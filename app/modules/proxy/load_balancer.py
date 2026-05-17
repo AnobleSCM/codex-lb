@@ -1060,6 +1060,27 @@ def _state_from_account(
     ):
         effective_runtime_reset = None
 
+    # Symmetric path for RATE_LIMITED accounts that were marked via the
+    # usage-data path (apply_usage_quota observing primary_used >= 100). That
+    # path does not set blocked_at, so the persisted-blocked_at cooldown branch
+    # below cannot recover them after a restart. When the latest primary entry
+    # is recent enough and reports a reset_at strictly later than the stale
+    # stored runtime reset, the upstream window has clearly rolled forward
+    # since the block was recorded, so the runtime reset guard can be cleared.
+    if (
+        account.status == AccountStatus.RATE_LIMITED
+        and effective_runtime_reset is not None
+        and effective_runtime_reset > time.time()
+        and effective_blocked_at is None
+        and primary_entry is not None
+        and _usage_entry_is_recent_enough(primary_entry.recorded_at)
+        and primary_entry.used_percent is not None
+        and float(primary_entry.used_percent) < 100.0
+        and primary_entry.reset_at is not None
+        and float(primary_entry.reset_at) > effective_runtime_reset
+    ):
+        effective_runtime_reset = None
+
     # Clear the runtime reset guard only when a post-block refresh has been
     # observed and the debounce period is over.
     #

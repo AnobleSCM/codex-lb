@@ -775,6 +775,88 @@ def test_state_from_account_rate_limited_clears_with_fresh_primary(monkeypatch):
     assert state.status == AccountStatus.ACTIVE
 
 
+def test_state_from_account_recovers_rate_limited_on_restart_without_blocked_at_when_usage_shows_new_reset_window(
+    monkeypatch,
+):
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    next_reset = int(now + 7200)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=next_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+    assert state.status == AccountStatus.ACTIVE
+
+
+def test_state_from_account_keeps_rate_limited_on_restart_when_fresh_primary_usage_is_missing_and_no_blocked_at(
+    monkeypatch,
+):
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=future_reset,
+        recorded_at=_epoch_to_naive_utc(now - 600),
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+    assert state.status == AccountStatus.RATE_LIMITED
+
+
+def test_state_from_account_keeps_rate_limited_without_blocked_at_when_usage_stays_on_same_reset_window(
+    monkeypatch,
+):
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=future_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+    assert state.status == AccountStatus.RATE_LIMITED
+
+
 def test_state_from_account_clears_rate_limited_after_restart_with_persisted_blocked_at(monkeypatch):
     now = 1_700_000_000.0
     blocked = now - 130.0
