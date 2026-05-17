@@ -82,3 +82,51 @@ actual GitHub state (status check rollup, codex review submissions,
 `mergeable` field) rather than asserting them from local history.
 Local `uv run pytest` / `uv run ruff` / `codex review --base origin/main`
 are encouraged but not substitutes for the cloud gates.
+
+## Live Runtime Discipline (Class C image-pin trap)
+
+This repo is the **source code** for codex-lb. It is NOT the live runtime.
+
+**The live MacBook codex-lb container is managed by a different compose file:**
+
+```text
+/Users/andrewnoble/.codex/codex-lb/docker-compose.yml
+```
+
+That live compose pins `image: codex-lb:active` — a Docker tag alias that
+always points at the currently-deployed local build. The repo's own
+`docker-compose.yml` defines a service named `server` and is for repo-local
+testing, NOT for live deployment.
+
+**Hard rules when working on codex-lb in this repo:**
+
+1. **Do not change the live compose to `ghcr.io/soju06/codex-lb:latest`** or run
+   `docker compose pull` against the live compose. The persistent
+   `codex-lb-data` volume may have a schema revision the public image lacks,
+   which causes an unrecoverable `MigrationBootstrapError` crash loop on
+   startup. Discovered 2026-05-17.
+
+2. **When publishing a new image for live deployment:**
+   - Build locally; tag as `codex-lb:local-<short-sha>`.
+   - Verify the new image's `/app/app/db/alembic/versions/` contains every
+     revision the live `codex-lb-data` volume has applied.
+   - Re-tag the new image as the stable alias:
+     `docker --context colima tag codex-lb:local-<short-sha> codex-lb:active`.
+   - Restart the live container (`docker --context colima restart codex-lb`).
+   - Verify `/health` returns 200 and check container logs for
+     `current_revision=<expected>` instead of `MigrationBootstrapError`.
+
+3. **When adding new alembic migrations**, document the revision id in the
+   change's `openspec/changes/<change>/context.md` so future operators know
+   which deployed image is required to read this schema.
+
+4. **Pre-startup sanity check (future work):** the application should emit
+   a clear warning like `image alembic head=<X> but DB alembic_version=<Y>;
+   cannot start` before crash-looping. Tracked in
+   `~/Developer/ecosystem-alignment/docs/superpowers/plans/2026-05-17-codex-lb-stream-disconnect-rca.md`
+   P6 item 3.
+
+**Full incident write-up:**
+- RCA: `~/Developer/ecosystem-alignment/docs/superpowers/plans/2026-05-17-codex-lb-stream-disconnect-rca.md`
+- Cross-agent broadcast: `~/workspace-wiki/wiki/message-board/active/2026-05-17-codex-lb-image-pin-discipline.md`
+- Wiki project page: `~/workspace-wiki/wiki/projects/codex-lb/index.md`
