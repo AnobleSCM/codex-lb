@@ -860,6 +860,45 @@ def test_state_from_account_keeps_rate_limited_after_restart_when_primary_usage_
     assert state.status == AccountStatus.RATE_LIMITED
 
 
+def test_state_from_account_keeps_rate_limited_during_active_runtime_cooldown_even_when_db_threshold_elapsed(
+    monkeypatch,
+):
+    now = 1_700_000_000.0
+    blocked = now - 130.0
+    future_reset = int(now + 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=future_reset,
+        blocked_at=int(blocked),
+    )
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=future_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+    )
+
+    # Runtime cooldown is in the future — a Retry-After-derived hold the
+    # balancer should respect. The DB-derived RATE_LIMITED_COOLDOWN_SECONDS
+    # threshold has elapsed (blocked=now-130s, threshold=120s), but the
+    # in-memory cooldown MUST take precedence so the retry-after hold is
+    # not shortened.
+    runtime = RuntimeState()
+    runtime.cooldown_until = now + 60.0
+    runtime.blocked_at = blocked
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=runtime,
+    )
+    assert state.status == AccountStatus.RATE_LIMITED
+
+
 def test_state_from_account_keeps_rate_limited_after_restart_when_primary_still_saturated(monkeypatch):
     now = 1_700_000_000.0
     blocked = now - 130.0

@@ -1074,17 +1074,17 @@ def _state_from_account(
             effective_blocked_at is not None and time.time() >= effective_blocked_at + QUOTA_EXCEEDED_COOLDOWN_SECONDS
         )
     elif account.status == AccountStatus.RATE_LIMITED:
-        if (
-            runtime.cooldown_until is not None
-            and runtime.cooldown_until <= time.time()
-            and runtime.blocked_at is not None
-        ):
-            cooldown_ready = True
-        elif (
-            effective_blocked_at is not None
-            and time.time() >= effective_blocked_at + RATE_LIMITED_COOLDOWN_SECONDS
-        ):
-            cooldown_ready = True
+        # Prefer the in-memory runtime cooldown when it's available so a
+        # retry-after-derived cooldown duration cannot be shortened by the
+        # DB-derived fallback. The fallback is intentionally a restart-only
+        # path: it activates when runtime state was lost and the DB is the
+        # only signal we have.
+        if runtime.cooldown_until is not None:
+            cooldown_ready = (
+                runtime.cooldown_until <= time.time() and runtime.blocked_at is not None
+            )
+        elif effective_blocked_at is not None:
+            cooldown_ready = time.time() >= effective_blocked_at + RATE_LIMITED_COOLDOWN_SECONDS
 
     if cooldown_ready and effective_blocked_at is not None:
         if account.status == AccountStatus.QUOTA_EXCEEDED:

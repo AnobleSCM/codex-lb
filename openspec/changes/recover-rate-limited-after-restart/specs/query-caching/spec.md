@@ -26,6 +26,13 @@
 - **WHEN** the persisted block marker is younger than the rate-limit cooldown threshold
 - **THEN** the balancer keeps the account in `rate_limited` regardless of how fresh the latest primary-window usage row is
 
+#### Scenario: An active in-memory rate-limit cooldown is not shortened by the DB-derived fallback
+- **GIVEN** an account is persisted as `rate_limited`
+- **AND** the in-memory `RuntimeState.cooldown_until` is set to a future time, reflecting a `Retry-After`-derived hold that has not yet expired
+- **WHEN** the persisted `blocked_at` marker would otherwise satisfy the DB-derived rate-limit cooldown threshold on its own
+- **THEN** the balancer keeps the account in `rate_limited` until the in-memory cooldown also expires
+- **AND** the DB-derived fallback only takes effect when the in-memory cooldown is absent (e.g., after a process restart that wiped runtime state)
+
 #### Scenario: Restart-safe rate-limit recovery does not flip an account whose primary window is still saturated
 - **GIVEN** an account is persisted as `rate_limited`
 - **AND** the account record contains a persisted block marker older than the rate-limit cooldown threshold
