@@ -14,6 +14,7 @@ from app.core.balancer import (
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
     QUOTA_EXCEEDED_COOLDOWN_SECONDS,
+    RATE_LIMITED_COOLDOWN_SECONDS,
     AccountState,
     RoutingStrategy,
     SelectionResult,
@@ -1062,18 +1063,28 @@ def _state_from_account(
     # Clear the runtime reset guard only when a post-block refresh has been
     # observed and the debounce period is over.
     #
-    # QUOTA_EXCEEDED uses a persisted blocked_at marker so recovery survives
-    # process restarts. RATE_LIMITED keeps the narrower runtime-only behavior,
-    # because its cooldown duration is not persisted today.
+    # Both QUOTA_EXCEEDED and RATE_LIMITED now use the persisted blocked_at
+    # marker plus a status-specific cooldown threshold so recovery survives
+    # process restarts. The original runtime cooldown_until path is kept as a
+    # secondary signal so a retry-after-derived cooldown can still gate
+    # recovery within the same process lifetime.
     cooldown_ready = False
     if account.status == AccountStatus.QUOTA_EXCEEDED:
         cooldown_ready = (
             effective_blocked_at is not None and time.time() >= effective_blocked_at + QUOTA_EXCEEDED_COOLDOWN_SECONDS
         )
-    elif (
-        runtime.cooldown_until is not None and runtime.cooldown_until <= time.time() and runtime.blocked_at is not None
-    ):
-        cooldown_ready = True
+    elif account.status == AccountStatus.RATE_LIMITED:
+        if (
+            runtime.cooldown_until is not None
+            and runtime.cooldown_until <= time.time()
+            and runtime.blocked_at is not None
+        ):
+            cooldown_ready = True
+        elif (
+            effective_blocked_at is not None
+            and time.time() >= effective_blocked_at + RATE_LIMITED_COOLDOWN_SECONDS
+        ):
+            cooldown_ready = True
 
     if cooldown_ready and effective_blocked_at is not None:
         if account.status == AccountStatus.QUOTA_EXCEEDED:
