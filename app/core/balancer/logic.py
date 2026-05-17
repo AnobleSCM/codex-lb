@@ -321,6 +321,7 @@ def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
 
 
 QUOTA_EXCEEDED_COOLDOWN_SECONDS = 120.0
+RATE_LIMITED_COOLDOWN_SECONDS = 120.0
 
 
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
