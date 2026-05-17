@@ -112,7 +112,13 @@ testing, NOT for live deployment.
      revision the live `codex-lb-data` volume has applied.
    - Re-tag the new image as the stable alias:
      `docker --context colima tag codex-lb:local-<short-sha> codex-lb:active`.
-   - Restart the live container (`docker --context colima restart codex-lb`).
+   - Recreate the live container so it resolves the new image:
+     `docker --context colima compose -f /Users/andrewnoble/.codex/codex-lb/docker-compose.yml up -d --force-recreate`.
+     `docker restart` alone is not sufficient — the running container is
+     pinned to its original image id at creation, so a tag swap on
+     `codex-lb:active` only takes effect on container recreate. Verify with
+     `docker --context colima inspect codex-lb --format '{{.Config.Image}} {{.Image}}'`
+     and confirm the image sha matches the new `codex-lb:local-<short-sha>` build.
    - Verify `/health` returns 200 and check container logs for
      `current_revision=<expected>` instead of `MigrationBootstrapError`.
 
