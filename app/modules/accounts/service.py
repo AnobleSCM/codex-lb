@@ -254,7 +254,10 @@ class AccountsService:
         )
 
         if self._usage_repo and self._usage_updater:
-            latest_usage = await self._usage_repo.latest_by_account(window="primary")
+            primary_entry = await self._usage_repo.latest_entry_for_account(
+                account_id, window="primary"
+            )
+            latest_usage = {account_id: primary_entry} if primary_entry else {}
             await self._usage_updater.refresh_accounts([account], latest_usage)
             get_account_selection_cache().invalidate()
 
@@ -278,10 +281,12 @@ class AccountsService:
     ) -> tuple[float | None, float | None]:
         if self._usage_repo is None:
             return None, None
-        primary_map = await self._usage_repo.latest_by_account(window="primary")
-        secondary_map = await self._usage_repo.latest_by_account(window="secondary")
-        primary_entry = primary_map.get(account_id)
-        secondary_entry = secondary_map.get(account_id)
+        primary_entry = await self._usage_repo.latest_entry_for_account(
+            account_id, window="primary"
+        )
+        secondary_entry = await self._usage_repo.latest_entry_for_account(
+            account_id, window="secondary"
+        )
         return (
             primary_entry.used_percent if primary_entry is not None else None,
             secondary_entry.used_percent if secondary_entry is not None else None,
@@ -328,12 +333,8 @@ class AccountsService:
                 async with session.post(
                     url, headers=headers, json=body, timeout=timeout
                 ) as resp:
-                    # Read a small chunk so the upstream registers the request,
-                    # then drop the rest. We never need the body.
-                    try:
-                        await resp.content.read(1024)
-                    except Exception:  # noqa: BLE001 - probe body read is best-effort
-                        pass
+                    # Initiating the request is enough to wake the upstream
+                    # rate-limiter; we do not consume the SSE body.
                     return resp.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning(

@@ -60,17 +60,17 @@ def _build_service(
     repo.get_by_id.return_value = account
 
     usage_repo = AsyncMock()
-    primary_map = (
-        {_ACCOUNT_ID: _make_usage_row(primary_pct)} if primary_pct is not None else {}
-    )
-    secondary_map = (
-        {_ACCOUNT_ID: _make_usage_row(secondary_pct)} if secondary_pct is not None else {}
-    )
+    primary_entry = _make_usage_row(primary_pct) if primary_pct is not None else None
+    secondary_entry = _make_usage_row(secondary_pct) if secondary_pct is not None else None
 
-    async def _latest_by_account(*, window: str) -> dict[str, Any]:
-        return primary_map if window == "primary" else secondary_map
+    async def _latest_entry_for_account(
+        requested_account_id: str, *, window: str
+    ) -> Any:
+        if requested_account_id != _ACCOUNT_ID:
+            return None
+        return primary_entry if window == "primary" else secondary_entry
 
-    usage_repo.latest_by_account.side_effect = _latest_by_account
+    usage_repo.latest_entry_for_account.side_effect = _latest_entry_for_account
 
     service = AccountsService(repo=repo, usage_repo=usage_repo)
     # Stop the real UsageUpdater from running — the unit test asserts the
