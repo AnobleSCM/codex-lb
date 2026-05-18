@@ -85,6 +85,25 @@ export const AccountActionResponseSchema = z.object({
   status: z.string(),
 });
 
+export const AccountProbeRequestSchema = z.object({
+  model: z.string().optional(),
+});
+
+export const AccountProbeResponseSchema = z.object({
+  status: z.string(),
+  accountId: z.string(),
+  probeStatusCode: z.number(),
+  primaryUsedPercentBefore: z.number().nullable(),
+  primaryUsedPercentAfter: z.number().nullable(),
+  secondaryUsedPercentBefore: z.number().nullable(),
+  secondaryUsedPercentAfter: z.number().nullable(),
+  accountStatusBefore: z.string(),
+  accountStatusAfter: z.string(),
+});
+
+export type AccountProbeRequest = z.infer<typeof AccountProbeRequestSchema>;
+export type AccountProbeResponse = z.infer<typeof AccountProbeResponseSchema>;
+
 export const OauthStartRequestSchema = z.object({
   forceMethod: z.string().optional(),
 });
