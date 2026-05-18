@@ -16,6 +16,7 @@ export type AccountDetailProps = {
   onPause: (accountId: string) => void;
   onResume: (accountId: string) => void;
   onDelete: (accountId: string) => void;
+  onProbe: (accountId: string) => void;
   onReauth: () => void;
 };
 
@@ -26,6 +27,7 @@ export function AccountDetail({
   onPause,
   onResume,
   onDelete,
+  onProbe,
   onReauth,
 }: AccountDetailProps) {
   const { data: trends } = useAccountTrends(account?.accountId ?? null);
@@ -73,6 +75,7 @@ export function AccountDetail({
         onPause={onPause}
         onResume={onResume}
         onDelete={onDelete}
+        onProbe={onProbe}
         onReauth={onReauth}
       />
     </div>

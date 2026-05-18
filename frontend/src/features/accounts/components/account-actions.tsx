@@ -1,7 +1,9 @@
-import { Pause, Play, RefreshCw, Trash2 } from "lucide-react";
+import { Activity, Pause, Play, RefreshCw, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { AccountSummary } from "@/features/accounts/schemas";
+
+const PROBE_DISABLED_STATUSES = new Set(["paused", "deactivated"]);
 
 export type AccountActionsProps = {
   account: AccountSummary;
@@ -9,6 +11,7 @@ export type AccountActionsProps = {
   onPause: (accountId: string) => void;
   onResume: (accountId: string) => void;
   onDelete: (accountId: string) => void;
+  onProbe: (accountId: string) => void;
   onReauth: () => void;
 };
 
@@ -18,8 +21,10 @@ export function AccountActions({
   onPause,
   onResume,
   onDelete,
+  onProbe,
   onReauth,
 }: AccountActionsProps) {
+  const probeAllowed = !PROBE_DISABLED_STATUSES.has(account.status);
   return (
     <div className="flex flex-wrap gap-2 border-t pt-4">
       {account.status === "paused" ? (
@@ -46,6 +51,21 @@ export function AccountActions({
           Pause
         </Button>
       )}
+
+      {probeAllowed ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1.5 text-xs"
+          onClick={() => onProbe(account.accountId)}
+          disabled={busy}
+          title="Send one minimal request to wake the upstream rate-limiter for this account"
+        >
+          <Activity className="h-3.5 w-3.5" />
+          Probe
+        </Button>
+      ) : null}
 
       {account.status === "deactivated" ? (
         <Button

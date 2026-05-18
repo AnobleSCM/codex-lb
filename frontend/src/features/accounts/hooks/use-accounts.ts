@@ -7,6 +7,7 @@ import {
   importAccount,
   listAccounts,
   pauseAccount,
+  probeAccount,
   reactivateAccount,
 } from "@/features/accounts/api";
 
@@ -67,7 +68,25 @@ export function useAccountMutations() {
     },
   });
 
-  return { importMutation, pauseMutation, resumeMutation, deleteMutation };
+  const probeMutation = useMutation({
+    mutationFn: ({ accountId, model }: { accountId: string; model?: string }) =>
+      probeAccount(accountId, model),
+    onSuccess: (result) => {
+      const transitioned = result.accountStatusBefore !== result.accountStatusAfter;
+      const transition = transitioned
+        ? `${result.accountStatusBefore} → ${result.accountStatusAfter}`
+        : result.accountStatusAfter;
+      toast.success(
+        `Probe sent (upstream ${result.probeStatusCode}) — account ${transition}`,
+      );
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Probe failed");
+    },
+  });
+
+  return { importMutation, pauseMutation, resumeMutation, deleteMutation, probeMutation };
 }
 
 export function useAccountTrends(accountId: string | null) {
