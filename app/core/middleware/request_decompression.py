@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import logging
 import zlib
 from collections.abc import Awaitable, Callable
 from typing import Protocol
@@ -13,6 +14,9 @@ from starlette.requests import ClientDisconnect
 
 from app.core.config.settings import get_settings
 from app.core.errors import dashboard_error
+from app.core.utils.request_id import get_request_id
+
+logger = logging.getLogger(__name__)
 
 
 class _DecompressedBodyTooLarge(Exception):
@@ -157,6 +161,15 @@ def add_request_decompression_middleware(app: FastAPI) -> None:
                     "invalid_request",
                     "Request body is compressed but could not be decompressed",
                 ),
+            )
+        decompressed_size = len(decompressed)
+        if decompressed_size * 5 >= max_size * 4:
+            logger.warning(
+                "Large decompressed request body request_id=%s path=%s bytes=%s max_bytes=%s",
+                get_request_id(),
+                request.url.path,
+                decompressed_size,
+                max_size,
             )
         _replace_request_body(request, decompressed)
         return await call_next(request)
