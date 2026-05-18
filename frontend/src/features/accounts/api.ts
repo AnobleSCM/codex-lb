@@ -3,6 +3,7 @@ import { del, get, post } from "@/lib/api-client";
 import {
   AccountActionResponseSchema,
   AccountImportResponseSchema,
+  AccountProbeResponseSchema,
   AccountsResponseSchema,
   AccountTrendsResponseSchema,
   ManualOauthCallbackRequestSchema,
@@ -41,6 +42,14 @@ export function reactivateAccount(accountId: string) {
   return post(
     `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/reactivate`,
     AccountActionResponseSchema,
+  );
+}
+
+export function probeAccount(accountId: string, model?: string) {
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/probe`,
+    AccountProbeResponseSchema,
+    model ? { body: { model } } : undefined,
   );
 }
 
