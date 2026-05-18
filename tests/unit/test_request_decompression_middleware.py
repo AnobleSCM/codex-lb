@@ -276,7 +276,9 @@ async def test_request_decompression_does_not_warn_below_eighty_percent(
         get_settings.cache_clear()
 
 
-def test_max_decompressed_body_bytes_default_leaves_room_for_slimmer() -> None:
+def test_max_decompressed_body_bytes_default_leaves_room_for_slimmer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The slimmer at app/core/clients/proxy.py needs headroom above the
     # 15 MiB upstream cap to strip historical Computer Use screenshots
     # from real-world Codex CLI sessions. 128 MiB is the documented
@@ -284,7 +286,14 @@ def test_max_decompressed_body_bytes_default_leaves_room_for_slimmer() -> None:
     # (~8x headroom over the inner cap, ~4x over a 30-turn Computer Use
     # session). Lower defaults would re-introduce false 413 rejections
     # in the request_decompression middleware before the slimmer can run.
-    assert Settings().max_decompressed_body_bytes >= 128 * 1024 * 1024
+    # Clear the env var first so the test guards the true code default,
+    # not whatever an operator has overridden in this shell.
+    monkeypatch.delenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert Settings().max_decompressed_body_bytes >= 128 * 1024 * 1024
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
