@@ -80,6 +80,9 @@ export function useAccountMutations() {
         `Probe sent (upstream ${result.probeStatusCode}) — account ${transition}`,
       );
       invalidateAccountRelatedQueries(queryClient);
+      void queryClient.invalidateQueries({
+        queryKey: ["accounts", "trends", result.accountId],
+      });
     },
     onError: (error: Error) => {
       toast.error(error.message || "Probe failed");
