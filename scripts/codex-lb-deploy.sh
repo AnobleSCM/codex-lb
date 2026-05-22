@@ -14,6 +14,7 @@
 #   - cwd is the codex-lb repo root
 #   - working tree is clean (or you accept that uncommitted changes ship)
 #   - docker --context colima is available
+#   - docker buildx (BuildKit) is installed (brew install docker-buildx)
 #   - the live compose lives at ~/.codex/codex-lb/docker-compose.yml
 
 set -euo pipefail
@@ -28,6 +29,19 @@ HEALTH_URL="http://127.0.0.1:2455/health"
 
 if [ ! -f "$LIVE_COMPOSE" ]; then
   echo "FATAL: live compose not found at $LIVE_COMPOSE" >&2
+  exit 1
+fi
+
+# The Dockerfile uses BuildKit cache mounts (`RUN --mount=type=cache`), so the
+# build needs BuildKit plus the buildx plugin. The docker CLI falls back to the
+# legacy builder unless DOCKER_BUILDKIT=1, and buildx must be installed
+# (`brew install docker-buildx`). Force BuildKit and fail early with an
+# actionable message instead of failing mid-build. (2026-05-21: buildx was not
+# re-wired in the Docker Desktop -> Homebrew migration and broke this deploy.)
+export DOCKER_BUILDKIT=1
+if ! docker buildx version >/dev/null 2>&1; then
+  echo "FATAL: docker buildx is required (the Dockerfile uses BuildKit cache mounts) but is unavailable." >&2
+  echo "       Install it with: brew install docker-buildx" >&2
   exit 1
 fi
 
