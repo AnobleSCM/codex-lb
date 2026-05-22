@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,15 +40,9 @@ def _make_account(status: AccountStatus = AccountStatus.ACTIVE) -> Account:
 
 
 def _make_usage_row(used_percent: float, account_id: str = _ACCOUNT_ID) -> Any:
-    # Service only reads ``used_percent`` off the row; a SimpleNamespace-like
+    # Service only reads ``used_percent`` off the row; a SimpleNamespace
     # stand-in is enough for the unit test.
-    class _Row:
-        pass
-
-    row = _Row()
-    row.used_percent = used_percent
-    row.account_id = account_id
-    return row
+    return SimpleNamespace(used_percent=used_percent, account_id=account_id)
 
 
 def _build_service(
@@ -63,9 +58,7 @@ def _build_service(
     primary_entry = _make_usage_row(primary_pct) if primary_pct is not None else None
     secondary_entry = _make_usage_row(secondary_pct) if secondary_pct is not None else None
 
-    async def _latest_entry_for_account(
-        requested_account_id: str, *, window: str
-    ) -> Any:
+    async def _latest_entry_for_account(requested_account_id: str, *, window: str) -> Any:
         if requested_account_id != _ACCOUNT_ID:
             return None
         return primary_entry if window == "primary" else secondary_entry
@@ -133,7 +126,7 @@ async def test_probe_account_captures_before_after_snapshot(monkeypatch):
     assert captured_kwargs["chatgpt_account_id"] == _CHATGPT_ACCOUNT_ID
     assert captured_kwargs["model"] == "gpt-5.5-test"
 
-    service._usage_updater.refresh_accounts.assert_awaited_once()
+    cast(AsyncMock, service._usage_updater).refresh_accounts.assert_awaited_once()
 
 
 @pytest.mark.asyncio

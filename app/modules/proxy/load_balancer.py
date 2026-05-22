@@ -1101,9 +1101,7 @@ def _state_from_account(
         # path: it activates when runtime state was lost and the DB is the
         # only signal we have.
         if runtime.cooldown_until is not None:
-            cooldown_ready = (
-                runtime.cooldown_until <= time.time() and runtime.blocked_at is not None
-            )
+            cooldown_ready = runtime.cooldown_until <= time.time() and runtime.blocked_at is not None
         elif effective_blocked_at is not None:
             cooldown_ready = time.time() >= effective_blocked_at + RATE_LIMITED_COOLDOWN_SECONDS
 
