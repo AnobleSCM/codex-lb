@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 
 from app.core.config.settings import get_settings
 from app.db.models import SchedulerLeader
-from app.db.session import get_session
+from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class LeaderElection:
         expires_at = now + timedelta(seconds=ttl)
 
         try:
-            async for session in get_session():
+            async with SessionLocal() as session:
                 await session.execute(
                     text(
                         """
@@ -75,7 +75,7 @@ class LeaderElection:
         ttl = settings.leader_election_ttl_seconds
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         try:
-            async for session in get_session():
+            async with SessionLocal() as session:
                 await session.execute(
                     text(
                         "UPDATE scheduler_leader SET expires_at = :expires_at WHERE id = 1 AND leader_id = :leader_id"

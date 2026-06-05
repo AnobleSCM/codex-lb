@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config.settings import get_settings
 from app.core.utils.time import utcnow
 from app.db.models import BridgeRingMember
-from app.db.session import get_session
+from app.db.session import SessionLocal
 from app.modules.health.schemas import BridgeRingInfo, HealthCheckResponse, HealthResponse
 from app.modules.proxy.ring_membership import RING_STALE_THRESHOLD_SECONDS
 
@@ -55,7 +55,7 @@ async def health_ready() -> HealthCheckResponse:
         raise HTTPException(status_code=503, detail="Service is draining")
 
     try:
-        async for session in get_session():
+        async with SessionLocal() as session:
             try:
                 await session.execute(text("SELECT 1"))
                 checks = {"database": "ok"}

@@ -127,12 +127,16 @@ async def test_health_ready_succeeds_when_degraded() -> None:
     mock_session = AsyncMock()
     mock_session.execute = AsyncMock()
 
-    with patch("app.core.draining._draining", False), patch("app.modules.health.api.get_session") as mock_get_session:
+    with (
+        patch("app.core.draining._draining", False),
+        patch("app.modules.health.api.SessionLocal") as mock_session_local,
+    ):
 
-        async def mock_get_session_context():
+        @asynccontextmanager
+        async def _session_cm():
             yield mock_session
 
-        mock_get_session.return_value = mock_get_session_context()
+        mock_session_local.return_value = _session_cm()
 
         result = await health_ready()
 
