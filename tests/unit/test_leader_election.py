@@ -93,11 +93,30 @@ class _SharedLease:
         self.row = row
 
 
-def _build_session_provider(shared: _SharedLease, lock: asyncio.Lock):
-    async def _provider():
-        yield _LeaseSession(shared, lock)
+class _SessionCM:
+    """Async context manager wrapping a lease session.
 
-    return _provider
+    ``LeaderElection`` borrows the session via ``async with SessionLocal() as
+    session:`` (a context manager), not the old ``async for session in
+    get_session()`` generator, so the connection is released on every exit
+    path — including the early ``return`` inside ``try_acquire``/``renew``.
+    """
+
+    def __init__(self, session: _LeaseSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> _LeaseSession:
+        return self._session
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+def _build_session_factory(shared: _SharedLease, lock: asyncio.Lock):
+    def _factory() -> _SessionCM:
+        return _SessionCM(_LeaseSession(shared, lock))
+
+    return _factory
 
 
 @pytest.mark.asyncio
@@ -111,7 +130,7 @@ async def test_try_acquire_concurrent_only_one_wins(monkeypatch: pytest.MonkeyPa
 
     shared = _SharedLease()
     lock = asyncio.Lock()
-    monkeypatch.setattr(leader_election_module, "get_session", _build_session_provider(shared, lock))
+    monkeypatch.setattr(leader_election_module, "SessionLocal", _build_session_factory(shared, lock))
 
     election_a = leader_election_module.LeaderElection(leader_id="node-a")
     election_b = leader_election_module.LeaderElection(leader_id="node-b")
@@ -134,7 +153,7 @@ async def test_try_acquire_sets_is_leader_on_success(monkeypatch: pytest.MonkeyP
     now = datetime.now(UTC)
     shared = _SharedLease(row={"leader_id": "node-a", "expires_at": now + timedelta(seconds=30)})
     lock = asyncio.Lock()
-    monkeypatch.setattr(leader_election_module, "get_session", _build_session_provider(shared, lock))
+    monkeypatch.setattr(leader_election_module, "SessionLocal", _build_session_factory(shared, lock))
 
     election = leader_election_module.LeaderElection(leader_id="node-a")
 
