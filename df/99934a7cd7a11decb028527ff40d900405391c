@@ -1,0 +1,28 @@
+openspec/changes/add-fleet-summary-endpoint/proposal.md
+  f808388f2203e97b 1-26
+openspec/changes/add-fleet-summary-endpoint/tasks.md
+  f808388f2203e97b 1-22
+openspec/changes/add-fleet-summary-endpoint/specs/fleet-summary-read/spec.md
+  f808388f2203e97b 1-35
+openspec/changes/add-fleet-summary-endpoint/design.md
+  f808388f2203e97b 1-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "df99934a7cd7a11decb028527ff40d900405391c",
+  "prompts": {
+    "f808388f2203e97b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65ffa35c-19b0-436d-9519-17656fc3c3a7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM <andrewnoble1992@gmail.com>",
+      "total_additions": 107,
+      "total_deletions": 0,
+      "accepted_lines": 107,
+      "overriden_lines": 0
+    }
+  }
+}
