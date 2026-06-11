@@ -112,6 +112,30 @@ async def validate_usage_api_key(
     return await _validate_api_key_token(token)
 
 
+# --- Fleet summary read auth (always requires valid key) ---
+
+
+async def validate_fleet_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> ApiKeyData:
+    """Validate API key for the fleet summary read endpoint.
+
+    Like ``validate_usage_api_key`` and unlike ``validate_proxy_api_key``, this
+    dependency ALWAYS requires a valid Bearer API key, independent of the
+    global ``api_key_auth_enabled`` setting. The fleet summary exposes account
+    emails and capacity state and the service binds to a non-loopback interface
+    (see ``deployment-networking``), so this route must never inherit the
+    proxy's unauthenticated pass-through. Raises ProxyAuthError (HTTP 401) when
+    the key is missing or invalid.
+    """
+    token = _extract_bearer_token(None if credentials is None else f"Bearer {credentials.credentials}")
+    if not token:
+        raise ProxyAuthError("Missing API key in Authorization header")
+
+    return await _validate_api_key_token(token)
+
+
 # --- Dashboard session auth ---
 
 
