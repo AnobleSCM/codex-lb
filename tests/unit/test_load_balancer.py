@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.balancer import (
+    QUOTA_EXCEEDED_NO_RESET_FALLBACK_SECONDS,
     AccountState,
     handle_permanent_failure,
     handle_quota_exceeded,
@@ -326,6 +327,57 @@ def test_handle_quota_exceeded_sets_used_percent_and_cooldown():
     assert state.status == AccountStatus.QUOTA_EXCEEDED
     assert state.used_percent == 100.0
     assert state.cooldown_until is not None
+
+
+def test_handle_quota_exceeded_uses_short_no_reset_fallback(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    state = AccountState("a", AccountStatus.ACTIVE, used_percent=5.0)
+    # UpstreamError carries no ``resets_at`` / ``resets_in_seconds`` hint.
+    handle_quota_exceeded(state, {})
+    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.reset_at is not None
+    # Falls back to the short bounded horizon, not the old 1h bench.
+    assert state.reset_at == int(now + QUOTA_EXCEEDED_NO_RESET_FALLBACK_SECONDS)
+    assert state.reset_at == int(now + 900)
+    assert state.reset_at < int(now + 3600)
+
+
+def test_handle_quota_exceeded_honors_explicit_reset_over_fallback(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    state = AccountState("a", AccountStatus.ACTIVE, used_percent=5.0)
+    # An explicit upstream reset hint is always honored; the fallback never applies.
+    handle_quota_exceeded(state, {"resets_in_seconds": 120})
+    assert state.reset_at == int(now + 120)
+
+
+def test_select_account_blocks_quota_exceeded_on_future_reset_despite_fresh_headroom():
+    # Reproduces the 2026-07-05 stale-reset mismatch: an account marked
+    # QUOTA_EXCEEDED still carries a reset_at in the future, but the freshest
+    # usage read shows the primary window has headroom (used_percent below 100).
+    # select_account keys only on reset_at, so it excludes the account; when the
+    # account is the pool's only member the balancer returns no candidate, which
+    # is exactly the condition that flips it into degraded mode.
+    now = 1_700_000_000.0
+    blocked = AccountState(
+        "a",
+        AccountStatus.QUOTA_EXCEEDED,
+        used_percent=0.0,
+        reset_at=now + 800.0,
+    )
+    assert select_account([blocked], now=now).account is None
+
+    # Once the (now-shortened) reset horizon passes, the same shape is selectable.
+    recovered = AccountState(
+        "a",
+        AccountStatus.QUOTA_EXCEEDED,
+        used_percent=0.0,
+        reset_at=now + 800.0,
+    )
+    result = select_account([recovered], now=now + 801.0)
+    assert result.account is not None
+    assert result.account.account_id == "a"
 
 
 def test_handle_permanent_failure_sets_reason():

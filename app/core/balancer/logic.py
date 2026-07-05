@@ -323,6 +323,24 @@ def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
 QUOTA_EXCEEDED_COOLDOWN_SECONDS = 120.0
 RATE_LIMITED_COOLDOWN_SECONDS = 120.0
 
+# Fallback reset horizon persisted by ``handle_quota_exceeded`` when OpenAI
+# returns a quota/usage-limit error with NO reset hint (both ``resets_at`` and
+# ``resets_in_seconds`` absent). ``select_account`` excludes a QUOTA_EXCEEDED
+# account until ``reset_at`` passes, so this value is the maximum time a
+# no-reset-hint quota block benches an account. A genuine reset hint from
+# upstream, when present, is always honored instead of this fallback.
+#
+# The horizon is deliberately short. OpenAI reset events propagate lazily
+# through ``/wham/usage`` (https://github.com/Soju06/codex-lb/issues/676), and
+# codex-lb's background usage refresh (default 60s) plus the per-status cooldown
+# (120s) recover a genuinely-available account well inside 15 minutes. The prior
+# 3600s (1h) fallback meant a transient upstream 503 or degraded-mode blip that
+# surfaced without a reset hint could bench an otherwise-healthy account for a
+# full hour. Observed 2026-07-05: the pool went fully degraded
+# ("all upstream accounts are unavailable") and accounts were held on stale
+# reset horizons far longer than the upstream limiter actually required.
+QUOTA_EXCEEDED_NO_RESET_FALLBACK_SECONDS = 900
+
 # Upper bound for the user-visible "Try again in {N}s" hint that
 # ``select_account`` surfaces when zero candidates are selectable. The clamp
 # protects clients from waiting the worst-case persisted ``reset_at`` after
@@ -350,7 +368,7 @@ def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
     if reset_at is not None:
         state.reset_at = reset_at
     else:
-        state.reset_at = int(time.time() + 3600)
+        state.reset_at = int(time.time() + QUOTA_EXCEEDED_NO_RESET_FALLBACK_SECONDS)
 
 
 def handle_permanent_failure(state: AccountState, error_code: str) -> None:
