@@ -10,10 +10,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config.settings import get_settings
+from app.core.resilience.degradation import get_available_accounts
+from app.core.resilience.degradation import get_status as get_degradation_status
 from app.core.utils.time import utcnow
 from app.db.models import BridgeRingMember
 from app.db.session import SessionLocal
-from app.modules.health.schemas import BridgeRingInfo, HealthCheckResponse, HealthResponse
+from app.modules.health.schemas import BridgeRingInfo, DegradationInfo, HealthCheckResponse, HealthResponse
 from app.modules.proxy.ring_membership import RING_STALE_THRESHOLD_SECONDS
 
 router = APIRouter(tags=["health"])
@@ -33,7 +35,19 @@ def _is_internal_client_host(client_host: str | None) -> bool:
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    return HealthResponse(status="ok")
+    # Liveness stays "ok" (a degraded upstream must not evict this process), but
+    # the response now carries the degradation level + last-known available
+    # account count so watchdogs can pre-check before claiming work. Both come
+    # from the in-memory degradation manager — no DB read on this hot path.
+    degradation = get_degradation_status()
+    return HealthResponse(
+        status="ok",
+        degradation=DegradationInfo(
+            level=degradation.get("level") or "normal",
+            reason=degradation.get("reason"),
+        ),
+        available_accounts=get_available_accounts(),
+    )
 
 
 @router.get("/health/live", response_model=HealthCheckResponse)

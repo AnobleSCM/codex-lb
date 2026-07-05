@@ -142,12 +142,13 @@ class LoadBalancer:
 
         selection_inputs = await load_selection_inputs()
         circuit_breaker_open = _is_upstream_circuit_breaker_open()
+        available_accounts = len(selection_inputs.accounts)
         if circuit_breaker_open:
-            set_degraded("upstream circuit breaker is open")
+            set_degraded("upstream circuit breaker is open", available_accounts=available_accounts)
         elif selection_inputs.accounts:
-            set_normal()
+            set_normal(available_accounts=available_accounts)
         elif selection_inputs.error_code is not None:
-            set_normal()
+            set_normal(available_accounts=available_accounts)
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
             return AccountSelection(
@@ -380,7 +381,14 @@ class LoadBalancer:
 
         if selected_snapshot is None:
             if error_message == "No available accounts":
-                set_degraded("all upstream accounts are unavailable")
+                # selection_inputs.accounts counts accounts that passed the DB
+                # status filter; when this branch fires none of them were
+                # selectable, so a non-zero count means "present but rate/quota
+                # blocked" while zero means "all deactivated/paused".
+                set_degraded(
+                    "all upstream accounts are unavailable",
+                    available_accounts=len(selection_inputs.accounts),
+                )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
         logger.info(

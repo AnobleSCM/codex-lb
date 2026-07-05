@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel
-from app.core.resilience.degradation import get_status, is_degraded, set_degraded, set_normal
+from app.core.resilience.degradation import (
+    get_available_accounts,
+    get_status,
+    is_degraded,
+    set_degraded,
+    set_normal,
+)
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy import load_balancer as load_balancer_module
@@ -119,6 +125,70 @@ def test_set_normal_clears_degraded_state() -> None:
     assert get_status() == {"level": "normal", "reason": None}
 
 
+def test_set_degraded_records_available_accounts() -> None:
+    set_degraded("all upstream accounts are unavailable", available_accounts=4)
+
+    # get_status() shape is unchanged; the count is exposed via its own accessor.
+    assert get_status() == {
+        "level": "degraded",
+        "reason": "all upstream accounts are unavailable",
+    }
+    assert get_available_accounts() == 4
+
+
+def test_set_normal_records_available_accounts() -> None:
+    set_normal(available_accounts=6)
+
+    assert is_degraded() is False
+    assert get_available_accounts() == 6
+
+
+def test_degradation_transition_logs_once_per_edge(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="app.core.resilience.degradation")
+    caplog.clear()
+
+    # set_degraded fires on every failed selection; the WARNING transition marker
+    # must appear exactly once, on the normal -> degraded edge.
+    set_degraded("all upstream accounts are unavailable", available_accounts=0)
+    set_degraded("all upstream accounts are unavailable", available_accounts=0)
+    set_degraded("all upstream accounts are unavailable", available_accounts=0)
+    enters = [r for r in caplog.records if "DEGRADATION_TRANSITION normal->degraded" in r.getMessage()]
+    assert len(enters) == 1
+
+    caplog.clear()
+    set_normal(available_accounts=3)
+    exits = [r for r in caplog.records if "DEGRADATION_TRANSITION degraded->normal" in r.getMessage()]
+    assert len(exits) == 1
+
+
+@pytest.mark.asyncio
+async def test_health_check_reports_degradation() -> None:
+    from app.modules.health.api import health_check
+
+    set_degraded("all upstream accounts are unavailable", available_accounts=2)
+    response = await health_check()
+
+    assert response.status == "ok"
+    assert response.degradation is not None
+    assert response.degradation.level == "degraded"
+    assert response.degradation.reason == "all upstream accounts are unavailable"
+    assert response.available_accounts == 2
+
+
+@pytest.mark.asyncio
+async def test_health_check_reports_normal_when_not_degraded() -> None:
+    from app.modules.health.api import health_check
+
+    set_normal(available_accounts=5)
+    response = await health_check()
+
+    assert response.status == "ok"
+    assert response.degradation is not None
+    assert response.degradation.level == "normal"
+    assert response.degradation.reason is None
+    assert response.available_accounts == 5
+
+
 @pytest.mark.asyncio
 async def test_health_ready_succeeds_when_degraded() -> None:
     from app.modules.health.api import health_ready
@@ -175,6 +245,8 @@ async def test_load_balancer_returns_degraded_message_when_no_accounts_available
         "No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable"
     )
     assert is_degraded() is True
+    # The empty pool is recorded so /health can report it (0 accounts present).
+    assert get_available_accounts() == 0
 
 
 @pytest.mark.asyncio

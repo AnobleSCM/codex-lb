@@ -13,7 +13,11 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "static"
 async def test_health_endpoint_ok(async_client):
     response = await async_client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    payload = response.json()
+    # Liveness stays "ok"; the response also carries degradation observability.
+    assert payload["status"] == "ok"
+    assert payload["degradation"]["level"] in {"normal", "degraded", "critical"}
+    assert "available_accounts" in payload
 
 
 @pytest.mark.asyncio
