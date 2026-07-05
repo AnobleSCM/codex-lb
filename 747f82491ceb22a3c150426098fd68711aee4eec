@@ -1,0 +1,29 @@
+tests/unit/test_accounts_service_probe.py
+  882526146820ecbd 4-5,43,45,61,129
+app/modules/accounts/schemas.py
+  882526146820ecbd 109
+app/modules/accounts/service.py
+  882526146820ecbd 242,256,276,279-280,324
+app/modules/proxy/load_balancer.py
+  882526146820ecbd 1104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "747f82491ceb22a3c150426098fd68711aee4eec",
+  "prompts": {
+    "882526146820ecbd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94c6e887-ef37-4ebd-b48e-68c9a3796f80",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "AnobleSCM",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 36,
+      "accepted_lines": 14,
+      "overriden_lines": 0
+    }
+  }
+}
