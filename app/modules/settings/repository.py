@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth.dashboard_session_ttl import DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
 from app.core.config.settings import get_settings
 from app.db.models import DashboardSettings
 
@@ -25,7 +26,7 @@ class SettingsRepository:
             prefer_earlier_reset_accounts=True,
             routing_strategy="capacity_weighted",
             openai_cache_affinity_max_age_seconds=get_settings().openai_cache_affinity_max_age_seconds,
-            dashboard_session_ttl_seconds=43200,
+            dashboard_session_ttl_seconds=DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
             import_without_overwrite=True,
             totp_required_on_login=False,
             password_hash=None,
