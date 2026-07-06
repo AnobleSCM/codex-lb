@@ -1,6 +1,6 @@
 ## Migration
 
-Alembic revision `20260705_000000_harden_dashboard_session_ttl` changes the `dashboard_settings.dashboard_session_ttl_seconds` server default to `31536000` and updates existing rows only when they still equal the legacy default `43200`.
+Alembic revision `20260705_000000_harden_dashboard_session_ttl` changes the `dashboard_settings.dashboard_session_ttl_seconds` server default to `31536000` and updates existing rows only when they still equal the legacy default `43200`. Its downgrade restores rows carrying the new default back to `43200` before older app versions can issue one-year dashboard sessions directly.
 
 ## Guardrail
 

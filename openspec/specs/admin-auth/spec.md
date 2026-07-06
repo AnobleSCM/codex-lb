@@ -87,6 +87,7 @@ The system SHALL issue dashboard password-authenticated sessions with an absolut
 ### Requirement: Legacy default dashboard session TTL migration
 
 The migration for this change MUST update `dashboard_settings.dashboard_session_ttl_seconds` from `43200` to `31536000` only for rows that still carry the legacy default value. Rows with any customized value MUST remain unchanged.
+On downgrade, the migration MUST reset rows carrying `31536000` back to `43200`, while rows carrying any other customized value MUST remain unchanged.
 
 #### Scenario: Legacy default row migrates to 1 year
 
@@ -98,4 +99,18 @@ The migration for this change MUST update `dashboard_settings.dashboard_session_
 
 - **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 7200`
 - **WHEN** the migration runs
+- **THEN** the row still has `dashboard_session_ttl_seconds = 7200`
+
+#### Scenario: Downgrade restores migrated session TTL rows
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 43200`
+- **AND** the migration has upgraded it to `31536000`
+- **WHEN** the migration is downgraded
+- **THEN** the row has `dashboard_session_ttl_seconds = 43200`
+
+#### Scenario: Downgrade preserves customized session TTL rows
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 7200`
+- **AND** the migration has left it unchanged
+- **WHEN** the migration is downgraded
 - **THEN** the row still has `dashboard_session_ttl_seconds = 7200`

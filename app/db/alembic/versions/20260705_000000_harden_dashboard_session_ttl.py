@@ -54,6 +54,13 @@ def downgrade() -> None:
     if not columns or "dashboard_session_ttl_seconds" not in columns:
         return
 
+    op.execute(
+        sa.text(
+            "UPDATE dashboard_settings "
+            "SET dashboard_session_ttl_seconds = :old_default "
+            "WHERE dashboard_session_ttl_seconds = :new_default"
+        ).bindparams(new_default=NEW_DEFAULT_TTL_SECONDS, old_default=OLD_DEFAULT_TTL_SECONDS)
+    )
     with op.batch_alter_table("dashboard_settings") as batch_op:
         batch_op.alter_column(
             "dashboard_session_ttl_seconds",

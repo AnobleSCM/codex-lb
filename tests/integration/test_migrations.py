@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
+from alembic import command
 from anyio import to_thread
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -29,6 +30,7 @@ except ImportError:
 
 from app.db.migrate import (
     LEGACY_MIGRATION_ORDER,
+    _build_alembic_config,
     check_schema_drift,
     inspect_migration_state,
     run_startup_migrations,
@@ -757,16 +759,21 @@ async def test_dashboard_settings_default_flip_migration_updates_pristine_fresh_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("initial_ttl_seconds", "expected_ttl_seconds"),
+    ("initial_ttl_seconds", "expected_upgrade_ttl_seconds", "expected_downgrade_ttl_seconds"),
     [
-        (REMOTE_DASHBOARD_SESSION_TTL_SECONDS, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS),
-        (7200, 7200),
+        (
+            REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
+            DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
+            REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
+        ),
+        (7200, 7200, 7200),
     ],
 )
 async def test_dashboard_session_ttl_migration_updates_only_legacy_default(
     tmp_path,
     initial_ttl_seconds: int,
-    expected_ttl_seconds: int,
+    expected_upgrade_ttl_seconds: int,
+    expected_downgrade_ttl_seconds: int,
 ):
     db_url = f"sqlite+aiosqlite:///{tmp_path / f'dashboard-session-ttl-{initial_ttl_seconds}.sqlite'}"
     parent_revision = "20260515_000000_soft_delete_request_logs_on_account_delete"
@@ -804,6 +811,22 @@ async def test_dashboard_session_ttl_migration_updates_only_legacy_default(
                     )
                 )
             ).scalar_one()
-            assert ttl_seconds == expected_ttl_seconds
+            assert ttl_seconds == expected_upgrade_ttl_seconds
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+
+        async with session_factory() as session:
+            ttl_seconds = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT dashboard_session_ttl_seconds
+                        FROM dashboard_settings
+                        WHERE id = 1
+                        """
+                    )
+                )
+            ).scalar_one()
+            assert ttl_seconds == expected_downgrade_ttl_seconds
     finally:
         await engine.dispose()
