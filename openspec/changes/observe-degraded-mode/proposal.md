@@ -33,9 +33,10 @@ behavior or liveness semantics.
   *unscoped* selection cycles — a preferred-account probe or a scope-restricted
   API key sees a subset of the pool and must not flip the global signal — reports
   a **service-wide** present-account count (not the request-scoped subset), and
-  recovers to normal only on a *proven* selection or a typed routing error, never
-  on mere account presence (which flapped `degraded->normal->degraded` on every
-  failed cycle when accounts were present but none selectable).
+  recovers to normal only on a *proven* selection with the circuit breaker closed
+  — never on mere account presence (which flapped `degraded->normal->degraded` on
+  every failed cycle) and never on a model-/scope-narrowed routing error (which
+  could otherwise clear a genuine pool-wide outage).
 - `GET /health` now returns `degradation` (`level`, `reason`) and
   `available_accounts` alongside `status`. **`status` stays `"ok"`** — liveness
   is unchanged so a degraded upstream cannot evict the process (the same reason

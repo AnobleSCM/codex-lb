@@ -13,9 +13,10 @@
   (`account_ids is None and not exclude`), reporting a **service-wide** present
   count via `_service_available_accounts` (derived from `runtime_accounts`, so a
   per-request model/scope filter cannot shrink it). Enter degraded on the
-  circuit-breaker and no-available-accounts paths; recover to normal only on a
-  *proven* selection (success path) or a typed routing error — never on mere
-  account presence.
+  circuit-breaker and no-available-accounts paths; recover to normal ONLY on a
+  *proven* selection (success path) with the circuit breaker closed — never on
+  mere account presence, never on a model-/scope-narrowed routing error, and
+  never while the breaker is open.
 
 ## 3. /health exposure
 
@@ -58,3 +59,15 @@
   test asserts the full `{level, reason}` shape.
 - [x] 6.5 Tests — no-flap across repeated failed cycles, recovery on a successful
   selection, and scoped requests leaving the global signal untouched.
+
+## 7. Review follow-ups round 2 (Cubic on the fix commit)
+
+- [x] 7.1 P2 — a typed/model-scoped routing error no longer clears global
+  degraded (removed the `set_normal` on `error_code`); a request for an
+  unsupported model can no longer mask a pool-wide outage. Test updated to assert
+  degraded persists.
+- [x] 7.2 P1/P2 — the success-path recovery is gated on `not
+  _is_upstream_circuit_breaker_open()`, so one lucky selection cannot flip
+  /health back to normal while the pool-wide breaker is still open. Test added.
+- [x] 7.3 Spec — recovery requirement corrected (proven selection + breaker
+  closed only) with scenarios for the typed-error and breaker-open cases.

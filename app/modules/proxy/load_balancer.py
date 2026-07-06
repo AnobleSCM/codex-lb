@@ -148,23 +148,18 @@ class LoadBalancer:
         # /health degraded nor publish a subset count (Cubic P2 — it would report
         # 0/1 while other upstream accounts are healthy).
         drives_global_health = scoped_account_ids is None and not excluded_ids
-        if drives_global_health:
-            if _is_upstream_circuit_breaker_open():
-                set_degraded(
-                    "upstream circuit breaker is open",
-                    available_accounts=_service_available_accounts(selection_inputs),
-                )
-            elif selection_inputs.error_code is not None:
-                # A typed routing error (e.g. model unsupported) proves accounts
-                # exist — they just cannot serve this request — so any stale
-                # "all accounts unavailable" degraded state is cleared here. This
-                # branch returns immediately below, so it cannot flap.
-                set_normal(available_accounts=_service_available_accounts(selection_inputs))
-            # Recovery for the accounts-present case is deferred to a *proven*
-            # selection (see the success path below). Marking normal here on mere
-            # account presence flapped degraded->normal->degraded on every failed
-            # cycle when accounts were present but none selectable (Cubic P1;
-            # 2026-07-05 incident).
+        if drives_global_health and _is_upstream_circuit_breaker_open():
+            set_degraded(
+                "upstream circuit breaker is open",
+                available_accounts=_service_available_accounts(selection_inputs),
+            )
+        # Recovery to normal is driven ONLY by a proven selection (the success
+        # path below). It is deliberately NOT triggered by mere account presence
+        # (which flapped degraded->normal->degraded on every failed cycle — Cubic
+        # P1), nor by a typed/model-scoped routing error: a request for an
+        # unsupported model must not clear a genuine pool-wide outage on /health
+        # (Cubic P2). Typed routing errors return just below with the degraded
+        # state left untouched.
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
             return AccountSelection(
@@ -408,11 +403,14 @@ class LoadBalancer:
                     )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
-        if drives_global_health:
-            # A selection actually succeeded, so the pool can serve: clear any
-            # degraded state now (logs the degraded->normal edge exactly once; a
-            # no-op when already normal). This deferred recovery replaces the
-            # pre-selection presence check that caused the flap (Cubic P1).
+        if drives_global_health and not _is_upstream_circuit_breaker_open():
+            # A selection actually succeeded AND the pool-wide breaker is not
+            # open, so the pool can serve: clear any degraded state now (logs the
+            # degraded->normal edge exactly once; a no-op when already normal).
+            # This deferred recovery replaces the pre-selection presence check
+            # that caused the flap (Cubic P1); gating on the breaker keeps a
+            # breaker-open outage visible on /health until the breaker itself
+            # closes, rather than letting one lucky selection mask it (Cubic P2).
             set_normal(available_accounts=_service_available_accounts(selection_inputs))
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",

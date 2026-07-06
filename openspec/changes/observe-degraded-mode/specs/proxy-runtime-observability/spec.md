@@ -49,11 +49,13 @@ The balancer MUST update the global degradation signal only from **unscoped**
 selection cycles (no `account_ids` and no `exclude_account_ids`); a scoped
 selection — a preferred-account probe or a scope-restricted API key — sees only a
 subset of the pool and MUST NOT change the degradation level or the reported
-`available_accounts`. Recovery to normal MUST be driven by a *proven* signal — a
-selection that actually returned an account, or a typed routing error that shows
-accounts exist — and MUST NOT be inferred from mere account presence before
-selection. As a result, repeated failed selections while accounts are present but
-none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
+`available_accounts`. Recovery to normal MUST be driven ONLY by a *proven*
+selection that actually returned an account while the pool-wide circuit breaker is
+not open. It MUST NOT be inferred from mere account presence before selection,
+from a request- or model-scoped routing error (a request for an unsupported model
+must not clear a genuine pool-wide outage), or while the upstream circuit breaker
+remains open. As a result, repeated failed selections while accounts are present
+but none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 
 #### Scenario: Present-but-unselectable pool does not flap
 - **GIVEN** the pool has accounts present but none are currently selectable
@@ -62,7 +64,7 @@ none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 - **AND** no `DEGRADATION_TRANSITION degraded->normal` event is emitted between the failures
 
 #### Scenario: A successful selection recovers the degraded state
-- **GIVEN** the manager is degraded and an account becomes selectable
+- **GIVEN** the manager is degraded, the circuit breaker is not open, and an account becomes selectable
 - **WHEN** an unscoped `select_account` returns that account
 - **THEN** the degradation level returns to normal with one recovery event
 
@@ -70,3 +72,13 @@ none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 - **GIVEN** the manager is degraded with a known `available_accounts` count
 - **WHEN** a scoped `select_account` (account_ids or exclude) finds nothing selectable
 - **THEN** the degradation level and `available_accounts` are unchanged
+
+#### Scenario: A typed routing error does not clear degraded
+- **GIVEN** the manager is degraded
+- **WHEN** an unscoped `select_account` returns a typed routing error (e.g. no plan supports the model) instead of an account
+- **THEN** the degradation level and reason are unchanged
+
+#### Scenario: A lucky selection does not recover while the breaker is open
+- **GIVEN** the upstream circuit breaker is open and the manager is degraded
+- **WHEN** an unscoped `select_account` still returns an account
+- **THEN** the degradation level stays degraded until the breaker closes

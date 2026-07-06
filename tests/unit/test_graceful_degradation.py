@@ -253,7 +253,7 @@ async def test_load_balancer_returns_degraded_message_when_no_accounts_available
 
 
 @pytest.mark.asyncio
-async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_error(
+async def test_load_balancer_keeps_degraded_state_on_typed_selection_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -280,7 +280,10 @@ async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_err
 
     assert selection.account is None
     assert selection.error_code == load_balancer_module.NO_PLAN_SUPPORT_FOR_MODEL
-    assert is_degraded() is False
+    # A model-scoped routing error must NOT clear a pool-wide degraded state:
+    # accounts may be down across the pool while simply not supporting this one
+    # model, and clearing here would mask a real outage on /health (Cubic P2).
+    assert is_degraded() is True
 
 
 def _make_active_account(account_id: str) -> Account:
@@ -374,6 +377,24 @@ async def test_successful_selection_recovers_from_degraded(
     exits = [r for r in caplog.records if "DEGRADATION_TRANSITION degraded->normal" in r.getMessage()]
     assert len(exits) == 1
     assert get_available_accounts() == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_selection_does_not_recover_while_circuit_breaker_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the pool-wide circuit breaker open, a single successful selection must
+    # NOT clear the breaker-driven degraded state — the outage must stay visible
+    # on /health until the breaker itself closes (Cubic P2).
+    monkeypatch.setattr(load_balancer_module, "_is_upstream_circuit_breaker_open", lambda: True)
+    account = _make_active_account("acc-breaker")
+    balancer = LoadBalancer(lambda: _repo_factory([account]))
+
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert is_degraded() is True
+    assert get_status()["reason"] == "upstream circuit breaker is open"
 
 
 @pytest.mark.asyncio
