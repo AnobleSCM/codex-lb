@@ -398,12 +398,37 @@ async def test_successful_selection_does_not_recover_while_circuit_breaker_open(
 
 
 @pytest.mark.asyncio
-async def test_scoped_selection_does_not_mutate_global_degradation(
+async def test_scoped_successful_selection_recovers_from_degraded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A scoped request (preferred-account probe / scope-restricted key) sees only
-    # a subset of the pool, so it must neither flip /health degraded nor overwrite
-    # the service-wide available-account count.
+    # A scoped request (e.g. a sticky preferred-account probe) that actually
+    # RETURNS an account proves an upstream is serving, so it must clear a stale
+    # degraded state. Otherwise a recovered pool that then serves only
+    # scoped/sticky traffic would stay falsely degraded on /health forever
+    # (recovery starvation), because the scoped probe short-circuits the unscoped
+    # path that would otherwise drive recovery.
+    monkeypatch.setattr(load_balancer_module, "_is_upstream_circuit_breaker_open", lambda: False)
+    account = _make_active_account("acc-sticky")
+    balancer = LoadBalancer(lambda: _repo_factory([account]))
+
+    set_degraded("all upstream accounts are unavailable", available_accounts=0)
+    selection = await balancer.select_account(account_ids=[account.id])
+
+    assert selection.account is not None
+    assert selection.account.id == "acc-sticky"
+    assert is_degraded() is False
+    # Count is service-wide (runtime_accounts), not the scoped subset.
+    assert get_available_accounts() == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_failed_selection_does_not_mutate_global_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scoped request that finds NOTHING selectable sees only a subset of the
+    # pool, so it must neither flip /health degraded nor overwrite the
+    # service-wide available-account count. (A scoped *success* may still recover
+    # — see the test above — but a scoped *failure* is not a pool-outage signal.)
     monkeypatch.setattr(
         "app.modules.proxy.load_balancer.get_settings",
         lambda: SimpleNamespace(circuit_breaker_enabled=False),
@@ -414,7 +439,7 @@ async def test_scoped_selection_does_not_mutate_global_degradation(
     selection = await balancer.select_account(account_ids=["missing"])
 
     assert selection.account is None
-    # The global signal is untouched by the scoped probe.
+    # The global signal is untouched by the scoped probe's failure.
     assert is_degraded() is True
     assert get_status()["reason"] == "prior outage"
     assert get_available_accounts() == 7

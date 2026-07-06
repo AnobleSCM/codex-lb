@@ -45,16 +45,20 @@ new transition WARNING.
 
 ### Requirement: Degradation state tracks proven pool health, only from unscoped cycles
 
-The balancer MUST update the global degradation signal only from **unscoped**
-selection cycles (no `account_ids` and no `exclude_account_ids`); a scoped
-selection — a preferred-account probe or a scope-restricted API key — sees only a
-subset of the pool and MUST NOT change the degradation level or the reported
-`available_accounts`. Recovery to normal MUST be driven ONLY by a *proven*
-selection that actually returned an account while the pool-wide circuit breaker is
-not open. It MUST NOT be inferred from mere account presence before selection,
-from a request- or model-scoped routing error (a request for an unsupported model
-must not clear a genuine pool-wide outage), or while the upstream circuit breaker
-remains open. As a result, repeated failed selections while accounts are present
+**Entry** into degraded mode MUST be driven only from **unscoped** selection
+cycles (no `account_ids` and no `exclude_account_ids`); a scoped selection — a
+preferred-account probe or a scope-restricted API key — sees only a subset of the
+pool, so its *failure* MUST NOT set degraded or overwrite the reported
+`available_accounts`. **Recovery** to normal MUST be driven by any *proven*
+selection that actually returned an account — scoped or unscoped — while the
+pool-wide circuit breaker is not open, because a returned account disproves "all
+accounts unavailable" regardless of request scope (this keeps a recovered pool
+that then serves only scoped/sticky traffic from staying falsely degraded).
+Recovery MUST NOT be inferred from mere account presence before selection, from a
+request- or model-scoped routing error (a request for an unsupported model must
+not clear a genuine pool-wide outage), or while the upstream circuit breaker
+remains open. The reported `available_accounts` MUST stay service-wide even on a
+scoped success. As a result, repeated failed selections while accounts are present
 but none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 
 #### Scenario: Present-but-unselectable pool does not flap
@@ -68,7 +72,12 @@ but none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 - **WHEN** an unscoped `select_account` returns that account
 - **THEN** the degradation level returns to normal with one recovery event
 
-#### Scenario: A scoped selection leaves the global signal untouched
+#### Scenario: A scoped success also recovers (no recovery starvation)
+- **GIVEN** the manager is degraded, the circuit breaker is not open, and a preferred/scoped account is selectable
+- **WHEN** a scoped `select_account` (account_ids) returns that account
+- **THEN** the degradation level returns to normal and `available_accounts` reports the service-wide count
+
+#### Scenario: A scoped failure leaves the global signal untouched
 - **GIVEN** the manager is degraded with a known `available_accounts` count
 - **WHEN** a scoped `select_account` (account_ids or exclude) finds nothing selectable
 - **THEN** the degradation level and `available_accounts` are unchanged

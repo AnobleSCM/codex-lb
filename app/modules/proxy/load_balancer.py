@@ -403,14 +403,20 @@ class LoadBalancer:
                     )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
-        if drives_global_health and not _is_upstream_circuit_breaker_open():
-            # A selection actually succeeded AND the pool-wide breaker is not
-            # open, so the pool can serve: clear any degraded state now (logs the
-            # degraded->normal edge exactly once; a no-op when already normal).
-            # This deferred recovery replaces the pre-selection presence check
-            # that caused the flap (Cubic P1); gating on the breaker keeps a
-            # breaker-open outage visible on /health until the breaker itself
-            # closes, rather than letting one lucky selection mask it (Cubic P2).
+        if not _is_upstream_circuit_breaker_open():
+            # A selection actually returned an account, so at least one upstream
+            # is serving — that disproves "all accounts unavailable" regardless
+            # of request scope. Recovery is therefore NOT gated on
+            # drives_global_health: a sticky/preferred-account (scoped) success
+            # must be able to clear /health, otherwise a recovered pool that then
+            # serves only scoped traffic would stay falsely degraded forever
+            # (recovery starvation — the scoped preferred-account probe
+            # short-circuits the unscoped path). Entry into degraded stays
+            # unscoped-only above (a scoped *failure* is a subset view, not a
+            # pool outage). Still suppressed while the pool-wide breaker is open
+            # (Cubic P2); the count stays service-wide even for a scoped success
+            # because runtime_accounts is the full pool. Logs the degraded->normal
+            # edge once; a no-op when already normal.
             set_normal(available_accounts=_service_available_accounts(selection_inputs))
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",

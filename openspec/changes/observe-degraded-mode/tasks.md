@@ -71,3 +71,14 @@
   /health back to normal while the pool-wide breaker is still open. Test added.
 - [x] 7.3 Spec — recovery requirement corrected (proven selection + breaker
   closed only) with scenarios for the typed-error and breaker-open cases.
+
+## 8. Review follow-ups round 3 (recovery starvation)
+
+- [x] 8.1 Recovery is no longer gated on `drives_global_health`: any *proven*
+  selection that returns an account (scoped or unscoped) recovers to normal while
+  the breaker is closed. A returned account disproves "all accounts unavailable"
+  regardless of scope; without this a recovered pool that then serves only
+  sticky/preferred-account (scoped) traffic would stay falsely degraded forever
+  because the scoped preferred-probe short-circuits the unscoped path. Entry into
+  degraded stays unscoped-only. Test added (scoped success recovers); the
+  scoped-no-mutation test now covers the scoped *failure* case explicitly.
