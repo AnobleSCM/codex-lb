@@ -19,11 +19,12 @@ pytestmark = pytest.mark.unit
 
 def _settings(
     *,
+    auth_mode: DashboardAuthMode = DashboardAuthMode.STANDARD,
     trust_proxy_headers: bool = False,
     trust_loopback_host_header: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        dashboard_auth_mode=DashboardAuthMode.STANDARD,
+        dashboard_auth_mode=auth_mode,
         firewall_trust_proxy_headers=trust_proxy_headers,
         firewall_trusted_proxy_cidrs=[],
         dashboard_trust_loopback_host_header_for_long_sessions=trust_loopback_host_header,
@@ -92,7 +93,7 @@ def test_long_dashboard_session_ttl_clamps_for_bridge_ip_without_explicit_overri
     assert ttl_seconds == REMOTE_DASHBOARD_SESSION_TTL_SECONDS
 
 
-def test_long_dashboard_session_ttl_accepts_loopback_host_header_with_explicit_override(
+def test_long_dashboard_session_ttl_clamps_bridge_ip_with_loopback_host_header_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_settings(monkeypatch, _settings(trust_loopback_host_header=True))
@@ -102,7 +103,33 @@ def test_long_dashboard_session_ttl_accepts_loopback_host_header_with_explicit_o
         DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
     )
 
-    assert ttl_seconds == DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
+    assert ttl_seconds == REMOTE_DASHBOARD_SESSION_TTL_SECONDS
+
+
+def test_long_dashboard_session_ttl_clamps_spoofed_loopback_host_for_remote_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_settings(monkeypatch, _settings(trust_loopback_host_header=True))
+
+    ttl_seconds = resolve_dashboard_session_ttl_seconds(
+        _request(client_host="203.0.113.10", host="127.0.0.1:2455"),
+        DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
+    )
+
+    assert ttl_seconds == REMOTE_DASHBOARD_SESSION_TTL_SECONDS
+
+
+def test_long_dashboard_session_ttl_clamps_for_trusted_header_auth_mode_on_direct_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_settings(monkeypatch, _settings(auth_mode=DashboardAuthMode.TRUSTED_HEADER))
+
+    ttl_seconds = resolve_dashboard_session_ttl_seconds(
+        _request(client_host="127.0.0.1", host="localhost:2455"),
+        DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
+    )
+
+    assert ttl_seconds == REMOTE_DASHBOARD_SESSION_TTL_SECONDS
 
 
 def test_long_dashboard_session_ttl_clamps_when_proxy_headers_are_trusted(monkeypatch: pytest.MonkeyPatch) -> None:

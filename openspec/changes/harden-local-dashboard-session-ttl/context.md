@@ -4,4 +4,4 @@ Alembic revision `20260705_000000_harden_dashboard_session_ttl` changes the `das
 
 ## Guardrail
 
-The 1-year effective TTL is intentionally limited to standard dashboard auth mode when the request is socket-level local. Localhost-published Docker deployments where the container sees a bridge peer can opt in with `CODEX_LB_DASHBOARD_TRUST_LOOPBACK_HOST_HEADER_FOR_LONG_SESSIONS=true`; that override still requires a loopback dashboard URL and no forwarded-client headers. Requests that arrive through proxy-aware mode, trusted-header auth, non-loopback hosts, or the default bridge-without-override path receive the 12-hour fallback when the configured value exceeds 30 days.
+The 1-year effective TTL is intentionally limited to standard dashboard auth mode when the request has a loopback socket peer, uses a loopback dashboard URL, and has no forwarded-client headers. `CODEX_LB_DASHBOARD_TRUST_LOOPBACK_HOST_HEADER_FOR_LONG_SESSIONS=true` does not make Docker bridge peers or other non-loopback socket peers eligible for a long session; spoofed loopback Host headers still receive the 12-hour fallback when the configured value exceeds 30 days.

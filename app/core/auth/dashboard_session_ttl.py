@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -33,11 +34,13 @@ def _allows_long_local_dashboard_session(request: HTTPConnection) -> bool:
         return False
     if settings.firewall_trust_proxy_headers:
         return False
+    if any(request.headers.get(header) for header in _FORWARDED_CLIENT_IP_HEADERS):
+        return False
+    if not _has_loopback_socket_peer(request):
+        return False
     if _is_local_request(request):
         return True
     if not settings.dashboard_trust_loopback_host_header_for_long_sessions:
-        return False
-    if any(request.headers.get(header) for header in _FORWARDED_CLIENT_IP_HEADERS):
         return False
     return _uses_loopback_dashboard_url(request)
 
@@ -52,6 +55,15 @@ def _is_local_request(request: HTTPConnection) -> bool:
     from app.core.request_locality import is_local_request
 
     return is_local_request(request)
+
+
+def _has_loopback_socket_peer(request: HTTPConnection) -> bool:
+    if request.client is None:
+        return False
+    try:
+        return ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
 
 
 def _uses_loopback_dashboard_url(request: HTTPConnection) -> bool:
