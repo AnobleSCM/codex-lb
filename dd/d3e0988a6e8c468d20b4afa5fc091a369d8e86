@@ -1,0 +1,31 @@
+app/modules/proxy/load_balancer.py
+  4287e61ef3107d1f 151-162,406-413
+tests/unit/test_graceful_degradation.py
+  4287e61ef3107d1f 256,283-286,382-399
+openspec/changes/observe-degraded-mode/tasks.md
+  4287e61ef3107d1f 16-19,62-73
+openspec/changes/observe-degraded-mode/specs/proxy-runtime-observability/spec.md
+  4287e61ef3107d1f 52-58,67,75-84
+openspec/changes/observe-degraded-mode/proposal.md
+  4287e61ef3107d1f 36-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ddd3e0988a6e8c468d20b4afa5fc091a369d8e86",
+  "prompts": {
+    "4287e61ef3107d1f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a3b1351-6437-448b-bae2-f16bba448aee",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "AnobleSCM",
+      "messages": [],
+      "total_additions": 81,
+      "total_deletions": 36,
+      "accepted_lines": 81,
+      "overriden_lines": 0
+    }
+  }
+}
