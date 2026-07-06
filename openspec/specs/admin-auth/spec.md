@@ -51,13 +51,33 @@ The system SHALL enforce both a minimum and a maximum length on dashboard passwo
 
 ### Requirement: Dashboard password sessions use a configurable absolute lifetime
 
-The system SHALL issue dashboard password-authenticated sessions with an absolute lifetime controlled by persisted dashboard settings. The default lifetime SHALL remain 12 hours. The configured lifetime SHALL apply to newly issued dashboard password sessions by setting both the encrypted session expiry payload and the cookie `Max-Age` to the same value.
+The system SHALL issue dashboard password-authenticated sessions with an absolute lifetime controlled by persisted dashboard settings. The default persisted lifetime SHALL be 1 year. Configured lifetimes at or below 30 days SHALL apply to newly issued dashboard password sessions by setting both the encrypted session expiry payload and the cookie `Max-Age` to the same value. Configured lifetimes above 30 days SHALL apply only in standard dashboard auth mode when the request has a loopback socket peer, uses a loopback dashboard URL, and has no forwarded-client headers. The explicit loopback-host-header override MUST NOT make a non-loopback socket peer eligible for a long session. Non-loopback, bridge-originated, proxy-aware, trusted-header, or forwarded-client requests MUST receive a 12-hour effective lifetime without rewriting the persisted setting.
 
 #### Scenario: Newly issued dashboard password session honors configured lifetime
 
-- **WHEN** an admin configures a dashboard session lifetime and successfully completes password authentication
+- **WHEN** an admin configures a dashboard session lifetime and successfully completes password authentication from a socket-level local request
 - **THEN** the newly issued dashboard session expires after the configured absolute lifetime
 - **AND** the cookie `Max-Age` matches the same configured lifetime
+
+#### Scenario: Long localhost-published bridge session requires explicit override
+
+- **WHEN** an admin configures a dashboard session lifetime greater than 30 days and successfully completes password authentication through a loopback dashboard URL whose socket peer is not loopback
+- **AND** the explicit loopback-host-header override is disabled
+- **THEN** the newly issued dashboard session expires after 12 hours
+
+#### Scenario: Long localhost-published bridge session remains clamped with explicit override
+
+- **WHEN** an admin configures a dashboard session lifetime greater than 30 days and successfully completes password authentication through a loopback dashboard URL whose socket peer is not loopback
+- **AND** the explicit loopback-host-header override is enabled
+- **AND** no forwarded-client headers are present
+- **THEN** the newly issued dashboard session expires after 12 hours
+- **AND** the cookie `Max-Age` is `43200`
+
+#### Scenario: Long dashboard password session falls back for non-loopback access
+
+- **WHEN** an admin configures a dashboard session lifetime greater than 30 days and successfully completes password authentication from a non-loopback, bridge-originated, proxy-aware, trusted-header, or forwarded-client request
+- **THEN** the newly issued dashboard session expires after 12 hours
+- **AND** the cookie `Max-Age` is `43200`
 
 #### Scenario: Existing dashboard sessions keep their original expiry
 
@@ -65,3 +85,33 @@ The system SHALL issue dashboard password-authenticated sessions with an absolut
 - **THEN** previously issued cookies continue to expire according to the expiry embedded in their encrypted payload
 - **AND** only newly issued dashboard password sessions use the updated lifetime
 
+### Requirement: Legacy default dashboard session TTL migration
+
+The migration for this change MUST update `dashboard_settings.dashboard_session_ttl_seconds` from `43200` to `31536000` only for rows that still carry the legacy default value. Rows with any customized value MUST remain unchanged.
+On downgrade, the migration MUST reset rows carrying `31536000` back to `43200`, while rows carrying any other customized value MUST remain unchanged.
+
+#### Scenario: Legacy default row migrates to 1 year
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 43200`
+- **WHEN** the migration runs
+- **THEN** the row has `dashboard_session_ttl_seconds = 31536000`
+
+#### Scenario: Customized row remains unchanged
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 7200`
+- **WHEN** the migration runs
+- **THEN** the row still has `dashboard_session_ttl_seconds = 7200`
+
+#### Scenario: Downgrade restores migrated session TTL rows
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 43200`
+- **AND** the migration has upgraded it to `31536000`
+- **WHEN** the migration is downgraded
+- **THEN** the row has `dashboard_session_ttl_seconds = 43200`
+
+#### Scenario: Downgrade preserves customized session TTL rows
+
+- **GIVEN** a dashboard settings row has `dashboard_session_ttl_seconds = 7200`
+- **AND** the migration has left it unchanged
+- **WHEN** the migration is downgraded
+- **THEN** the row still has `dashboard_session_ttl_seconds = 7200`

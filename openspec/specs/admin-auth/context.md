@@ -47,7 +47,7 @@ Requests from localhost (127.0.0.1, ::1) bypass bootstrap entirely — no token 
 
 ## Session Management
 
-Stateless encrypted cookies using Fernet. Session payload: `{exp, pw, tv}`. TTL: 12 hours. No server-side session storage.
+Stateless encrypted cookies using Fernet. Session payload: `{exp, pw, tv}`. Default persisted TTL: 1 year for local dashboard use. Long configured lifetimes above 30 days apply only when the request has a loopback socket peer, uses a loopback dashboard URL, has no forwarded-client headers, and standard dashboard auth is active. Non-loopback, bridge-originated, proxy-aware, trusted-header, forwarded-client, or spoofed loopback Host requests fall back to 12 hours. No server-side session storage.
 
 ## Rate Limiting
 

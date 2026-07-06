@@ -15,7 +15,7 @@ async def test_settings_api_get_and_update(async_client):
     assert payload["preferEarlierResetAccounts"] is True
     assert payload["routingStrategy"] == "capacity_weighted"
     assert payload["openaiCacheAffinityMaxAgeSeconds"] == 1800
-    assert payload["dashboardSessionTtlSeconds"] == 43200
+    assert payload["dashboardSessionTtlSeconds"] == 31536000
     assert payload["httpResponsesSessionBridgePromptCacheIdleTtlSeconds"] == 3600
     assert payload["httpResponsesSessionBridgeGatewaySafeMode"] is False
     assert payload["stickyReallocationBudgetThresholdPct"] == 95.0

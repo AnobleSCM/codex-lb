@@ -212,6 +212,7 @@ class Settings(BaseSettings):
     firewall_ip_cache_ttl_seconds: int = Field(default=30, gt=0)
     dashboard_auth_mode: DashboardAuthMode = DashboardAuthMode.STANDARD
     dashboard_auth_proxy_header: str = "Remote-User"
+    dashboard_trust_loopback_host_header_for_long_sessions: bool = False
 
     # --- Multi-replica & production settings ---
     # Prometheus metrics
