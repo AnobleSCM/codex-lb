@@ -82,3 +82,9 @@
   because the scoped preferred-probe short-circuits the unscoped path. Entry into
   degraded stays unscoped-only. Test added (scoped success recovers); the
   scoped-no-mutation test now covers the scoped *failure* case explicitly.
+
+- [x] 8.2 The "No available accounts" error is only wrapped as "operating in
+  degraded mode" when the service actually is degraded (`is_degraded()`); a scoped
+  miss on a healthy pool (e.g. a scope-restricted key that exhausted its assigned
+  accounts) returns the plain error instead of a false global-outage claim while
+  /health stays normal. Test added. (Codex review P2.)

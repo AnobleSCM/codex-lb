@@ -445,6 +445,28 @@ async def test_scoped_failed_selection_does_not_mutate_global_degradation(
     assert get_available_accounts() == 7
 
 
+@pytest.mark.asyncio
+async def test_scoped_miss_on_healthy_pool_returns_plain_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scope-restricted request that matches no account, while the pool is
+    # healthy (not degraded), must NOT be told the whole service is in degraded
+    # mode — /health stays normal, so the error should be the plain no-accounts
+    # message, not a false global-outage claim (Codex P2).
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(circuit_breaker_enabled=False),
+    )
+    account = _make_active_account("acc-present")
+    balancer = LoadBalancer(lambda: _repo_factory([account]))
+
+    selection = await balancer.select_account(account_ids=["nonexistent"])
+
+    assert selection.account is None
+    assert selection.error_message == "No available accounts"
+    assert is_degraded() is False
+
+
 def test_set_normal_clears_available_accounts_when_count_omitted() -> None:
     set_degraded("outage", available_accounts=5)
     assert get_available_accounts() == 5

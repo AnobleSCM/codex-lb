@@ -82,6 +82,11 @@ but none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
 - **WHEN** a scoped `select_account` (account_ids or exclude) finds nothing selectable
 - **THEN** the degradation level and `available_accounts` are unchanged
 
+#### Scenario: A scoped miss on a healthy pool is not labeled degraded
+- **GIVEN** the manager is normal (not degraded)
+- **WHEN** a scoped `select_account` finds no matching account
+- **THEN** the returned error is the plain no-accounts message and does not claim the service is in degraded mode
+
 #### Scenario: A typed routing error does not clear degraded
 - **GIVEN** the manager is degraded
 - **WHEN** an unscoped `select_account` returns a typed routing error (e.g. no plan supports the model) instead of an account

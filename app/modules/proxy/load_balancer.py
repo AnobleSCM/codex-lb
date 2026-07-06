@@ -30,7 +30,7 @@ from app.core.openai.model_registry import get_model_registry
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.resilience.circuit_breaker import are_all_account_circuit_breakers_open
 from app.core.resilience.degradation import get_status as get_degradation_status
-from app.core.resilience.degradation import set_degraded, set_normal
+from app.core.resilience.degradation import is_degraded, set_degraded, set_normal
 from app.core.usage.quota import apply_usage_quota
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import utcnow
@@ -401,7 +401,15 @@ class LoadBalancer:
                         "all upstream accounts are unavailable",
                         available_accounts=_service_available_accounts(selection_inputs),
                     )
-                error_message = _format_degraded_error_message(error_message)
+                if is_degraded():
+                    # Only claim "degraded mode" in the error when the service
+                    # actually is degraded (we just set it above, or it was
+                    # already globally degraded). A scoped miss on a healthy pool
+                    # — e.g. a scope-restricted key that exhausted its assigned
+                    # accounts — returns the plain error instead of falsely
+                    # telling the caller the whole service is down while /health
+                    # stays normal (Codex P2).
+                    error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
         if not _is_upstream_circuit_breaker_open():
             # A selection actually returned an account, so at least one upstream
