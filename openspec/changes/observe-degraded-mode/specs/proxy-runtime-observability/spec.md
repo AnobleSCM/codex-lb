@@ -5,9 +5,12 @@
 `GET /health` MUST return `status = "ok"` whenever the process is alive, so a
 degraded upstream never evicts the process. Alongside `status`, the response
 MUST carry the current degradation `level` and `reason` and the last-known
-`available_accounts` count (accounts the balancer last considered that were
-present and not deactivated/paused). These fields MUST be read from in-memory
-runtime state without an additional database read on the `/health` path.
+`available_accounts` count. That count MUST be **service-wide** — the number of
+accounts present in the whole pool (not deactivated/paused) at the last unscoped
+selection cycle — and MUST NOT be narrowed by a request's account/exclude/model
+scope. The `degradation` object MUST always be present (non-null). These fields
+MUST be read from in-memory runtime state without an additional database read on
+the `/health` path.
 
 #### Scenario: Healthy pool reports normal
 - **GIVEN** the balancer is not degraded
@@ -39,3 +42,31 @@ new transition WARNING.
 - **GIVEN** the manager is in the degraded state
 - **WHEN** `set_normal` is called
 - **THEN** exactly one `DEGRADATION_TRANSITION` recovery event is emitted at INFO
+
+### Requirement: Degradation state tracks proven pool health, only from unscoped cycles
+
+The balancer MUST update the global degradation signal only from **unscoped**
+selection cycles (no `account_ids` and no `exclude_account_ids`); a scoped
+selection — a preferred-account probe or a scope-restricted API key — sees only a
+subset of the pool and MUST NOT change the degradation level or the reported
+`available_accounts`. Recovery to normal MUST be driven by a *proven* signal — a
+selection that actually returned an account, or a typed routing error that shows
+accounts exist — and MUST NOT be inferred from mere account presence before
+selection. As a result, repeated failed selections while accounts are present but
+none are selectable MUST NOT produce a `degraded->normal->degraded` flap.
+
+#### Scenario: Present-but-unselectable pool does not flap
+- **GIVEN** the pool has accounts present but none are currently selectable
+- **WHEN** `select_account` is called repeatedly and each call selects nothing
+- **THEN** exactly one `DEGRADATION_TRANSITION normal->degraded` WARNING is emitted
+- **AND** no `DEGRADATION_TRANSITION degraded->normal` event is emitted between the failures
+
+#### Scenario: A successful selection recovers the degraded state
+- **GIVEN** the manager is degraded and an account becomes selectable
+- **WHEN** an unscoped `select_account` returns that account
+- **THEN** the degradation level returns to normal with one recovery event
+
+#### Scenario: A scoped selection leaves the global signal untouched
+- **GIVEN** the manager is degraded with a known `available_accounts` count
+- **WHEN** a scoped `select_account` (account_ids or exclude) finds nothing selectable
+- **THEN** the degradation level and `available_accounts` are unchanged

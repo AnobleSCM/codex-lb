@@ -29,8 +29,13 @@ behavior or liveness semantics.
   line only on the normal↔degraded **edge** (WARNING on enter, INFO on
   recovery). Repeated `set_degraded` calls while already degraded drop to debug,
   eliminating the per-request warning storm.
-- `LoadBalancer.select_account` passes the current pool count at each
-  `set_degraded` / `set_normal` call site.
+- `LoadBalancer.select_account` drives the degradation signal only from
+  *unscoped* selection cycles — a preferred-account probe or a scope-restricted
+  API key sees a subset of the pool and must not flip the global signal — reports
+  a **service-wide** present-account count (not the request-scoped subset), and
+  recovers to normal only on a *proven* selection or a typed routing error, never
+  on mere account presence (which flapped `degraded->normal->degraded` on every
+  failed cycle when accounts were present but none selectable).
 - `GET /health` now returns `degradation` (`level`, `reason`) and
   `available_accounts` alongside `status`. **`status` stays `"ok"`** — liveness
   is unchanged so a degraded upstream cannot evict the process (the same reason

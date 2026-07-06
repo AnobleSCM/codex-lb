@@ -9,9 +9,13 @@
 
 ## 2. Balancer wiring
 
-- [x] 2.1 Pass `available_accounts=len(selection_inputs.accounts)` at the
-  circuit-breaker `set_degraded`, the two `set_normal`, and the
-  no-available-accounts `set_degraded` call sites in `LoadBalancer.select_account`.
+- [x] 2.1 Drive the degradation signal only from *unscoped* selection cycles
+  (`account_ids is None and not exclude`), reporting a **service-wide** present
+  count via `_service_available_accounts` (derived from `runtime_accounts`, so a
+  per-request model/scope filter cannot shrink it). Enter degraded on the
+  circuit-breaker and no-available-accounts paths; recover to normal only on a
+  *proven* selection (success path) or a typed routing error — never on mere
+  account presence.
 
 ## 3. /health exposure
 
@@ -32,6 +36,25 @@
 
 ## 5. Validation
 
-- [x] 5.1 `pytest` across degradation/health/load-balancer suites — 175 passed, 3 pre-existing skips.
-- [x] 5.2 `ruff check` + `ruff format --check` + `ty check` on changed files — clean.
-- [ ] 5.3 `openspec validate --specs` — run in CI (openspec CLI not on local PATH this run).
+- [x] 5.1 `pytest` across degradation/health/load-balancer suites.
+- [x] 5.2 `ruff check` + `ruff format --check` + `ty check` (whole-repo) — clean.
+- [ ] 5.3 `openspec validate --specs` — **run-before-merge, NOT a CI gate.** The
+  CI workflow (`.github/workflows/ci.yml`) has no OpenSpec step and the CLI is a
+  Node package not present in this Python repo's toolchain, so validation is a
+  manual/pre-merge step, not automated. (Corrects the earlier claim that CI runs
+  it — Cubic P2.) A dedicated CI OpenSpec job is deferred: it touches the
+  protected CI workflow and needs its own review.
+
+## 6. Review follow-ups (Cubic on PR #16)
+
+- [x] 6.1 P1 — kill the `degraded->normal->degraded` flap: stop marking normal on
+  mere account presence before selection; recover only on a proven selection.
+- [x] 6.2 P2 — `/health available_accounts` is service-wide, not request-scoped:
+  gate global mutation to unscoped cycles and count via `_service_available_accounts`.
+- [x] 6.3 P2 — `set_normal` / `set_degraded` clear `_available_accounts` to `None`
+  when a fresh count is omitted, so `/health` never reports a stale pool count.
+- [x] 6.4 P3 — `/health` indexes `degradation["level"]` directly (fail loud) via a
+  typed `DegradationStatus`; `HealthResponse.degradation` is non-null; integration
+  test asserts the full `{level, reason}` shape.
+- [x] 6.5 Tests — no-flap across repeated failed cycles, recovery on a successful
+  selection, and scoped requests leaving the global signal untouched.

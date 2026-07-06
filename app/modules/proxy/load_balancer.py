@@ -141,14 +141,30 @@ class LoadBalancer:
             return selection_inputs
 
         selection_inputs = await load_selection_inputs()
-        circuit_breaker_open = _is_upstream_circuit_breaker_open()
-        available_accounts = len(selection_inputs.accounts)
-        if circuit_breaker_open:
-            set_degraded("upstream circuit breaker is open", available_accounts=available_accounts)
-        elif selection_inputs.accounts:
-            set_normal(available_accounts=available_accounts)
-        elif selection_inputs.error_code is not None:
-            set_normal(available_accounts=available_accounts)
+        # The degradation manager is a *service-wide* pool-health signal. Only an
+        # unscoped selection cycle (no account_ids / exclude filter) observes the
+        # whole pool, so only it may mutate that signal: a preferred-account probe
+        # or a scope-restricted API key sees a subset and must neither flip
+        # /health degraded nor publish a subset count (Cubic P2 — it would report
+        # 0/1 while other upstream accounts are healthy).
+        drives_global_health = scoped_account_ids is None and not excluded_ids
+        if drives_global_health:
+            if _is_upstream_circuit_breaker_open():
+                set_degraded(
+                    "upstream circuit breaker is open",
+                    available_accounts=_service_available_accounts(selection_inputs),
+                )
+            elif selection_inputs.error_code is not None:
+                # A typed routing error (e.g. model unsupported) proves accounts
+                # exist — they just cannot serve this request — so any stale
+                # "all accounts unavailable" degraded state is cleared here. This
+                # branch returns immediately below, so it cannot flap.
+                set_normal(available_accounts=_service_available_accounts(selection_inputs))
+            # Recovery for the accounts-present case is deferred to a *proven*
+            # selection (see the success path below). Marking normal here on mere
+            # account presence flapped degraded->normal->degraded on every failed
+            # cycle when accounts were present but none selectable (Cubic P1;
+            # 2026-07-05 incident).
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
             return AccountSelection(
@@ -381,16 +397,23 @@ class LoadBalancer:
 
         if selected_snapshot is None:
             if error_message == "No available accounts":
-                # selection_inputs.accounts counts accounts that passed the DB
-                # status filter; when this branch fires none of them were
-                # selectable, so a non-zero count means "present but rate/quota
-                # blocked" while zero means "all deactivated/paused".
-                set_degraded(
-                    "all upstream accounts are unavailable",
-                    available_accounts=len(selection_inputs.accounts),
-                )
+                if drives_global_health:
+                    # None of the pool's accounts were selectable. Report the
+                    # service-wide count of *present* (not deactivated/paused)
+                    # accounts: non-zero => present but rate/quota blocked,
+                    # zero => all deactivated/paused.
+                    set_degraded(
+                        "all upstream accounts are unavailable",
+                        available_accounts=_service_available_accounts(selection_inputs),
+                    )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
+        if drives_global_health:
+            # A selection actually succeeded, so the pool can serve: clear any
+            # degraded state now (logs the degraded->normal edge exactly once; a
+            # no-op when already normal). This deferred recovery replaces the
+            # pre-selection presence check that caused the flap (Cubic P1).
+            set_normal(available_accounts=_service_available_accounts(selection_inputs))
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",
             selected_snapshot.id,
@@ -1213,6 +1236,22 @@ def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Acco
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:
     return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
+
+
+def _service_available_accounts(selection_inputs: _SelectionInputs) -> int:
+    """Service-wide count of accounts present in the pool (not deactivated or
+    paused), independent of the per-request model/scope filter.
+
+    ``selection_inputs.accounts`` is narrowed by account_ids / exclude / model,
+    so it is a request-scoped count. ``runtime_accounts`` carries the full,
+    unfiltered account list, so filtering it through :func:`_selectable_accounts`
+    yields the service-wide "present" count that /health should publish. Falls
+    back to the scoped list only when runtime_accounts is unavailable.
+    """
+    runtime_accounts = selection_inputs.runtime_accounts
+    if runtime_accounts is None:
+        return len(selection_inputs.accounts)
+    return len(_selectable_accounts(runtime_accounts))
 
 
 def _gated_limit_name_for_model(model: str | None) -> str | None:

@@ -42,9 +42,12 @@ async def health_check() -> HealthResponse:
     degradation = get_degradation_status()
     return HealthResponse(
         status="ok",
+        # Index directly: get_status() always carries a non-null level, so a
+        # missing key should fail loud (a watchdog reading a silently-defaulted
+        # "normal" during a real degradation is worse than a 500 in dev).
         degradation=DegradationInfo(
-            level=degradation.get("level") or "normal",
-            reason=degradation.get("reason"),
+            level=degradation["level"],
+            reason=degradation["reason"],
         ),
         available_accounts=get_available_accounts(),
     )

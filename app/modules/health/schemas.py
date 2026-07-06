@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DegradationInfo(BaseModel):
@@ -16,7 +16,9 @@ class HealthResponse(BaseModel):
     status: str
     # Upstream degradation state, surfaced so watchdogs/daemons can pre-check
     # before claiming work. ``status`` stays "ok" (liveness) even when degraded.
-    degradation: DegradationInfo | None = None
+    # Always present and non-null — the handler always supplies it — so generated
+    # clients can rely on the field rather than treating it as optional.
+    degradation: DegradationInfo = Field(default_factory=DegradationInfo)
     # Accounts the balancer last considered (present, not deactivated/paused);
     # None until the first selection cycle populates it.
     available_accounts: int | None = None

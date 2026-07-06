@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterator, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel
 from app.core.resilience.degradation import (
     get_available_accounts,
@@ -15,6 +17,7 @@ from app.core.resilience.degradation import (
     set_degraded,
     set_normal,
 )
+from app.db.models import Account, AccountStatus
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy import load_balancer as load_balancer_module
@@ -278,3 +281,138 @@ async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_err
     assert selection.account is None
     assert selection.error_code == load_balancer_module.NO_PLAN_SUPPORT_FOR_MODEL
     assert is_degraded() is False
+
+
+def _make_active_account(account_id: str) -> Account:
+    encryptor = TokenEncryptor()
+    return Account(
+        id=account_id,
+        chatgpt_account_id=f"workspace-{account_id}",
+        email=f"{account_id}@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access"),
+        refresh_token_encrypted=encryptor.encrypt("refresh"),
+        id_token_encrypted=encryptor.encrypt("id"),
+        last_refresh=datetime.now(tz=timezone.utc),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_selection_does_not_flap_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Accounts are present in the pool but none are selectable (e.g. all in
+    # transient error backoff). Before the fix, select_account marked normal on
+    # mere presence and then degraded again when selection failed, flapping on
+    # every failed cycle. The transition WARNING must now fire exactly once with
+    # no recovery event in between.
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(circuit_breaker_enabled=False),
+    )
+    present = _make_active_account("a1")
+    balancer = LoadBalancer(lambda: _repo_factory([]))
+    monkeypatch.setattr(
+        balancer,
+        "_load_selection_inputs",
+        AsyncMock(
+            return_value=load_balancer_module._SelectionInputs(
+                accounts=[present],
+                latest_primary={},
+                latest_secondary={},
+                runtime_accounts=[present],
+            )
+        ),
+    )
+    monkeypatch.setattr(load_balancer_module, "_build_states", lambda **_kwargs: ([], {}))
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_select_account_preferring_budget_safe",
+        lambda *_a, **_k: load_balancer_module.SelectionResult(account=None, error_message="No available accounts"),
+    )
+
+    caplog.set_level("INFO", logger="app.core.resilience.degradation")
+    caplog.clear()
+
+    for _ in range(3):
+        result = await balancer.select_account()
+        assert result.account is None
+
+    enters = [r for r in caplog.records if "DEGRADATION_TRANSITION normal->degraded" in r.getMessage()]
+    exits = [r for r in caplog.records if "DEGRADATION_TRANSITION degraded->normal" in r.getMessage()]
+    assert len(enters) == 1
+    assert exits == []
+    assert is_degraded() is True
+    # Service-wide present count, not the request-scoped selection subset.
+    assert get_available_accounts() == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_selection_recovers_from_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A stale degraded state (from a prior outage) must clear the moment a real
+    # selection succeeds — recovery is now driven by a proven selection, not by
+    # mere account presence.
+    monkeypatch.setattr(load_balancer_module, "_is_upstream_circuit_breaker_open", lambda: False)
+    account = _make_active_account("acc-recover")
+    balancer = LoadBalancer(lambda: _repo_factory([account]))
+
+    set_degraded("all upstream accounts are unavailable", available_accounts=0)
+    caplog.set_level("INFO", logger="app.core.resilience.degradation")
+    caplog.clear()
+
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert selection.account.id == "acc-recover"
+    assert is_degraded() is False
+    exits = [r for r in caplog.records if "DEGRADATION_TRANSITION degraded->normal" in r.getMessage()]
+    assert len(exits) == 1
+    assert get_available_accounts() == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_selection_does_not_mutate_global_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scoped request (preferred-account probe / scope-restricted key) sees only
+    # a subset of the pool, so it must neither flip /health degraded nor overwrite
+    # the service-wide available-account count.
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings",
+        lambda: SimpleNamespace(circuit_breaker_enabled=False),
+    )
+    balancer = LoadBalancer(lambda: _repo_factory([]))
+
+    set_degraded("prior outage", available_accounts=7)
+    selection = await balancer.select_account(account_ids=["missing"])
+
+    assert selection.account is None
+    # The global signal is untouched by the scoped probe.
+    assert is_degraded() is True
+    assert get_status()["reason"] == "prior outage"
+    assert get_available_accounts() == 7
+
+
+def test_set_normal_clears_available_accounts_when_count_omitted() -> None:
+    set_degraded("outage", available_accounts=5)
+    assert get_available_accounts() == 5
+
+    set_normal()  # recovery without a fresh count
+
+    # None (unknown) is reported instead of a stale pool count.
+    assert get_available_accounts() is None
+
+
+def test_set_degraded_clears_available_accounts_when_count_omitted() -> None:
+    set_normal(available_accounts=5)
+    assert get_available_accounts() == 5
+
+    set_degraded("outage")  # degrade without a fresh count
+
+    assert get_available_accounts() is None

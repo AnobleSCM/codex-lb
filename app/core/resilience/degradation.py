@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +11,18 @@ class DegradationLevel(Enum):
     NORMAL = "normal"
     DEGRADED = "degraded"
     CRITICAL = "critical"
+
+
+class DegradationStatus(TypedDict):
+    """Shape returned by :func:`get_status` — the /health degradation contract.
+
+    ``level`` is always one of the :class:`DegradationLevel` values (never
+    absent), so consumers may index it directly and fail loud on a contract
+    break; ``reason`` is null in the normal state.
+    """
+
+    level: str
+    reason: str | None
 
 
 class DegradationManager:
@@ -22,8 +35,10 @@ class DegradationManager:
         self._available_accounts: int | None = None
 
     def set_degraded(self, reason: str | None = None, *, available_accounts: int | None = None) -> None:
-        if available_accounts is not None:
-            self._available_accounts = available_accounts
+        # ``available_accounts`` is the count observed at *this* transition. When
+        # a caller cannot provide a fresh count, clear it to ``None`` (unknown)
+        # rather than preserving a stale pool count on /health.
+        self._available_accounts = available_accounts
         was_normal = self._level == DegradationLevel.NORMAL
         self._level = DegradationLevel.DEGRADED
         self._reason = reason
@@ -41,8 +56,10 @@ class DegradationManager:
             logger.debug("Still degraded: %s", reason or "unknown reason")
 
     def set_normal(self, *, available_accounts: int | None = None) -> None:
-        if available_accounts is not None:
-            self._available_accounts = available_accounts
+        # ``available_accounts`` is the count observed at *this* transition. When
+        # a caller cannot provide a fresh count, clear it to ``None`` (unknown)
+        # so /health does not keep reporting a stale pool count after recovery.
+        self._available_accounts = available_accounts
         previous = self._level
         self._level = DegradationLevel.NORMAL
         self._reason = None
@@ -56,7 +73,7 @@ class DegradationManager:
     def is_degraded(self) -> bool:
         return self._level != DegradationLevel.NORMAL
 
-    def get_status(self) -> dict[str, str | None]:
+    def get_status(self) -> DegradationStatus:
         return {
             "level": self._level.value,
             "reason": self._reason,
@@ -81,7 +98,7 @@ def is_degraded() -> bool:
     return _manager.is_degraded()
 
 
-def get_status() -> dict[str, str | None]:
+def get_status() -> DegradationStatus:
     return _manager.get_status()
 
 
