@@ -30,7 +30,7 @@ from app.core.openai.model_registry import get_model_registry
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.resilience.circuit_breaker import are_all_account_circuit_breakers_open
 from app.core.resilience.degradation import get_status as get_degradation_status
-from app.core.resilience.degradation import set_degraded, set_normal
+from app.core.resilience.degradation import is_degraded, set_degraded, set_normal
 from app.core.usage.quota import apply_usage_quota
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import utcnow
@@ -141,13 +141,25 @@ class LoadBalancer:
             return selection_inputs
 
         selection_inputs = await load_selection_inputs()
-        circuit_breaker_open = _is_upstream_circuit_breaker_open()
-        if circuit_breaker_open:
-            set_degraded("upstream circuit breaker is open")
-        elif selection_inputs.accounts:
-            set_normal()
-        elif selection_inputs.error_code is not None:
-            set_normal()
+        # The degradation manager is a *service-wide* pool-health signal. Only an
+        # unscoped selection cycle (no account_ids / exclude filter) observes the
+        # whole pool, so only it may mutate that signal: a preferred-account probe
+        # or a scope-restricted API key sees a subset and must neither flip
+        # /health degraded nor publish a subset count (Cubic P2 — it would report
+        # 0/1 while other upstream accounts are healthy).
+        drives_global_health = scoped_account_ids is None and not excluded_ids
+        if drives_global_health and _is_upstream_circuit_breaker_open():
+            set_degraded(
+                "upstream circuit breaker is open",
+                available_accounts=_service_available_accounts(selection_inputs),
+            )
+        # Recovery to normal is driven ONLY by a proven selection (the success
+        # path below). It is deliberately NOT triggered by mere account presence
+        # (which flapped degraded->normal->degraded on every failed cycle — Cubic
+        # P1), nor by a typed/model-scoped routing error: a request for an
+        # unsupported model must not clear a genuine pool-wide outage on /health
+        # (Cubic P2). Typed routing errors return just below with the degraded
+        # state left untouched.
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
             return AccountSelection(
@@ -380,9 +392,40 @@ class LoadBalancer:
 
         if selected_snapshot is None:
             if error_message == "No available accounts":
-                set_degraded("all upstream accounts are unavailable")
-                error_message = _format_degraded_error_message(error_message)
+                if drives_global_health:
+                    # None of the pool's accounts were selectable. Report the
+                    # service-wide count of *present* (not deactivated/paused)
+                    # accounts: non-zero => present but rate/quota blocked,
+                    # zero => all deactivated/paused.
+                    set_degraded(
+                        "all upstream accounts are unavailable",
+                        available_accounts=_service_available_accounts(selection_inputs),
+                    )
+                if is_degraded():
+                    # Only claim "degraded mode" in the error when the service
+                    # actually is degraded (we just set it above, or it was
+                    # already globally degraded). A scoped miss on a healthy pool
+                    # — e.g. a scope-restricted key that exhausted its assigned
+                    # accounts — returns the plain error instead of falsely
+                    # telling the caller the whole service is down while /health
+                    # stays normal (Codex P2).
+                    error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=None)
+        if not _is_upstream_circuit_breaker_open():
+            # A selection actually returned an account, so at least one upstream
+            # is serving — that disproves "all accounts unavailable" regardless
+            # of request scope. Recovery is therefore NOT gated on
+            # drives_global_health: a sticky/preferred-account (scoped) success
+            # must be able to clear /health, otherwise a recovered pool that then
+            # serves only scoped traffic would stay falsely degraded forever
+            # (recovery starvation — the scoped preferred-account probe
+            # short-circuits the unscoped path). Entry into degraded stays
+            # unscoped-only above (a scoped *failure* is a subset view, not a
+            # pool outage). Still suppressed while the pool-wide breaker is open
+            # (Cubic P2); the count stays service-wide even for a scoped success
+            # because runtime_accounts is the full pool. Logs the degraded->normal
+            # edge once; a no-op when already normal.
+            set_normal(available_accounts=_service_available_accounts(selection_inputs))
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",
             selected_snapshot.id,
@@ -1205,6 +1248,22 @@ def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Acco
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:
     return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
+
+
+def _service_available_accounts(selection_inputs: _SelectionInputs) -> int:
+    """Service-wide count of accounts present in the pool (not deactivated or
+    paused), independent of the per-request model/scope filter.
+
+    ``selection_inputs.accounts`` is narrowed by account_ids / exclude / model,
+    so it is a request-scoped count. ``runtime_accounts`` carries the full,
+    unfiltered account list, so filtering it through :func:`_selectable_accounts`
+    yields the service-wide "present" count that /health should publish. Falls
+    back to the scoped list only when runtime_accounts is unavailable.
+    """
+    runtime_accounts = selection_inputs.runtime_accounts
+    if runtime_accounts is None:
+        return len(selection_inputs.accounts)
+    return len(_selectable_accounts(runtime_accounts))
 
 
 def _gated_limit_name_for_model(model: str | None) -> str | None:
