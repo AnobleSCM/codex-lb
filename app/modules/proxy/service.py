@@ -12322,7 +12322,11 @@ def _is_sqlite_database_locked_error(exc: Exception) -> bool:
 
 
 def _http_bridge_is_single_instance_ring(settings: Settings) -> bool:
-    _, ring = _normalized_http_bridge_instance_ring(settings)
+    try:
+        _, ring = _normalized_http_bridge_instance_ring(settings)
+    except Exception:
+        logger.warning("Failed to normalize HTTP bridge instance ring", exc_info=True)
+        return False
     return len(ring) <= 1
 
 

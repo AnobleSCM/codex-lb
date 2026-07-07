@@ -24,13 +24,26 @@ def _index_names(table_name: str) -> set[str]:
     inspector = sa.inspect(bind)
     if not inspector.has_table(table_name):
         return set()
+    sqlite_index_names: set[str] = set()
+    if bind.dialect.name == "sqlite":
+        sqlite_index_names = {
+            str(row[0])
+            for row in bind.execute(
+                sa.text("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :table_name"),
+                {"table_name": table_name},
+            )
+            if row[0]
+        }
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
             message="Skipped unsupported reflection of expression-based index",
             category=SAWarning,
         )
-        return {name for index in inspector.get_indexes(table_name) if isinstance(name := index["name"], str)}
+        reflected_index_names = {
+            name for index in inspector.get_indexes(table_name) if isinstance(name := index["name"], str)
+        }
+    return sqlite_index_names | reflected_index_names
 
 
 def upgrade() -> None:

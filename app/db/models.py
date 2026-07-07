@@ -661,7 +661,7 @@ class ApiKey(Base):
         server_default=false(),
         nullable=False,
     )
-    usage_sections: Mapped[str | None] = mapped_column(
+    usage_sections: Mapped[str] = mapped_column(
         Text,
         nullable=False,
         default="upstream_limits,account_pool_usage",
