@@ -36,7 +36,7 @@ def upgrade() -> None:
         return
     if _COLUMN not in columns:
         with op.batch_alter_table(_TABLE) as batch_op:
-            batch_op.add_column(sa.Column(_COLUMN, sa.String(), nullable=True))
+            batch_op.add_column(sa.Column(_COLUMN, sa.String(36), nullable=True))
 
     rows = bind.execute(sa.text(f"SELECT id FROM {_TABLE} WHERE {_COLUMN} IS NULL OR {_COLUMN} = ''")).fetchall()
     for row in rows:
@@ -46,7 +46,7 @@ def upgrade() -> None:
         )
 
     with op.batch_alter_table(_TABLE) as batch_op:
-        batch_op.alter_column(_COLUMN, existing_type=sa.String(), nullable=False)
+        batch_op.alter_column(_COLUMN, existing_type=sa.String(36), nullable=False)
 
 
 def downgrade() -> None:

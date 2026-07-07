@@ -1,7 +1,7 @@
 """add request log failure metadata
 
 Revision ID: 20260526_000000_add_request_log_failure_metadata
-Revises: 20260525_000000_add_usage_raw_window_latest_index
+Revises: 20260601_000000_merge_relative_availability_and_usage_raw_heads
 Create Date: 2026-05-26
 """
 

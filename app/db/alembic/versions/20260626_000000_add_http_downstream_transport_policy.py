@@ -41,6 +41,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     if _has_column("api_keys", "transport_policy_override"):
-        op.drop_column("api_keys", "transport_policy_override")
+        with op.batch_alter_table("api_keys") as batch_op:
+            batch_op.drop_column("transport_policy_override")
     if _has_column("dashboard_settings", "http_downstream_transport_policy"):
-        op.drop_column("dashboard_settings", "http_downstream_transport_policy")
+        with op.batch_alter_table("dashboard_settings") as batch_op:
+            batch_op.drop_column("http_downstream_transport_policy")

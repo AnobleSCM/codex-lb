@@ -7,8 +7,11 @@ Create Date: 2026-05-16
 
 from __future__ import annotations
 
+import warnings
+
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.exc import SAWarning
 
 revision = "20260516_000000_add_sqlite_hot_path_indexes"
 down_revision = "20260514_000000_add_request_logs_api_key_time_index"
@@ -21,7 +24,13 @@ def _index_names(table_name: str) -> set[str]:
     inspector = sa.inspect(bind)
     if not inspector.has_table(table_name):
         return set()
-    return {name for index in inspector.get_indexes(table_name) if isinstance(name := index["name"], str)}
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Skipped unsupported reflection of expression-based index",
+            category=SAWarning,
+        )
+        return {name for index in inspector.get_indexes(table_name) if isinstance(name := index["name"], str)}
 
 
 def upgrade() -> None:

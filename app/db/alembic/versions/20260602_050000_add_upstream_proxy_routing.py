@@ -133,15 +133,21 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     request_log_columns = _columns(bind, "request_logs")
-    for column_name in (
-        "upstream_proxy_fail_closed_reason",
-        "upstream_proxy_fallback_used",
-        "upstream_proxy_endpoint_id",
-        "upstream_proxy_pool_id",
-        "upstream_proxy_route_mode",
-    ):
-        if column_name in request_log_columns:
-            op.drop_column("request_logs", column_name)
+    request_log_columns_to_drop = [
+        column_name
+        for column_name in (
+            "upstream_proxy_fail_closed_reason",
+            "upstream_proxy_fallback_used",
+            "upstream_proxy_endpoint_id",
+            "upstream_proxy_pool_id",
+            "upstream_proxy_route_mode",
+        )
+        if column_name in request_log_columns
+    ]
+    if request_log_columns_to_drop:
+        with op.batch_alter_table("request_logs") as batch_op:
+            for column_name in request_log_columns_to_drop:
+                batch_op.drop_column(column_name)
     dashboard_columns = _columns(bind, "dashboard_settings")
     if "upstream_proxy_default_pool_id" in dashboard_columns or "upstream_proxy_routing_enabled" in dashboard_columns:
         with op.batch_alter_table("dashboard_settings") as batch_op:

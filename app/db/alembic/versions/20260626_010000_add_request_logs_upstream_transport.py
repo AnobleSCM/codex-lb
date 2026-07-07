@@ -28,4 +28,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     if _has_column("request_logs", "upstream_transport"):
-        op.drop_column("request_logs", "upstream_transport")
+        with op.batch_alter_table("request_logs") as batch_op:
+            batch_op.drop_column("upstream_transport")

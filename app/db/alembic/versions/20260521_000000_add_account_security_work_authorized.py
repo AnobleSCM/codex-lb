@@ -43,4 +43,5 @@ def downgrade() -> None:
 
     columns = {column["name"] for column in inspector.get_columns("accounts")}
     if "security_work_authorized" in columns:
-        op.drop_column("accounts", "security_work_authorized")
+        with op.batch_alter_table("accounts") as batch_op:
+            batch_op.drop_column("security_work_authorized")

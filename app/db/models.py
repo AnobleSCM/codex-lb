@@ -49,12 +49,6 @@ class AccountStatus(str, Enum):
     DEACTIVATED = "deactivated"
 
 
-class AccountRoutingPolicy(str, Enum):
-    NORMAL = "normal"
-    BURN_FIRST = "burn_first"
-    PRESERVE = "preserve"
-
-
 class StickySessionKind(str, Enum):
     CODEX_SESSION = "codex_session"
     STICKY_THREAD = "sticky_thread"
@@ -619,12 +613,6 @@ class DashboardSettings(Base):
         String,
         default="gpt-5.4-mini",
         server_default=text("'gpt-5.4-mini'"),
-        nullable=False,
-    )
-    additional_quota_routing_policies_json: Mapped[str] = mapped_column(
-        Text,
-        default="{}",
-        server_default=text("'{}'"),
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

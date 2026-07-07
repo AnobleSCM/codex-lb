@@ -184,6 +184,9 @@ def downgrade() -> None:
         op.drop_index("idx_quota_planner_decisions_status_created", table_name="quota_planner_decisions")
     if "idx_logs_request_kind_time" in _index_names("request_logs"):
         op.drop_index("idx_logs_request_kind_time", table_name="request_logs")
+    if "request_kind" in _column_names("request_logs"):
+        with op.batch_alter_table("request_logs") as batch_op:
+            batch_op.drop_column("request_kind")
 
     tables = _table_names()
     if "quota_window_observations" in tables:
