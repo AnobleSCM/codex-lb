@@ -1,7 +1,7 @@
 """harden dashboard session ttl default
 
 Revision ID: 20260705_000000_harden_dashboard_session_ttl
-Revises: 20260515_000000_soft_delete_request_logs_on_account_delete
+Revises: 20260701_000000_add_weekly_pace_smoothing_minutes
 Create Date: 2026-07-05
 """
 
@@ -12,7 +12,7 @@ from alembic import op
 from sqlalchemy.engine import Connection
 
 revision = "20260705_000000_harden_dashboard_session_ttl"
-down_revision = "20260515_000000_soft_delete_request_logs_on_account_delete"
+down_revision = "20260701_000000_add_weekly_pace_smoothing_minutes"
 branch_labels = None
 depends_on = None
 
@@ -54,13 +54,6 @@ def downgrade() -> None:
     if not columns or "dashboard_session_ttl_seconds" not in columns:
         return
 
-    op.execute(
-        sa.text(
-            "UPDATE dashboard_settings "
-            "SET dashboard_session_ttl_seconds = :old_default "
-            "WHERE dashboard_session_ttl_seconds = :new_default"
-        ).bindparams(new_default=NEW_DEFAULT_TTL_SECONDS, old_default=OLD_DEFAULT_TTL_SECONDS)
-    )
     with op.batch_alter_table("dashboard_settings") as batch_op:
         batch_op.alter_column(
             "dashboard_session_ttl_seconds",

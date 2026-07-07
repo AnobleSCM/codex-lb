@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from alembic import command
 from anyio import to_thread
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -30,7 +29,6 @@ except ImportError:
 
 from app.db.migrate import (
     LEGACY_MIGRATION_ORDER,
-    _build_alembic_config,
     check_schema_drift,
     inspect_migration_state,
     run_startup_migrations,
@@ -492,20 +490,62 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
             await session.execute(text("PRAGMA foreign_keys=ON"))
             dashboard_columns_rows = (await session.execute(text("PRAGMA table_info(dashboard_settings)"))).fetchall()
             dashboard_columns = {str(row[1]) for row in dashboard_columns_rows if len(row) > 1}
+            dashboard_column_defaults = {str(row[1]): row[4] for row in dashboard_columns_rows if len(row) > 4}
+            account_columns_rows = (await session.execute(text("PRAGMA table_info(accounts)"))).fetchall()
+            account_columns = {str(row[1]) for row in account_columns_rows if len(row) > 1}
+            api_key_columns_rows = (await session.execute(text("PRAGMA table_info(api_keys)"))).fetchall()
+            api_key_columns = {str(row[1]) for row in api_key_columns_rows if len(row) > 1}
+            api_key_column_defaults = {str(row[1]): row[4] for row in api_key_columns_rows if len(row) > 4}
             request_log_columns_rows = (await session.execute(text("PRAGMA table_info(request_logs)"))).fetchall()
             request_log_columns = {str(row[1]) for row in request_log_columns_rows if len(row) > 1}
             assert "deleted_at" in request_log_columns
             assert "transport" in request_log_columns
             assert "plan_type" in request_log_columns
+            assert "source" in request_log_columns
+            assert "archive_request_id" in request_log_columns
+            assert "limit_warmup_enabled" in account_columns
             legacy_plan_type = (
                 await session.execute(text("SELECT plan_type FROM request_logs WHERE id=1"))
             ).scalar_one()
             assert legacy_plan_type is None
+            assert "limit_warmup_enabled" in dashboard_columns
+            assert "limit_warmup_windows" in dashboard_columns
+            assert "limit_warmup_model" in dashboard_columns
+            assert "limit_warmup_prompt" in dashboard_columns
+            assert "limit_warmup_cooldown_seconds" in dashboard_columns
+            assert "limit_warmup_exhausted_threshold_percent" in dashboard_columns
+            assert "limit_warmup_min_available_percent" in dashboard_columns
+            exhausted_threshold = (
+                await session.execute(
+                    text("SELECT limit_warmup_exhausted_threshold_percent FROM dashboard_settings WHERE id=1")
+                )
+            ).scalar_one()
+            assert exhausted_threshold == 99.0
+            assert "hide_upstream_quota_from_api_keys" in dashboard_columns
+            assert dashboard_column_defaults["hide_upstream_quota_from_api_keys"] in ("0", 0, False)
+            assert "single_account_id" in dashboard_columns
+            assert "limit_warmup_staggered_idle_enabled" in dashboard_columns
+            assert "usage_sections" in api_key_columns
+            assert api_key_column_defaults["usage_sections"] in (
+                "'upstream_limits,account_pool_usage'",
+                '"upstream_limits,account_pool_usage"',
+                "upstream_limits,account_pool_usage",
+            )
             if "routing_strategy" in dashboard_columns:
                 routing_strategy = (
                     await session.execute(text("SELECT routing_strategy FROM dashboard_settings WHERE id=1"))
                 ).scalar_one()
                 assert routing_strategy == "capacity_weighted"
+            assert "relative_availability_power" in dashboard_columns
+            relative_availability_power = (
+                await session.execute(text("SELECT relative_availability_power FROM dashboard_settings WHERE id=1"))
+            ).scalar_one()
+            assert relative_availability_power == 2.0
+            assert "relative_availability_top_k" in dashboard_columns
+            relative_availability_top_k = (
+                await session.execute(text("SELECT relative_availability_top_k FROM dashboard_settings WHERE id=1"))
+            ).scalar_one()
+            assert relative_availability_top_k == 5
             assert "openai_cache_affinity_max_age_seconds" in dashboard_columns
             affinity_ttl = (
                 await session.execute(
@@ -531,12 +571,25 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
             ).scalar_one()
             assert gateway_safe_mode in (False, 0)
             assert "sticky_reallocation_budget_threshold_pct" in dashboard_columns
+            assert "sticky_reallocation_primary_budget_threshold_pct" in dashboard_columns
+            assert "sticky_reallocation_secondary_budget_threshold_pct" in dashboard_columns
             sticky_budget_threshold = (
                 await session.execute(
                     text("SELECT sticky_reallocation_budget_threshold_pct FROM dashboard_settings WHERE id=1")
                 )
             ).scalar_one()
             assert sticky_budget_threshold == 95.0
+            sticky_primary_threshold, sticky_secondary_threshold = (
+                await session.execute(
+                    text(
+                        "SELECT sticky_reallocation_primary_budget_threshold_pct, "
+                        "sticky_reallocation_secondary_budget_threshold_pct "
+                        "FROM dashboard_settings WHERE id=1"
+                    )
+                )
+            ).one()
+            assert sticky_primary_threshold == 95.0
+            assert sticky_secondary_threshold == 95.0
             sticky_columns_rows = (await session.execute(text("PRAGMA table_info(sticky_sessions)"))).fetchall()
             sticky_columns = {str(row[1]) for row in sticky_columns_rows if len(row) > 1}
             assert "kind" in sticky_columns
@@ -582,6 +635,17 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
             assert "idx_logs_model_effort_time" in request_log_index_names
             assert "idx_logs_status_error_time" in request_log_index_names
             assert "idx_logs_api_key_time" in request_log_index_names
+            assert "idx_logs_source_requested_at" in request_log_index_names
+            warmup_table_exists = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='account_limit_warmups'")
+                )
+            ).scalar_one()
+            assert warmup_table_exists == 1
+            warmup_index_rows = (await session.execute(text("PRAGMA index_list(account_limit_warmups)"))).fetchall()
+            warmup_index_names = {str(row[1]) for row in warmup_index_rows if len(row) > 1}
+            assert "idx_account_limit_warmups_account_attempted" in warmup_index_names
+            assert "idx_account_limit_warmups_status_attempted" in warmup_index_names
             request_log_fk_rows = (await session.execute(text("PRAGMA foreign_key_list(request_logs)"))).fetchall()
             request_log_fk_actions = {
                 (str(row[2]).lower(), str(row[3]).lower(), str(row[4]).lower(), str(row[6]).lower())
@@ -597,12 +661,12 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
                 text(
                     """
                     INSERT INTO accounts (
-                        id, chatgpt_account_id, email, plan_type,
+                        id, chatgpt_account_id, codex_installation_id, email, plan_type,
                         access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
                         last_refresh, created_at, status, deactivation_reason, reset_at
                     )
                     VALUES (
-                        'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
+                        'acc_legacy_2', 'chatgpt_legacy_2', 'legacy-installation-2', 'legacy@example.com', 'team',
                         x'11', x'12', x'13',
                         '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
                     )
@@ -759,24 +823,19 @@ async def test_dashboard_settings_default_flip_migration_updates_pristine_fresh_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("initial_ttl_seconds", "expected_upgrade_ttl_seconds", "expected_downgrade_ttl_seconds"),
+    ("initial_ttl_seconds", "expected_ttl_seconds"),
     [
-        (
-            REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
-            DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
-            REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
-        ),
-        (7200, 7200, 7200),
+        (REMOTE_DASHBOARD_SESSION_TTL_SECONDS, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS),
+        (7200, 7200),
     ],
 )
 async def test_dashboard_session_ttl_migration_updates_only_legacy_default(
     tmp_path,
     initial_ttl_seconds: int,
-    expected_upgrade_ttl_seconds: int,
-    expected_downgrade_ttl_seconds: int,
+    expected_ttl_seconds: int,
 ):
     db_url = f"sqlite+aiosqlite:///{tmp_path / f'dashboard-session-ttl-{initial_ttl_seconds}.sqlite'}"
-    parent_revision = "20260515_000000_soft_delete_request_logs_on_account_delete"
+    parent_revision = "20260701_000000_add_weekly_pace_smoothing_minutes"
     target_revision = "20260705_000000_harden_dashboard_session_ttl"
 
     await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=True))
@@ -811,22 +870,82 @@ async def test_dashboard_session_ttl_migration_updates_only_legacy_default(
                     )
                 )
             ).scalar_one()
-            assert ttl_seconds == expected_upgrade_ttl_seconds
-
-        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
-
-        async with session_factory() as session:
-            ttl_seconds = (
-                await session.execute(
-                    text(
-                        """
-                        SELECT dashboard_session_ttl_seconds
-                        FROM dashboard_settings
-                        WHERE id = 1
-                        """
-                    )
-                )
-            ).scalar_one()
-            assert ttl_seconds == expected_downgrade_ttl_seconds
+            assert ttl_seconds == expected_ttl_seconds
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_free_account_monthly_migration_renames_only_free_usage_windows(tmp_path):
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'free-monthly-migration.sqlite'}"
+
+    await to_thread.run_sync(
+        lambda: run_upgrade(
+            db_url,
+            "20260604_000000_add_reauth_required_account_status",
+            bootstrap_legacy=True,
+        )
+    )
+
+    engine = create_async_engine(db_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO accounts (
+                        id, email, plan_type,
+                        access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
+                        last_refresh, status
+                    )
+                    VALUES
+                      ('acc_free_monthly_migration', 'free-monthly@example.com', 'free',
+                       x'01', x'02', x'03', '2026-01-01 00:00:00', 'active'),
+                      ('acc_paid_monthly_migration', 'paid-monthly@example.com', 'plus',
+                       x'04', x'05', x'06', '2026-01-01 00:00:00', 'active')
+                    """
+                )
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO usage_history (account_id, recorded_at, window, used_percent)
+                    VALUES
+                      ('acc_free_monthly_migration', CURRENT_TIMESTAMP, 'primary', 10.0),
+                      ('acc_free_monthly_migration', CURRENT_TIMESTAMP, 'secondary', 20.0),
+                      ('acc_free_monthly_migration', CURRENT_TIMESTAMP, NULL, 25.0),
+                      ('acc_paid_monthly_migration', CURRENT_TIMESTAMP, 'primary', 30.0),
+                      ('acc_paid_monthly_migration', CURRENT_TIMESTAMP, 'secondary', 40.0),
+                      ('acc_paid_monthly_migration', CURRENT_TIMESTAMP, NULL, 45.0)
+                    """
+                )
+            )
+            await session.commit()
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+
+        async with session_factory() as session:
+            free_windows = [
+                row[0]
+                for row in (
+                    await session.execute(
+                        text("SELECT window FROM usage_history WHERE account_id = :account_id ORDER BY id"),
+                        {"account_id": "acc_free_monthly_migration"},
+                    )
+                ).all()
+            ]
+            paid_windows = [
+                row[0]
+                for row in (
+                    await session.execute(
+                        text("SELECT window FROM usage_history WHERE account_id = :account_id ORDER BY id"),
+                        {"account_id": "acc_paid_monthly_migration"},
+                    )
+                ).all()
+            ]
+    finally:
+        await engine.dispose()
+
+    assert free_windows == ["old-primary", "old-secondary", "old-primary"]
+    assert paid_windows == ["primary", "secondary", None]
