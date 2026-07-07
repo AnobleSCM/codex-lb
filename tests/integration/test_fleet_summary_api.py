@@ -1017,6 +1017,7 @@ async def test_fleet_refresh_respects_account_scoped_api_key(async_client, db_se
 
 @pytest.mark.asyncio
 async def test_fleet_refresh_owns_session_until_shielded_refresh_finishes(db_setup, monkeypatch):
+    fleet_api._BACKGROUND_REFRESH_TASKS.clear()
     await _seed_account_with_windows(
         "acc_refresh_cancel",
         "refresh-cancel@example.com",
@@ -1094,8 +1095,16 @@ async def test_fleet_refresh_owns_session_until_shielded_refresh_finishes(db_set
     await asyncio.sleep(0)
 
     assert not session_exited.is_set()
+    assert len(fleet_api._BACKGROUND_REFRESH_TASKS) == 1
     allow_refresh_finish.set()
     await asyncio.wait_for(session_exited.wait(), timeout=1)
+    await asyncio.wait_for(_wait_for_background_refresh_tasks_to_drain(), timeout=1)
 
     assert session_was_open_during_refresh == [True]
     assert invalidations == ["rate_limit_headers", "account_selection"]
+    assert fleet_api._BACKGROUND_REFRESH_TASKS == set()
+
+
+async def _wait_for_background_refresh_tasks_to_drain() -> None:
+    while fleet_api._BACKGROUND_REFRESH_TASKS:
+        await asyncio.sleep(0)

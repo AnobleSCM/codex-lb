@@ -30,6 +30,7 @@ router = APIRouter(
 )
 
 _REFRESH_SKIP_STATUSES = {AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED}
+_BACKGROUND_REFRESH_TASKS: set[asyncio.Task[FleetRefreshResponse]] = set()
 
 
 def _visible_account_ids(api_key: ApiKeyData) -> list[str] | None:
@@ -104,7 +105,8 @@ async def refresh_fleet_usage(
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        task.add_done_callback(_log_cancelled_refresh_task_exception)
+        _BACKGROUND_REFRESH_TASKS.add(task)
+        task.add_done_callback(_handle_cancelled_refresh_task_done)
         raise
 
 
@@ -134,6 +136,13 @@ async def _refresh_fleet_usage_with_owned_session(visible_account_ids: list[str]
             attempted_count=len(eligible_accounts),
             generated_at=utcnow(),
         )
+
+
+def _handle_cancelled_refresh_task_done(task: asyncio.Task[FleetRefreshResponse]) -> None:
+    try:
+        _log_cancelled_refresh_task_exception(task)
+    finally:
+        _BACKGROUND_REFRESH_TASKS.discard(task)
 
 
 def _log_cancelled_refresh_task_exception(task: asyncio.Task[FleetRefreshResponse]) -> None:
