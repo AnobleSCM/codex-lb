@@ -28,14 +28,32 @@ LIVE_COMPOSE="${HOME}/.codex/codex-lb/docker-compose.yml"
 HEALTH_URL="http://127.0.0.1:2455/health"
 DRAIN_STATUS_URL="${CODEX_LB_DEPLOY_DRAIN_STATUS_URL:-http://127.0.0.1:2455/internal/drain/status}"
 DRAIN_START_URL="${CODEX_LB_DEPLOY_DRAIN_START_URL:-http://127.0.0.1:2455/internal/drain/start}"
+DRAIN_STOP_URL="${CODEX_LB_DEPLOY_DRAIN_STOP_URL:-http://127.0.0.1:2455/internal/drain/stop}"
 DEPLOY_DRAIN_TIMEOUT_SECONDS="${CODEX_LB_DEPLOY_DRAIN_TIMEOUT_SECONDS:-900}"
 DEPLOY_DRAIN_POLL_SECONDS="${CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+DRAIN_STARTED=0
 
 fatal() {
   echo "FATAL: $*" >&2
   exit 1
 }
+
+cleanup_drain_on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  if [ "$exit_code" -ne 0 ] && [ "$DRAIN_STARTED" -eq 1 ]; then
+    echo "==> Stopping live drain after failed deploy" >&2
+    if curl -fsS -X POST "$DRAIN_STOP_URL" >/dev/null; then
+      echo "    live drain stopped" >&2
+    else
+      echo "WARN: unable to stop live drain at $DRAIN_STOP_URL; manual recovery may be required" >&2
+    fi
+  fi
+  exit "$exit_code"
+}
+
+trap cleanup_drain_on_exit EXIT
 
 drain_check() {
   local key="$1"
@@ -94,6 +112,11 @@ require_idle_before_deploy() {
   fi
 
   echo "    live proxy idle: in_flight=0"
+}
+
+start_live_drain() {
+  DRAIN_STARTED=1
+  curl -fsS -X POST "$DRAIN_START_URL" >/dev/null || fatal "unable to start live drain at $DRAIN_START_URL"
 }
 
 wait_for_drain_zero() {
@@ -173,7 +196,7 @@ else
 fi
 
 echo "==> Draining live proxy before recreate"
-curl -fsS -X POST "$DRAIN_START_URL" >/dev/null || fatal "unable to start live drain at $DRAIN_START_URL"
+start_live_drain
 wait_for_drain_zero
 
 echo "==> Retagging $IMAGE_TAG as codex-lb:active"
