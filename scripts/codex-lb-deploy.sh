@@ -26,6 +26,99 @@ SHORT_SHA="$(git rev-parse --short HEAD)"
 IMAGE_TAG="codex-lb:local-${SHORT_SHA}"
 LIVE_COMPOSE="${HOME}/.codex/codex-lb/docker-compose.yml"
 HEALTH_URL="http://127.0.0.1:2455/health"
+DRAIN_STATUS_URL="${CODEX_LB_DEPLOY_DRAIN_STATUS_URL:-http://127.0.0.1:2455/internal/drain/status}"
+DRAIN_START_URL="${CODEX_LB_DEPLOY_DRAIN_START_URL:-http://127.0.0.1:2455/internal/drain/start}"
+DEPLOY_DRAIN_TIMEOUT_SECONDS="${CODEX_LB_DEPLOY_DRAIN_TIMEOUT_SECONDS:-900}"
+DEPLOY_DRAIN_POLL_SECONDS="${CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS:-2}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+fatal() {
+  echo "FATAL: $*" >&2
+  exit 1
+}
+
+drain_check() {
+  local key="$1"
+  "$PYTHON_BIN" -c "
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+    checks = payload.get('checks', {})
+    if not isinstance(checks, dict):
+        raise TypeError('checks is not an object')
+    print(checks.get(sys.argv[1], ''))
+except Exception as exc:
+    raise SystemExit(f'failed to parse drain status: {exc}')
+" "$key"
+}
+
+read_drain_status() {
+  curl -fsS "$DRAIN_STATUS_URL"
+}
+
+extract_drain_value() {
+  local status_json="$1"
+  local key="$2"
+  printf '%s' "$status_json" | drain_check "$key"
+}
+
+extract_in_flight() {
+  local status_json="$1"
+  local in_flight
+  in_flight="$(extract_drain_value "$status_json" "in_flight")" || return 1
+  case "$in_flight" in
+    ''|*[!0-9]*)
+      echo "invalid in_flight value in drain status: $in_flight" >&2
+      return 1
+      ;;
+  esac
+  printf '%s' "$in_flight"
+}
+
+require_idle_before_deploy() {
+  local status_json
+  status_json="$(read_drain_status)" || fatal "unable to read live drain status at $DRAIN_STATUS_URL"
+
+  local draining bridge_drain_active in_flight
+  draining="$(extract_drain_value "$status_json" "draining")" || fatal "unable to parse live drain status"
+  bridge_drain_active="$(extract_drain_value "$status_json" "bridge_drain_active")" || fatal "unable to parse live drain status"
+  in_flight="$(extract_in_flight "$status_json")" || fatal "unable to parse live drain status"
+
+  if [ "$draining" = "true" ] || [ "$bridge_drain_active" = "true" ]; then
+    fatal "live proxy is already draining; refusing to build or recreate during an active drain"
+  fi
+  if [ "$in_flight" -ne 0 ]; then
+    fatal "live proxy has $in_flight in-flight request(s); refusing to build or recreate"
+  fi
+
+  echo "    live proxy idle: in_flight=0"
+}
+
+wait_for_drain_zero() {
+  case "$DEPLOY_DRAIN_TIMEOUT_SECONDS" in
+    ''|*[!0-9]*)
+      fatal "CODEX_LB_DEPLOY_DRAIN_TIMEOUT_SECONDS must be a non-negative integer"
+      ;;
+  esac
+
+  local deadline=$((SECONDS + DEPLOY_DRAIN_TIMEOUT_SECONDS))
+  while true; do
+    local status_json in_flight
+    status_json="$(read_drain_status)" || fatal "unable to read live drain status at $DRAIN_STATUS_URL"
+    in_flight="$(extract_in_flight "$status_json")" || fatal "unable to parse live drain status"
+    if [ "$in_flight" -eq 0 ]; then
+      echo "    drain complete: in_flight=0"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      fatal "live proxy still has $in_flight in-flight request(s) after ${DEPLOY_DRAIN_TIMEOUT_SECONDS}s; not recreating"
+    fi
+    echo "    waiting for in-flight requests to drain: in_flight=$in_flight"
+    sleep "$DEPLOY_DRAIN_POLL_SECONDS"
+  done
+}
 
 if [ ! -f "$LIVE_COMPOSE" ]; then
   echo "FATAL: live compose not found at $LIVE_COMPOSE" >&2
@@ -44,6 +137,9 @@ if ! docker buildx version >/dev/null 2>&1; then
   echo "       Install it with: brew install docker-buildx" >&2
   exit 1
 fi
+
+echo "==> Checking live proxy idle gate"
+require_idle_before_deploy
 
 echo "==> Building $IMAGE_TAG from $REPO_ROOT (HEAD=$SHORT_SHA)"
 docker --context colima build -t "$IMAGE_TAG" .
@@ -75,6 +171,10 @@ else
   fi
   echo "    new image contains $LIVE_HEAD: OK"
 fi
+
+echo "==> Draining live proxy before recreate"
+curl -fsS -X POST "$DRAIN_START_URL" >/dev/null || fatal "unable to start live drain at $DRAIN_START_URL"
+wait_for_drain_zero
 
 echo "==> Retagging $IMAGE_TAG as codex-lb:active"
 docker --context colima tag "$IMAGE_TAG" codex-lb:active

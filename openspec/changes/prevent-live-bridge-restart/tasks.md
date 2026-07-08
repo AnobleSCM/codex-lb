@@ -1,0 +1,7 @@
+- [x] Add red/green coverage for the local deploy helper refusing active in-flight work before build/recreate.
+- [x] Add red/green coverage for the deploy helper starting drain and waiting before force-recreate on an idle proxy.
+- [x] Add red/green coverage that single-container Compose templates pin a stable HTTP bridge instance id.
+- [x] Implement the local deploy idle gate and drain wait.
+- [x] Pin the stable bridge instance id in the repo Compose templates.
+- [x] Run focused tests, lint/type checks, and the full pytest suite.
+- [x] Attempt OpenSpec validation. Blocked locally: neither `openspec` nor `uv run openspec` is available in this runtime.
