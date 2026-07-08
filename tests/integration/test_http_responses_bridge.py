@@ -34,18 +34,7 @@ _TEST_SYNC_TIMEOUT_SECONDS = 5.0
 async def _cleanup_http_bridge_sessions(app_instance):
     yield
     service = get_proxy_service_for_app(app_instance)
-    async with service._http_bridge_lock:
-        sessions = list(service._http_bridge_sessions.values())
-        inflight_sessions = list(service._http_bridge_inflight_sessions.values())
-        service._http_bridge_sessions.clear()
-        service._http_bridge_inflight_sessions.clear()
-        service._http_bridge_turn_state_index.clear()
-        service._http_bridge_previous_response_index.clear()
-    for session in sessions:
-        await service._close_http_bridge_session(session)
-    for inflight_future in inflight_sessions:
-        if not inflight_future.done():
-            inflight_future.cancel()
+    await service.close_all_http_bridge_sessions()
 
 
 def _encode_jwt(payload: dict) -> str:

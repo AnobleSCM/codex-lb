@@ -24,6 +24,7 @@ import aiohttp
 import anyio
 from fastapi import WebSocket
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 
 from app.core import shutdown as shutdown_state
 from app.core import usage as usage_core
@@ -5472,6 +5473,12 @@ class ProxyService:
         except Exception as exc:
             if _is_missing_durable_bridge_table_error(exc):
                 logger.warning("Durable bridge tables missing; using in-memory bridge session fallback", exc_info=True)
+                return
+            if _is_sqlite_database_locked_error(exc) and _http_bridge_is_single_instance_ring(get_settings()):
+                logger.warning(
+                    "Durable bridge SQLite claim was busy; using in-memory bridge session fallback",
+                    exc_info=True,
+                )
                 return
             raise
 
@@ -12308,6 +12315,19 @@ def _is_missing_durable_bridge_table_error(exc: Exception) -> bool:
     if "http_bridge_sessions" not in message and "http_bridge_session_aliases" not in message:
         return False
     return "no such table" in message or "does not exist" in message or "undefinedtable" in message
+
+
+def _is_sqlite_database_locked_error(exc: Exception) -> bool:
+    return isinstance(exc, OperationalError) and "database is locked" in str(exc).lower()
+
+
+def _http_bridge_is_single_instance_ring(settings: Settings) -> bool:
+    try:
+        _, ring = _normalized_http_bridge_instance_ring(settings)
+    except Exception:
+        logger.warning("Failed to normalize HTTP bridge instance ring", exc_info=True)
+        return False
+    return len(ring) <= 1
 
 
 def _http_bridge_durable_lease_ttl_seconds() -> float:

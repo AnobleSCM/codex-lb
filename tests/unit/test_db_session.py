@@ -499,17 +499,28 @@ async def test_init_background_db_creates_separate_engine() -> None:
 
 
 @pytest.mark.asyncio
-async def test_init_background_db_uses_main_pool_size_for_postgres_by_default() -> None:
+async def test_init_background_db_uses_main_pool_size_for_postgres_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_LB_TEST_DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(
+            database_url="postgresql+asyncpg://user:pass@localhost/db",
+            database_pool_size=15,
+            database_max_overflow=10,
+            database_background_pool_size=None,
+            database_background_max_overflow=None,
+        ),
+    )
+
     session_module.init_background_db("postgresql+asyncpg://user:pass@localhost/db")
 
     assert session_module._background_engine is not None
     assert session_module._background_session_factory is not None
 
     pool = session_module._background_engine.pool
-    if os.environ.get("CODEX_LB_TEST_DATABASE_URL"):
-        assert isinstance(pool, NullPool)
-    else:
-        assert cast(Any, pool).size() == 15
+    assert not isinstance(pool, NullPool)
+    assert cast(Any, pool).size() == 15
 
     if session_module._background_engine is not None:
         await session_module._background_engine.dispose()
