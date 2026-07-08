@@ -13,7 +13,9 @@ After image build and alembic parity checks pass, the helper MUST start drain,
 wait until in-flight work is zero, and only then recreate the container. If the
 deploy exits unsuccessfully after drain start and before a successful completion,
 the helper MUST attempt to stop the live drain before it exits so the old
-container does not remain stuck in draining mode.
+container does not remain stuck in draining mode. The loopback-only stop-drain
+endpoint MUST remain reachable while the process is draining and MUST NOT count
+as in-flight proxy work.
 
 #### Scenario: Active executor work blocks local deploy
 
@@ -34,6 +36,8 @@ container does not remain stuck in draining mode.
 - **WHEN** the local deploy helper has started live drain
 - **AND** the post-drain wait, retag, recreate, or verification step fails
 - **THEN** the helper calls `/internal/drain/stop` before exiting
+- **AND** `/internal/drain/stop` is accepted even while the live proxy is
+  already draining
 - **AND** the old live proxy is not left in draining mode when it remains
   available to receive the stop request
 

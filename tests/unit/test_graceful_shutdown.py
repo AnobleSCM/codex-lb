@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from importlib import import_module
+from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
+from starlette.testclient import TestClient
 
 from app.main import InFlightMiddleware
 
@@ -14,8 +17,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def reset_shutdown_state() -> None:
-    setattr(shutdown_state, "_draining", False)
-    setattr(shutdown_state, "_in_flight", 0)
+    shutdown_state.reset()
 
 
 def test_set_draining_updates_shutdown_state() -> None:
@@ -252,3 +254,31 @@ async def test_in_flight_middleware_allows_drain_status_during_drain() -> None:
 
     assert app_called is True
     assert sent_messages[0]["status"] == 200
+
+
+def test_drain_stop_path_is_allowlisted_for_drain_and_inflight() -> None:
+    from app.core.middleware import inflight
+
+    assert "/internal/drain/stop" in inflight._DRAIN_ALLOWED_HTTP_PATHS
+    assert "/internal/drain/stop" in inflight._IN_FLIGHT_EXCLUDED_HTTP_PATHS
+
+
+def test_drain_stop_reaches_real_handler_and_clears_state_while_draining() -> None:
+    from app.modules.health.api import router as health_router
+
+    app = FastAPI()
+    app.include_router(health_router)
+    app.add_middleware(cast(Any, InFlightMiddleware))
+
+    shutdown_state.set_draining(True)
+    shutdown_state.set_bridge_drain_active(True)
+    shutdown_state.increment_in_flight()
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        response = client.post("/internal/drain/stop")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "checks": {"draining": "stopped"}, "bridge_ring": None}
+    assert shutdown_state.is_draining() is False
+    assert shutdown_state.is_bridge_drain_active() is False
+    assert shutdown_state.get_in_flight() == 1

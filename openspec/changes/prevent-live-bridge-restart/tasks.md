@@ -3,8 +3,10 @@
 - [x] Add red/green coverage that single-container Compose templates pin a stable HTTP bridge instance id.
 - [x] Add red/green coverage that unreadable or malformed drain status fails closed before build/drain/recreate.
 - [x] Add red/green coverage that failed or timed-out post-drain deploy attempts stop-drain cleanup.
+- [x] Add red/green coverage that `/internal/drain/stop` reaches the real middleware+endpoint while draining.
 - [x] Implement the local deploy idle gate and drain wait.
 - [x] Implement stop-drain cleanup for failed or timed-out post-drain deploys.
+- [x] Allow `/internal/drain/stop` through drain and in-flight middleware while draining.
 - [x] Pin the stable bridge instance id in the repo Compose templates.
 - [x] Run focused tests, lint/type checks, and the full pytest suite.
 - [x] Attempt OpenSpec validation. Blocked locally: neither `openspec` nor `uv run openspec` is available in this runtime.
