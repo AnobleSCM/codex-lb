@@ -11,6 +11,25 @@ from sqlalchemy.exc import OperationalError
 pytestmark = pytest.mark.unit
 
 
+class _SessionCM:
+    """Async context manager wrapping a mock session.
+
+    ``health_ready`` borrows the session via ``async with SessionLocal() as
+    session:`` (a context manager), not the old ``async for session in
+    get_session()`` generator. This mirrors that contract so the connection is
+    released on every exit path, including early return/raise.
+    """
+
+    def __init__(self, session: object) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> object:
+        return self._session
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
 def _bridge_ring_ok():
     from app.modules.health.schemas import BridgeRingInfo
 
@@ -62,14 +81,11 @@ async def test_health_ready_db_ok():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         response = await health_ready()
         assert response.status == "ok"
@@ -86,13 +102,10 @@ async def test_health_ready_db_error():
     with (
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
     ):
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
             await health_ready()
@@ -133,14 +146,11 @@ async def test_health_ready_ignores_upstream_state():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         response = await health_ready()
 
@@ -161,15 +171,12 @@ async def test_health_ready_circuit_breaker_disabled_returns_200():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
         with patch("app.modules.health.api.get_settings", return_value=SimpleNamespace(circuit_breaker_enabled=False)):
 
-            async def mock_get_session_context():
-                yield mock_session
-
-            mock_get_session.return_value = mock_get_session_context()
+            mock_get_session.return_value = _SessionCM(mock_session)
 
             response = await health_ready()
 
@@ -189,7 +196,7 @@ async def test_health_ready_fails_when_active_ring_exists_but_instance_is_missin
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api.get_settings") as mock_get_settings,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock()) as mock_bridge_ring,
     ):
@@ -201,10 +208,7 @@ async def test_health_ready_fails_when_active_ring_exists_but_instance_is_missin
             is_member=False,
         )
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
             await health_ready()
@@ -225,7 +229,7 @@ async def test_health_ready_allows_empty_bridge_ring_while_instance_registers():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api.get_settings") as mock_get_settings,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock()) as mock_bridge_ring,
     ):
@@ -237,10 +241,7 @@ async def test_health_ready_allows_empty_bridge_ring_while_instance_registers():
             is_member=False,
         )
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         response = await health_ready()
 
@@ -259,7 +260,7 @@ async def test_health_ready_fails_when_bridge_ring_lookup_errors():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", True),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api.get_settings") as mock_get_settings,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock()) as mock_bridge_ring,
     ):
@@ -272,10 +273,7 @@ async def test_health_ready_fails_when_bridge_ring_lookup_errors():
             error="unavailable: ProgrammingError",
         )
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
             await health_ready()
@@ -295,17 +293,14 @@ async def test_health_ready_fails_when_bridge_registration_is_not_complete():
         patch("app.core.draining._draining", False),
         patch("app.core.startup._bridge_durable_schema_ready", True),
         patch("app.core.startup._bridge_registration_complete", False),
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch(
             "app.modules.health.api.get_settings", return_value=MagicMock(http_responses_session_bridge_enabled=True)
         ),
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
 
-        async def mock_get_session_context():
-            yield mock_session
-
-        mock_get_session.return_value = mock_get_session_context()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
             await health_ready()
@@ -323,16 +318,13 @@ async def test_health_ready_fails_when_bridge_durable_schema_is_not_ready():
         patch("app.core.startup._bridge_durable_schema_ready", False),
         patch("app.core.startup._bridge_registration_complete", True),
         patch("app.modules.health.api.get_settings") as mock_settings,
-        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch("app.modules.health.api.SessionLocal") as mock_get_session,
     ):
         mock_settings.return_value.http_responses_session_bridge_enabled = True
         mock_session = AsyncMock()
         mock_session.execute = AsyncMock(return_value=MagicMock())
 
-        async def session_generator():
-            yield mock_session
-
-        mock_get_session.return_value = session_generator()
+        mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
             await health_api.health_ready()

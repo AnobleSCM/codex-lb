@@ -14,7 +14,7 @@ from app.core.resilience.degradation import get_available_accounts
 from app.core.resilience.degradation import get_status as get_degradation_status
 from app.core.utils.time import utcnow
 from app.db.models import BridgeRingMember
-from app.db.session import get_session
+from app.db.session import SessionLocal
 from app.modules.health.schemas import BridgeRingInfo, DegradationInfo, HealthCheckResponse, HealthResponse
 from app.modules.proxy.ring_membership import RING_STALE_THRESHOLD_SECONDS
 
@@ -72,7 +72,7 @@ async def health_ready() -> HealthCheckResponse:
         raise HTTPException(status_code=503, detail="Service is draining")
 
     try:
-        async for session in get_session():
+        async with SessionLocal() as session:
             try:
                 await session.execute(text("SELECT 1"))
                 checks = {"database": "ok"}

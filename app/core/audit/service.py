@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 
 from app.core.utils.request_id import get_request_id
 from app.db.models import AuditLog
-from app.db.session import get_session
+from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ async def _write_audit_log(
 ) -> None:
     try:
         sanitized_details = _sanitize_details(details)
-        async for session in get_session():
+        async with SessionLocal() as session:
             log_entry = AuditLog(
                 action=action,
                 actor_ip=actor_ip,
