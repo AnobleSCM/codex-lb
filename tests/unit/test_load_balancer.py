@@ -2361,6 +2361,39 @@ def test_background_recovery_state_preserves_rate_limit_cooldown_when_reset_is_i
     assert state.cooldown_until == pytest.approx(future_reset)
 
 
+def test_background_recovery_state_keeps_rate_limited_on_future_reset_despite_fresh_newer_window(monkeypatch):
+    # Fork-#2 evidence shape (observed 2026-05-17): status=rate_limited with a
+    # stored reset still in the future and no persisted blocked_at, while fresh
+    # primary usage shows capacity on a strictly LATER reset window. Upstream
+    # treats the persisted reset guard as authoritative until it elapses: the
+    # fresh-newer-window guard clear in _state_from_account applies only to
+    # QUOTA_EXCEEDED, and apply_usage_quota holds RATE_LIMITED while
+    # runtime_reset lies in the future. Recovery for this shape lands once the
+    # stored reset passes (see the companion test below) — not early.
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    newer_reset = int(now + 7200)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
+    fresh_primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=newer_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+    )
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=fresh_primary,
+        secondary_entry=None,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == pytest.approx(future_reset)
+
+
 def test_background_recovery_state_recovers_rate_limited_after_reset_elapses(monkeypatch):
     now = 1_700_000_000.0
     blocked = now - 7200.0
@@ -2387,6 +2420,42 @@ def test_background_recovery_state_recovers_rate_limited_after_reset_elapses(mon
     )
 
     assert state.status == AccountStatus.ACTIVE
+
+
+def test_background_recovery_state_recovers_rate_limited_after_reset_elapses_with_newer_window_usage(monkeypatch):
+    # Companion to the future-reset keep test above: the same fresh usage with a
+    # strictly LATER reset window recovers the account as soon as the stored
+    # reset elapses. The window mismatch does not block recovery — upstream's
+    # staleness bound is the persisted reset horizon itself, seeded from the
+    # persisted columns only (restart shape: no live runtime state).
+    now = 1_700_000_000.0
+    blocked = now - 7200.0
+    past_reset = int(now - 300)
+    newer_reset = int(now + 7200)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=past_reset,
+        blocked_at=int(blocked),
+    )
+    fresh_primary = _make_test_usage(
+        window="primary",
+        used_percent=10.0,
+        reset_at=newer_reset,
+        recorded_at=_epoch_to_naive_utc(now - 10),
+    )
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=fresh_primary,
+        secondary_entry=None,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+    assert state.blocked_at is None
 
 
 def test_background_recovery_state_recovers_monthly_only_rate_limited_after_reset_elapses(monkeypatch):
