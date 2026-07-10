@@ -136,7 +136,8 @@ async def test_proxy_compact_strips_tool_fields_before_upstream(async_client, mo
     assert seen_payloads[0]["input"] == []
     assert "tools" not in seen_payloads[0]
     assert "tool_choice" not in seen_payloads[0]
-    assert "parallel_tool_calls" not in seen_payloads[0]
+    assert "store" not in seen_payloads[0]
+    assert seen_payloads[0]["parallel_tool_calls"] is False
 
 
 @pytest.mark.asyncio
