@@ -383,11 +383,14 @@ class LoadBalancer:
         selection_inputs = await load_selection_inputs()
         circuit_breaker_open = _is_upstream_circuit_breaker_open()
         if circuit_breaker_open:
-            set_degraded("upstream circuit breaker is open")
+            set_degraded(
+                "upstream circuit breaker is open",
+                available_accounts=_service_available_accounts(selection_inputs),
+            )
         elif selection_inputs.accounts:
-            set_normal()
+            set_normal(available_accounts=_service_available_accounts(selection_inputs))
         elif selection_inputs.error_code is not None:
-            set_normal()
+            set_normal(available_accounts=_service_available_accounts(selection_inputs))
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
             return AccountSelection(
@@ -763,7 +766,10 @@ class LoadBalancer:
                     error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
                 )
             if error_message == "No available accounts":
-                set_degraded("all upstream accounts are unavailable")
+                set_degraded(
+                    "all upstream accounts are unavailable",
+                    available_accounts=_service_available_accounts(selection_inputs),
+                )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=selection_error_code)
         logger.info(
@@ -2233,6 +2239,23 @@ def _selectable_accounts(accounts: list[Account]) -> list[Account]:
         for account in accounts
         if account.status not in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
     ]
+
+
+def _service_available_accounts(selection_inputs: _SelectionInputs) -> int:
+    """Service-wide count of accounts present in the pool (not deactivated,
+    paused, or reauth-required), independent of the per-request model/scope
+    filter, so /health publishes a pool-wide figure rather than a scoped subset.
+
+    ``selection_inputs.accounts`` is narrowed by account_ids / exclude / model,
+    so it is a request-scoped count. ``runtime_accounts`` carries the full,
+    unfiltered account list, so filtering it through :func:`_selectable_accounts`
+    yields the service-wide "present" count. Falls back to the scoped list only
+    when ``runtime_accounts`` is unavailable.
+    """
+    runtime_accounts = selection_inputs.runtime_accounts
+    if runtime_accounts is None:
+        return len(selection_inputs.accounts)
+    return len(_selectable_accounts(runtime_accounts))
 
 
 def _gated_limit_name_for_model(model: str | None) -> str | None:

@@ -50,7 +50,13 @@ def test_resolve_static_asset_accepts_file_under_static_root(tmp_path):
 async def test_health_endpoint_ok(async_client):
     response = await async_client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    payload = response.json()
+    # Liveness stays "ok"; the response also carries degradation observability.
+    assert payload["status"] == "ok"
+    assert payload["degradation"]["level"] in {"normal", "degraded", "critical"}
+    # Lock in the full {level, reason} contract so a silent drop of reason fails.
+    assert "reason" in payload["degradation"]
+    assert "available_accounts" in payload
     assert response.headers["X-App-Version"] == __version__
 
 

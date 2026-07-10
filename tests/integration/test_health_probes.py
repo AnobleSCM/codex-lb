@@ -6,10 +6,14 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.asyncio
-async def test_health_endpoint_unchanged(async_client):
+async def test_health_endpoint_reports_status_and_degradation(async_client):
     response = await async_client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    payload = response.json()
+    # Liveness stays "ok"; the response also carries degradation observability.
+    assert payload["status"] == "ok"
+    assert payload["degradation"]["level"] in {"normal", "degraded", "critical"}
+    assert "available_accounts" in payload
 
 
 @pytest.mark.asyncio

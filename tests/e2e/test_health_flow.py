@@ -8,7 +8,11 @@ import pytest
 async def test_all_health_endpoints_respond(client):
     response = await client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    health_payload = response.json()
+    # Liveness stays "ok"; the response also carries degradation observability.
+    assert health_payload["status"] == "ok"
+    assert health_payload["degradation"]["level"] in {"normal", "degraded", "critical"}
+    assert "available_accounts" in health_payload
 
     response = await client.get("/health/live")
     assert response.status_code == 200
