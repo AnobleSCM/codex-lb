@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -33,29 +34,9 @@ def _base_env(tmp_path: Path) -> dict[str, str]:
     event_log = tmp_path / "events.log"
 
     _write_executable(
-        bin_dir / "docker",
+        bin_dir / "fake-drain-response",
         """#!/usr/bin/env bash
 set -euo pipefail
-printf 'docker %s\\n' "$*" >> "$FAKE_DOCKER_LOG"
-printf 'docker %s\\n' "$*" >> "$FAKE_EVENT_LOG"
-if [[ "$*" == *" compose "* && "${FAKE_DOCKER_FAIL_COMPOSE:-0}" == "1" ]]; then
-  printf 'compose failed\\n' >&2
-  exit 42
-fi
-case "$*" in
-  "buildx version"*) exit 0 ;;
-  *" exec codex-lb python "*) printf '\\n'; exit 0 ;;
-  *" logs --tail 200 codex-lb"*) printf '\\n'; exit 0 ;;
-  *) exit 0 ;;
-esac
-""",
-    )
-    _write_executable(
-        bin_dir / "curl",
-        """#!/usr/bin/env bash
-set -euo pipefail
-printf 'curl %s\\n' "$*" >> "$FAKE_CURL_LOG"
-printf 'curl %s\\n' "$*" >> "$FAKE_EVENT_LOG"
 if [[ "$*" == *"/internal/drain/status"* ]]; then
   if [[ "${FAKE_DRAIN_STATUS_FAIL:-0}" == "1" ]]; then
     printf 'status unavailable\\n' >&2
@@ -69,7 +50,7 @@ if [[ "$*" == *"/internal/drain/status"* ]]; then
     count=$((count + 1))
     printf '%s' "$count" > "$FAKE_DRAIN_STATUS_COUNT_FILE"
     status="$(
-      awk -v line="$count" 'NR == line { print; found = 1 } END { if (!found) exit 1 }' \
+      awk -v line="$count" 'NR == line { print; found = 1 } END { if (!found) exit 1 }' \\
         "$FAKE_DRAIN_STATUS_SEQUENCE" || tail -n 1 "$FAKE_DRAIN_STATUS_SEQUENCE"
     )"
     printf '%s\\n' "$status"
@@ -85,6 +66,54 @@ fi
 if [[ "$*" == *"/internal/drain/stop"* ]]; then
   printf '{"status":"ok","checks":{"draining":"stopped"}}\\n'
   exit 0
+fi
+printf 'unexpected fake drain request: %s\\n' "$*" >&2
+exit 64
+""",
+    )
+    _write_executable(
+        bin_dir / "docker",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+printf 'docker %s\\n' "$*" >> "$FAKE_EVENT_LOG"
+if [[ "$*" == *" compose "* && "${FAKE_DOCKER_FAIL_COMPOSE:-0}" == "1" ]]; then
+  printf 'compose failed\\n' >&2
+  exit 42
+fi
+if [[ "$*" == *"/internal/drain/"* ]]; then
+  exec fake-drain-response "$@"
+fi
+if [[ "$*" == *"/app/app/db/alembic/versions"* ]]; then
+  if [[ "$*" == *" exec codex-lb python "* ]]; then
+    printf '%s\\n' "$FAKE_LIVE_REVISIONS"
+    exit 0
+  fi
+  if [[ "$*" == *" run --rm --entrypoint python "* ]]; then
+    printf '%s\\n' "$FAKE_NEW_IMAGE_REVISIONS"
+    exit 0
+  fi
+fi
+case "$*" in
+  "buildx version"*) exit 0 ;;
+  *" exec codex-lb python "*) printf '\\n'; exit 0 ;;
+  *" logs --tail 200 codex-lb"*) printf '\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+""",
+    )
+    _write_executable(
+        bin_dir / "curl",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "$FAKE_CURL_LOG"
+printf 'curl %s\\n' "$*" >> "$FAKE_EVENT_LOG"
+if [[ "$*" == *"/internal/drain/"* ]]; then
+  if [[ "${FAKE_HOST_DRAIN_FORBIDDEN:-0}" == "1" ]]; then
+    printf 'host drain access forbidden\\n' >&2
+    exit 22
+  fi
+  exec fake-drain-response "$@"
 fi
 if [[ "$*" == *"%{http_code}"* ]]; then
   printf '200'
@@ -108,6 +137,9 @@ printf 'ok\\n'
             ),
             "FAKE_DRAIN_STATUS_COUNT_FILE": str(tmp_path / "status-count.txt"),
             "FAKE_DRAIN_STATUS_SEQUENCE": "",
+            "FAKE_HOST_DRAIN_FORBIDDEN": "0",
+            "FAKE_LIVE_REVISIONS": "20260630_020000_merge_heads\n20260701_000000_pace_smoothing",
+            "FAKE_NEW_IMAGE_REVISIONS": ("20260630_020000_merge_heads\n20260701_000000_pace_smoothing"),
         }
     )
     return env
@@ -131,6 +163,33 @@ def test_deploy_refuses_to_build_or_recreate_when_live_proxy_has_in_flight_work(
     docker_log = (tmp_path / "docker.log").read_text() if (tmp_path / "docker.log").exists() else ""
     assert result.returncode != 0
     assert "in-flight" in result.stderr
+    assert " build " not in docker_log
+    assert " compose " not in docker_log
+
+
+@pytest.mark.parametrize("active_key", ["draining", "bridge_drain_active"])
+def test_deploy_refuses_to_build_when_live_proxy_is_already_draining(tmp_path: Path, active_key: str) -> None:
+    env = _base_env(tmp_path)
+    checks: dict[str, str] = {
+        "draining": "false",
+        "bridge_drain_active": "false",
+        "in_flight": "0",
+    }
+    checks[active_key] = "true"
+    env["FAKE_DRAIN_STATUS"] = json.dumps({"status": "ok", "checks": checks})
+
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    docker_log = (tmp_path / "docker.log").read_text()
+    assert result.returncode != 0
+    assert "already draining" in result.stderr
     assert " build " not in docker_log
     assert " compose " not in docker_log
 
@@ -171,6 +230,26 @@ def test_deploy_fails_closed_when_live_drain_status_is_malformed(tmp_path: Path)
     )
 
     docker_log = (tmp_path / "docker.log").read_text() if (tmp_path / "docker.log").exists() else ""
+    assert result.returncode != 0
+    assert "unable to parse live drain status" in result.stderr
+    assert " build " not in docker_log
+    assert " compose " not in docker_log
+
+
+def test_deploy_fails_closed_when_live_drain_status_omits_state_flags(tmp_path: Path) -> None:
+    env = _base_env(tmp_path)
+    env["FAKE_DRAIN_STATUS"] = '{"status":"ok","checks":{"in_flight":"0"}}'
+
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    docker_log = (tmp_path / "docker.log").read_text()
     assert result.returncode != 0
     assert "unable to parse live drain status" in result.stderr
     assert " build " not in docker_log
@@ -250,6 +329,57 @@ def test_deploy_stops_drain_after_force_recreate_failure(tmp_path: Path) -> None
     assert "/internal/drain/stop" in event_log
     assert event_log.index("/internal/drain/start") < event_log.index(" compose ")
     assert event_log.index(" compose ") < event_log.index("/internal/drain/stop")
+
+
+def test_deploy_routes_loopback_only_drain_calls_through_live_container(tmp_path: Path) -> None:
+    env = _base_env(tmp_path)
+    env["FAKE_HOST_DRAIN_FORBIDDEN"] = "1"
+
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    event_log = (tmp_path / "events.log").read_text()
+    curl_log = (tmp_path / "curl.log").read_text()
+    assert result.returncode == 0, result.stderr
+    assert "docker --context colima exec codex-lb python" in event_log
+    assert "/internal/drain/status" in event_log
+    assert "/internal/drain/start" in event_log
+    assert not any(
+        drain_path in curl_log
+        for drain_path in (
+            "/internal/drain/status",
+            "/internal/drain/start",
+            "/internal/drain/stop",
+        )
+    )
+
+
+def test_deploy_rejects_candidate_image_missing_running_alembic_revision(tmp_path: Path) -> None:
+    env = _base_env(tmp_path)
+    env["FAKE_NEW_IMAGE_REVISIONS"] = "20260701_000000_pace_smoothing"
+
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    event_log = (tmp_path / "events.log").read_text()
+    assert result.returncode != 0
+    assert "20260630_020000_merge_heads" in result.stderr
+    assert "MigrationBootstrapError" in result.stderr
+    assert " tag " not in event_log
+    assert " compose " not in event_log
+    assert "/internal/drain/start" not in event_log
 
 
 def test_single_container_compose_files_pin_stable_bridge_instance_id() -> None:

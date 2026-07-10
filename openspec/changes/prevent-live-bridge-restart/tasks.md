@@ -9,4 +9,18 @@
 - [x] Allow `/internal/drain/stop` through drain and in-flight middleware while draining.
 - [x] Pin the stable bridge instance id in the repo Compose templates.
 - [x] Run focused tests, lint/type checks, and the full pytest suite.
-- [x] Attempt OpenSpec validation. Blocked locally: neither `openspec` nor `uv run openspec` is available in this runtime.
+- [x] Validate the OpenSpec change with the one-shot official CLI.
+
+## AGE-3084 follow-up
+
+- [x] Add red/green coverage that drain status/start/stop calls execute inside
+  the live container and do not use the host-published port.
+- [x] Route all drain calls, including failed-deploy cleanup, through the live
+  container's loopback network namespace.
+- [x] Add red/green coverage that a candidate image missing any running-image
+  Alembic revision fails before retag or recreate.
+- [x] Replace the retired SQLite live-head query with a fail-closed
+  running-image-to-candidate-image migration inventory comparison.
+- [x] Run focused tests, shell syntax validation, lint/type checks, and the full
+  pytest suite.
+- [x] Validate the updated OpenSpec change.

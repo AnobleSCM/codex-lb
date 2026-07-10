@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Local deploy for codex-lb. Builds the current source tree as
 # codex-lb:local-<short-sha>, verifies the new image contains every
-# alembic revision the live codex-lb-data volume has applied, retags
-# the new image as codex-lb:active, force-recreates the container via
-# the live compose file, and confirms /health=200 plus a clean
-# current_revision in container logs.
+# alembic revision available in the running image, retags the new image
+# as codex-lb:active, force-recreates the container via the live compose
+# file, and confirms /health=200 plus a clean current_revision in
+# container logs.
 #
 # Exits non-zero on any failure. Safe to re-run.
 #
@@ -32,6 +32,7 @@ DRAIN_STOP_URL="${CODEX_LB_DEPLOY_DRAIN_STOP_URL:-http://127.0.0.1:2455/internal
 DEPLOY_DRAIN_TIMEOUT_SECONDS="${CODEX_LB_DEPLOY_DRAIN_TIMEOUT_SECONDS:-900}"
 DEPLOY_DRAIN_POLL_SECONDS="${CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+ALEMBIC_VERSIONS_DIR="/app/app/db/alembic/versions"
 DRAIN_STARTED=0
 
 fatal() {
@@ -39,12 +40,25 @@ fatal() {
   exit 1
 }
 
+drain_request() {
+  local method="$1"
+  local url="$2"
+  docker --context colima exec codex-lb python -c "
+import sys
+import urllib.request
+
+request = urllib.request.Request(sys.argv[1], method=sys.argv[2])
+with urllib.request.urlopen(request, timeout=10) as response:
+    sys.stdout.buffer.write(response.read())
+" "$url" "$method"
+}
+
 cleanup_drain_on_exit() {
   local exit_code=$?
   trap - EXIT
   if [ "$exit_code" -ne 0 ] && [ "$DRAIN_STARTED" -eq 1 ]; then
     echo "==> Stopping live drain after failed deploy" >&2
-    if curl -fsS -X POST "$DRAIN_STOP_URL" >/dev/null; then
+    if drain_request POST "$DRAIN_STOP_URL" >/dev/null; then
       echo "    live drain stopped" >&2
     else
       echo "WARN: unable to stop live drain at $DRAIN_STOP_URL; manual recovery may be required" >&2
@@ -73,7 +87,7 @@ except Exception as exc:
 }
 
 read_drain_status() {
-  curl -fsS "$DRAIN_STATUS_URL"
+  drain_request GET "$DRAIN_STATUS_URL"
 }
 
 extract_drain_value() {
@@ -95,13 +109,29 @@ extract_in_flight() {
   printf '%s' "$in_flight"
 }
 
+extract_drain_boolean() {
+  local status_json="$1"
+  local key="$2"
+  local value
+  value="$(extract_drain_value "$status_json" "$key")" || return 1
+  case "$value" in
+    true|false)
+      printf '%s' "$value"
+      ;;
+    *)
+      echo "invalid $key value in drain status: $value" >&2
+      return 1
+      ;;
+  esac
+}
+
 require_idle_before_deploy() {
   local status_json
   status_json="$(read_drain_status)" || fatal "unable to read live drain status at $DRAIN_STATUS_URL"
 
   local draining bridge_drain_active in_flight
-  draining="$(extract_drain_value "$status_json" "draining")" || fatal "unable to parse live drain status"
-  bridge_drain_active="$(extract_drain_value "$status_json" "bridge_drain_active")" || fatal "unable to parse live drain status"
+  draining="$(extract_drain_boolean "$status_json" "draining")" || fatal "unable to parse live drain status"
+  bridge_drain_active="$(extract_drain_boolean "$status_json" "bridge_drain_active")" || fatal "unable to parse live drain status"
   in_flight="$(extract_in_flight "$status_json")" || fatal "unable to parse live drain status"
 
   if [ "$draining" = "true" ] || [ "$bridge_drain_active" = "true" ]; then
@@ -116,7 +146,7 @@ require_idle_before_deploy() {
 
 start_live_drain() {
   DRAIN_STARTED=1
-  curl -fsS -X POST "$DRAIN_START_URL" >/dev/null || fatal "unable to start live drain at $DRAIN_START_URL"
+  drain_request POST "$DRAIN_START_URL" >/dev/null || fatal "unable to start live drain at $DRAIN_START_URL"
 }
 
 wait_for_drain_zero() {
@@ -167,33 +197,49 @@ require_idle_before_deploy
 echo "==> Building $IMAGE_TAG from $REPO_ROOT (HEAD=$SHORT_SHA)"
 docker --context colima build -t "$IMAGE_TAG" .
 
-echo "==> Verifying alembic parity against live volume"
-# Read live volume head defensively: a fresh volume has no alembic_version
-# row (or no table at all), in which case there is nothing to verify and
-# the regular alembic upgrade path will populate it on next start.
-LIVE_HEAD="$(docker --context colima exec codex-lb python -c "
-import sqlite3
-try:
-    c = sqlite3.connect('/var/lib/codex-lb/store.db')
-    row = c.execute('SELECT version_num FROM alembic_version').fetchone()
-    print(row[0] if row else '')
-except sqlite3.OperationalError:
-    print('')
-" 2>/dev/null)"
+echo "==> Verifying alembic parity against running image"
+ALEMBIC_INVENTORY_PYTHON="
+from pathlib import Path
 
-if [ -z "$LIVE_HEAD" ]; then
-  echo "    live volume head: <fresh, no alembic_version yet — skipping parity check>"
-else
-  echo "    live volume head: $LIVE_HEAD"
-  NEW_IMAGE_HAS_HEAD="$(docker --context colima run --rm --entrypoint sh "$IMAGE_TAG" -c "test -f /app/app/db/alembic/versions/${LIVE_HEAD}.py && echo yes || echo no")"
-  if [ "$NEW_IMAGE_HAS_HEAD" != "yes" ]; then
-    echo "FATAL: new image $IMAGE_TAG is missing alembic revision $LIVE_HEAD" >&2
-    echo "       deploying it would crash-loop on MigrationBootstrapError" >&2
-    echo "       see ~/workspace-wiki/wiki/projects/codex-lb/index.md (Class C runtime discipline)" >&2
-    exit 1
-  fi
-  echo "    new image contains $LIVE_HEAD: OK"
+for migration in sorted(Path('$ALEMBIC_VERSIONS_DIR').glob('*.py')):
+    if migration.name != '__init__.py':
+        print(migration.stem)
+"
+
+if ! LIVE_REVISIONS="$(docker --context colima exec codex-lb python -c "$ALEMBIC_INVENTORY_PYTHON")"; then
+  fatal "unable to read alembic revision inventory from the running container"
 fi
+if [ -z "$LIVE_REVISIONS" ]; then
+  fatal "running container has no readable alembic revisions; refusing to skip parity verification"
+fi
+
+if ! NEW_IMAGE_REVISIONS="$(docker --context colima run --rm --entrypoint python "$IMAGE_TAG" -c "$ALEMBIC_INVENTORY_PYTHON")"; then
+  fatal "unable to read alembic revision inventory from new image $IMAGE_TAG"
+fi
+if [ -z "$NEW_IMAGE_REVISIONS" ]; then
+  fatal "new image $IMAGE_TAG has no readable alembic revisions"
+fi
+
+if ! MISSING_REVISIONS="$("$PYTHON_BIN" -c "
+import sys
+
+live_revisions = set(sys.argv[1].splitlines())
+new_image_revisions = set(sys.argv[2].splitlines())
+print('\\n'.join(sorted(live_revisions - new_image_revisions)))
+" "$LIVE_REVISIONS" "$NEW_IMAGE_REVISIONS")"; then
+  fatal "unable to compare running and candidate alembic revision inventories"
+fi
+
+if [ -n "$MISSING_REVISIONS" ]; then
+  echo "FATAL: new image $IMAGE_TAG is missing alembic revision(s) from the running image:" >&2
+  while IFS= read -r revision; do
+    echo "       $revision" >&2
+  done <<< "$MISSING_REVISIONS"
+  echo "       deploying it could crash-loop on MigrationBootstrapError" >&2
+  echo "       see ~/workspace-wiki/wiki/projects/codex-lb/index.md (Class C runtime discipline)" >&2
+  exit 1
+fi
+echo "    new image contains every running-image alembic revision: OK"
 
 echo "==> Draining live proxy before recreate"
 start_live_drain
