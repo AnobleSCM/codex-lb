@@ -1,0 +1,34 @@
+app/modules/health/api.py
+  bae4441013363813 17,75
+tests/unit/test_health_probes.py
+  bae4441013363813 14-32,84,88,105,108,149,153,174,179,199,211,232,244,263,276,296,303,321,327
+tests/unit/test_graceful_degradation.py
+  bae4441013363813 204-207,209-210,213
+app/core/audit/service.py
+  bae4441013363813 10,69
+tests/unit/test_get_session_pool_leak.py
+  bae4441013363813 1-274
+tests/unit/test_leader_election.py
+  bae4441013363813 96-97,99-119,133,156
+app/core/scheduling/leader_election.py
+  bae4441013363813 11,36,78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "152b619d2b944781a60b6db130a130c739739a5b",
+  "prompts": {
+    "bae4441013363813": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce0f470b-3412-4c74-8e9a-a3f79529eb63",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM <andrewnoble1992@gmail.com>",
+      "total_additions": 351,
+      "total_deletions": 62,
+      "accepted_lines": 351,
+      "overriden_lines": 0
+    }
+  }
+}
