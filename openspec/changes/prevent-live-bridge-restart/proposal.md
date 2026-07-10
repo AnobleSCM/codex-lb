@@ -20,10 +20,16 @@ the application defaults to the container hostname, which changes on recreation.
 
 - Refuse local deploy before build/recreate when `/internal/drain/status`
   reports active in-flight work or an already active drain.
+- Reach every loopback-only drain endpoint from inside the live container's
+  network namespace instead of through the host-published Docker port.
 - After the new image is built and alembic parity is verified, start drain on
   the live proxy, wait for in-flight work to reach zero, then retag and
   force-recreate the container.
 - Keep the gate fail-closed when drain status cannot be read or parsed.
+- Verify migration compatibility by requiring the candidate image's Alembic
+  revision inventory to be a superset of the running image's inventory. This
+  keeps the guard effective when the live database is PostgreSQL rather than
+  the retired SQLite volume.
 - Pin stable single-container bridge instance IDs in the repo Compose templates.
 
 ## Non-goals
@@ -31,4 +37,3 @@ the application defaults to the container hostname, which changes on recreation.
 - No live deploy, restart, or compose mutation is performed by this change.
 - No provider/runtime retry policy change is included.
 - No migration or schema change is included.
-
