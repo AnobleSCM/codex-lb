@@ -67,11 +67,31 @@ regression tests no longer match upstream's evolved `apply_usage_quota`).
 ## Rollback is a database restore, not a code revert
 
 Between the fork base and `v1.21.0-beta.1`, upstream shipped migrations with
-**lossy or no-op downgrades**. Once the live `codex-lb-data` volume has been
-upgraded by the new image, `alembic downgrade` cannot faithfully restore the
-prior schema/data. Rollback therefore means **restore the pre-cutover
-`codex-lb-data` snapshot** and re-pin the prior image, not revert the code. Take
-a `codex-lb-data` snapshot immediately before the live cutover.
+**lossy or no-op downgrades**, so `alembic downgrade` cannot faithfully restore
+the prior schema/data. Rollback therefore means restoring data, not reverting
+code — and the two data assets are distinct:
+
+- **Database (the rollback asset):** the live database is PostgreSQL. The
+  rollback asset is the **pre-cutover `pg_dump`**, taken immediately before the
+  live cutover (restore path proven 2026-07-10). Rolling back = re-pin the
+  prior image + restore that dump.
+- **`codex-lb-data` volume (separate asset — NOT touched by the DB rollback):**
+  the volume holds `encryption.key` (plus legacy SQLite artifacts). The DB
+  rollback does not restore or modify it; it must simply remain intact so the
+  restored rows stay decryptable.
+
+**RPO:** restoring the pre-cutover dump discards every write made after the
+cutover — usage telemetry, request logs, and any account / API-key / settings
+mutations. Mitigation: account, API-key, and settings mutations are **frozen
+during the 48h soak window**, so the only accepted loss on rollback is
+telemetry (usage / request-log rows).
+
+## Landing mechanics
+
+Landing is an **ours-merge commit**: its tree is byte-identical to the reviewed
+sync tip, with parents = old `main` + the sync tip, merged through the normal
+gated PR flow. It is **not** a force-push reset — old `main` history stays
+reachable, and the landed tree is exactly the reviewed one.
 
 ## Breaking config for operators (review before cutover)
 
