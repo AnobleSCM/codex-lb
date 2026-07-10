@@ -1,0 +1,22 @@
+tests/unit/test_load_balancer.py
+  bae4441013363813 2364-2396,2425-2460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "958b6cab5296b9123ecbbbcf0b62d806c774ace6",
+  "prompts": {
+    "bae4441013363813": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce0f470b-3412-4c74-8e9a-a3f79529eb63",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM <andrewnoble1992@gmail.com>",
+      "total_additions": 69,
+      "total_deletions": 0,
+      "accepted_lines": 69,
+      "overriden_lines": 0
+    }
+  }
+}
