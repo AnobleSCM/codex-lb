@@ -1,0 +1,28 @@
+openspec/changes/upstream-sync-v1-21-0-beta-1/tasks.md
+  bae4441013363813 1-89
+openspec/changes/upstream-sync-v1-21-0-beta-1/context.md
+  bae4441013363813 1-117
+openspec/changes/upstream-sync-v1-21-0-beta-1/.openspec.yaml
+  bae4441013363813 1-2
+openspec/changes/upstream-sync-v1-21-0-beta-1/proposal.md
+  bae4441013363813 1-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6c44648306a64a9dfd24e2c1a2d50f230ad2c83b",
+  "prompts": {
+    "bae4441013363813": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce0f470b-3412-4c74-8e9a-a3f79529eb63",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM <andrewnoble1992@gmail.com>",
+      "total_additions": 270,
+      "total_deletions": 0,
+      "accepted_lines": 270,
+      "overriden_lines": 0
+    }
+  }
+}
