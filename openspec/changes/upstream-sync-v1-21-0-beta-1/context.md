@@ -77,7 +77,7 @@ upstream's evolved `apply_usage_quota`.
 | 2 | `fea73d5c` | No-reset quota fallback 3600s → 900s |
 | 3 | `9005277b` | Degraded mode surfaced on `/health` |
 | 4 | `d350ce4d` (#12) | Own/close sessions in non-request borrows |
-| 5 | #8 `cada1757`, #10 `cbe84e28`, #21 `fdfdbc1d`, #23 `823dd47d`, #3 `704fadd0` | Deploy tooling + `.codex` symlink + Class C runbook |
+| 5 | #8 `cada1757`, #10 `cbe84e28`, #21 `fdfdbc1d`, #23 `823dd47d`, #3 `704fadd0` | Deploy tooling + Class C runbook (the fork's tracked `.codex → .agents` symlink is DROPPED: upstream's `test_codex_sandbox_symlink_is_not_tracked` hygiene guard forbids a tracked `.codex`; Codex runtimes use `AGENTS.md`/`.agents/` directly, and a local untracked symlink remains possible) |
 
 ## Rollback is a database restore, not a code revert
 
