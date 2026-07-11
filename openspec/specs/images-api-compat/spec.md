@@ -1,7 +1,9 @@
 # images-api-compat Specification
 
 ## Purpose
-TBD - created by archiving change add-images-api-compat. Update Purpose after archive.
+Define the OpenAI-compatible Images API adapter that exposes public `gpt-image-*`
+requests while routing through the existing Responses `image_generation` tool
+pipeline.
 ## Requirements
 ### Requirement: OpenAI-compatible image generation endpoint
 
@@ -10,7 +12,7 @@ The system SHALL expose `POST /v1/images/generations` and accept the OpenAI Imag
 #### Scenario: Compatible image generation request returns a JSON envelope
 
 - **WHEN** a client sends `POST /v1/images/generations` with `model=gpt-image-2`, a non-empty `prompt`, and no `stream`
-- **THEN** the service returns 200 with a JSON body of shape `{created, data: [{b64_json, revised_prompt}], usage}` containing exactly `n` (or 1 by default) entries
+- **THEN** the service returns 200 with a JSON body of shape `{created, data: [{b64_json, revised_prompt}], usage}` containing exactly one entry
 
 #### Scenario: Unsupported model is rejected
 
@@ -30,7 +32,8 @@ The system SHALL expose `POST /v1/images/generations` and accept the OpenAI Imag
 #### Scenario: Multi-image requests are rejected until upstream support arrives
 
 - **WHEN** a client sends `/v1/images/generations` or `/v1/images/edits` with `n > 1`
-- **THEN** the service returns 400 with OpenAI `invalid_request_error` and `param: n`, with a message that explains the upstream `image_generation` tool does not yet support multi-image responses. Operators may raise the cap by overriding `images_max_n`.
+- **THEN** the service returns 400 with OpenAI `invalid_request_error` and `param: n`, with a message that explains the upstream `image_generation` tool does not yet support multi-image responses
+- **AND** no settings override SHALL raise the accepted request `n` above 1 until codex-lb implements client-side fan-out or upstream exposes first-class multi-image support
 
 #### Scenario: Missing model defaults to images_default_model
 
@@ -98,3 +101,18 @@ The system SHALL apply API-key allowed-model policy and model-scoped usage limit
 - **WHEN** an `/v1/images/*` request completes successfully against an internal host Responses model (for example `gpt-5.5`)
 - **THEN** the resulting `request_logs` row has `model` equal to the publicly requested value (for example `gpt-image-2`) so dashboards and usage views surface the user-visible model rather than the internal host model
 
+### Requirement: Image routes expose bounded operational observability
+
+The system SHALL emit structured route-completion logs and Prometheus metrics for `/v1/images/generations` and `/v1/images/edits`. Observability labels MUST be bounded to route, effective public model, stream flag, HTTP status, and outcome, and MUST NOT include prompts, image bytes, file names, access tokens, or raw upstream payloads.
+
+#### Scenario: Successful image request records completion telemetry
+
+- **WHEN** an `/v1/images/generations` or `/v1/images/edits` request completes successfully
+- **THEN** the service emits an `images_route_complete` log line with the public image route, public model, stream flag, status, outcome, and duration
+- **AND** increments `codex_lb_image_requests_total` and observes `codex_lb_image_request_duration_seconds` with the same bounded labels
+
+#### Scenario: Failed image request records completion telemetry
+
+- **WHEN** an image request is rejected by validation or mapped from an upstream/image-generation error
+- **THEN** the service emits the same bounded `images_route_complete` fields with a non-success outcome
+- **AND** increments the image request counter and duration histogram without logging prompt or binary image content

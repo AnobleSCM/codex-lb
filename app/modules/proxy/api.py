@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from json import JSONDecodeError
-from typing import Final, cast
+from typing import Any, Final, Literal, cast
+from uuid import uuid4
 
 from fastapi import (
     APIRouter,
@@ -36,20 +39,49 @@ from app.core.auth.dependencies import (
     validate_proxy_api_key_authorization,
     validate_usage_api_key,
 )
+from app.core.auth.refresh import RefreshError
 from app.core.clients.files import FileProxyError
 from app.core.clients.proxy import ProxyResponseError
+from app.core.clients.rate_limit_reset_credits import (
+    ConsumeResetCreditError,
+    ResetCreditItem,
+    consume_reset_credit,
+)
+from app.core.clients.usage import (
+    ConsumeRateLimitResetCreditResponse as UpstreamConsumeRateLimitResetCreditResponse,
+)
+from app.core.clients.usage import UsageFetchError, consume_rate_limit_reset_credit
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
-from app.core.errors import OpenAIErrorEnvelope, openai_error, response_failed_event
-from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
+from app.core.crypto import TokenEncryptor
+from app.core.errors import (
+    PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    OpenAIErrorEnvelope,
+    is_previous_response_not_found_error,
+    openai_error,
+    response_failed_event,
+)
+from app.core.exceptions import (
+    ProxyAuthError,
+    ProxyModelNotAllowed,
+    ProxyRateLimitError,
+    ProxyUpstreamError,
+)
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, bridge_public_contract_error_total
 from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
 from app.core.openai.chat_requests import ChatCompletionsRequest
-from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
+from app.core.openai.chat_responses import (
+    ChatCompletion,
+    ChatCompletionResult,
+    ChatCompletionUsage,
+    collect_chat_completion,
+    stream_chat_chunks,
+)
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.images import V1ImageResponse, V1ImagesEditsForm, V1ImagesGenerationsRequest
 from app.core.openai.model_registry import UpstreamModel, get_model_registry, is_public_model
 from app.core.openai.models import (
+    CompactResponsePayload,
     CompactResponseResult,
     OpenAIError,
     OpenAIResponsePayload,
@@ -59,64 +91,136 @@ from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
 from app.core.openai.parsing import parse_response_payload
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.openai.requests import (
+    ResponsesCompactRequest,
+    ResponsesRequest,
+    extract_input_file_ids,
+    normalize_tool_type,
+)
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
+from app.core.request_locality import resolve_request_client_host
 from app.core.resilience.overload import is_local_overload_error_code, merge_retry_after_headers
 from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
-from app.core.usage.types import UsageWindowRow
-from app.core.utils.json_guards import is_json_mapping
-from app.core.utils.sse import format_sse_event, inject_sse_keepalives, parse_sse_data_json
-from app.db.models import Account, AccountStatus, UsageHistory
-from app.db.session import get_background_session
+from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
+from app.core.utils.json_guards import is_json_list, is_json_mapping
+from app.core.utils.request_id import ensure_request_id, get_request_id
+from app.core.utils.sse import (
+    CODEX_KEEPALIVE_FRAME,
+    SSE_KEEPALIVE_FRAME,
+    format_sse_event,
+    inject_sse_keepalives,
+    parse_sse_data_json,
+)
+from app.db.models import Account, AccountStatus, ModelSource
+from app.db.session import detach_session_objects, get_background_session
 from app.dependencies import ProxyContext, get_proxy_context, get_proxy_websocket_context
+from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
+    TRAFFIC_CLASS_OPPORTUNISTIC,
     ApiKeyData,
     ApiKeyInvalidError,
     ApiKeyRateLimitExceededError,
+    ApiKeyRequestUsageBudget,
     ApiKeySelfLimitData,
     ApiKeysService,
     ApiKeyUsageReservationData,
+    _compute_pooled_credits,
 )
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+from app.modules.model_sources.catalog import (
+    source_model_audio_cost_usd,
+    source_model_cost_usd,
+    source_model_request_overrides,
+    source_model_supported_tool_types,
+    source_model_supports_reasoning,
+    source_models_to_upstream_models,
+)
+from app.modules.model_sources.forwarding import (
+    ModelSourceForwardingError,
+    SourceUsage,
+    SourceUsageHolder,
+    forward_chat_completion,
+)
+from app.modules.model_sources.forwarding import (
+    forward_audio_transcription as forward_source_audio_transcription,
+)
+from app.modules.model_sources.forwarding import (
+    forward_responses as forward_source_responses,
+)
+from app.modules.model_sources.forwarding import (
+    stream_chat_completion as stream_source_chat_completion,
+)
+from app.modules.model_sources.forwarding import (
+    stream_responses as stream_source_responses,
+)
+from app.modules.model_sources.repository import ModelSourcesRepository
+from app.modules.proxy import affinity as proxy_affinity_module
 from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
+from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
+from app.modules.proxy.images_observability import record_images_route_observability
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
+    apply_api_key_enforcement_to_chat_payload,
     enforce_strict_function_tools_format,
     enforce_strict_text_format,
+    normalize_responses_request_payload,
     openai_client_payload_error,
     openai_validation_error,
+    resolve_model_alias,
+    sanitize_source_chat_payload,
+    strip_terminal_compaction_trigger_input,
     validate_model_access,
 )
 from app.modules.proxy.schemas import (
+    AccountPoolUsageResponse,
     CodexModelEntry,
     CodexModelsResponse,
+    ConsumeRateLimitResetCreditRequest,
+    ConsumeRateLimitResetCreditResponse,
     FileCreateRequest,
     ModelListItem,
     ModelListResponse,
     ModelMetadata,
     RateLimitStatusPayload,
     ReasoningLevelSchema,
+    V1ResetCreditEntry,
+    V1ResetCreditRedeemRequest,
+    V1ResetCreditRedeemResponse,
     V1UsageLimitResponse,
     V1UsageResponse,
+    WarmupFailedAccount,
+    WarmupRequest,
+    WarmupResponse,
+    WarmupSkippedAccount,
+    WarmupSubmittedAccount,
 )
 from app.modules.proxy.types import (
     CreditStatusDetailsData,
+    RateLimitResetCreditsData,
     RateLimitStatusPayloadData,
     RateLimitWindowSnapshotData,
 )
-from app.modules.usage.repository import UsageRepository
+from app.modules.rate_limit_reset_credits.api import serialize_reset_credit_redeem
+from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
+from app.modules.request_logs.repository import RequestLogsRepository
+from app.modules.usage.mappers import usage_history_to_window_row
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
+from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
 
 _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
     {
         "message",
+        "compaction",
         "function_call",
         "function_call_output",
         "reasoning",
@@ -130,6 +234,20 @@ _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
     }
 )
 _PUBLIC_RESPONSE_TEXT_PART_TYPES = frozenset({"output_text", "input_text", "text", "refusal"})
+_PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES = frozenset(
+    {"response.completed", "response.incomplete", "response.failed", "error"}
+)
+_PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT = 64
+_SOURCE_LIMITED_STREAM_BUFFER_BYTES = 16 * 1024 * 1024
+
+
+class _V1ResetCreditFreshCredentials:
+    __slots__ = ("access_token_encrypted", "chatgpt_account_id")
+
+    def __init__(self, *, access_token_encrypted: bytes, chatgpt_account_id: str | None) -> None:
+        self.access_token_encrypted = access_token_encrypted
+        self.chatgpt_account_id = chatgpt_account_id
+
 
 router = APIRouter(
     prefix="/backend-api/codex",
@@ -179,24 +297,23 @@ _UNAVAILABLE_SELECTION_ERROR_CODES = {
     "no_accounts",
     "no_plan_support_for_model",
     "additional_quota_data_unavailable",
+    "quota_exhausted",
     "no_additional_quota_eligible_accounts",
 }
 _STREAM_STARTUP_ERROR_PROBE_SECONDS = 0.05
 # Keep bridge startup probing above tiny event-loop scheduling jitter:
 # PostgreSQL-backed failures may need a DB round trip before the first item.
-_HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS = 0.5
-_V1_FULL_CONTEXT_WINDOW_OVERRIDES: Final[dict[str, int]] = {
-    "gpt-5.4": 1_000_000,
-    "gpt-5.5": 400_000,
-    "gpt-5.4-mini": 400_000,
-    "gpt-5.3-codex": 400_000,
-}
+_HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS = 2.0
+_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS = 2.0
+_CURSOR_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS = 15.0
+_CURSOR_CONTEXT_LIMIT_SYNTHETIC_USAGE_TOKENS: Final[int] = 1_000_000
 _V1_MAX_OUTPUT_TOKEN_OVERRIDES: Final[dict[str, int]] = {
     "gpt-5.4": 128_000,
     "gpt-5.5": 128_000,
     "gpt-5.4-mini": 128_000,
     "gpt-5.3-codex": 128_000,
 }
+_OPPORTUNISTIC_RETRY_AFTER_SECONDS = 60
 
 # OpenAI error ``type`` -> HTTP status for the /v1/images/* non-streaming
 # error path. The /v1/responses path has its own ``_status_for_error``
@@ -218,6 +335,51 @@ _IMAGE_ERROR_CODE_STATUS: Final[dict[str, int]] = {
     "rate_limit_exceeded": 429,
     "insufficient_quota": 429,
 }
+_WARMUP_MODES: Final[frozenset[str]] = frozenset({"normal", "strict", "force"})
+
+
+def _accepts_event_stream(request: Request) -> bool:
+    for value in request.headers.getlist("accept"):
+        media_ranges = (part.split(";", 1)[0].strip().lower() for part in value.split(","))
+        if "text/event-stream" in media_ranges:
+            return True
+    return False
+
+
+def _has_openai_responses_shape(payload: V1ResponsesRequest | Mapping[str, JsonValue]) -> bool:
+    if isinstance(payload, Mapping):
+        payload_dict = cast("Mapping[str, JsonValue]", payload)
+        return (
+            ("input" in payload_dict and payload_dict.get("instructions") is None)
+            or payload_dict.get("messages") is not None
+            or "truncation" in payload_dict
+        )
+
+    explicit_fields = payload.model_fields_set
+    return (
+        ("input" in explicit_fields and payload.instructions is None)
+        or payload.messages is not None
+        or "truncation" in explicit_fields
+    )
+
+
+def _is_openai_sdk_request(
+    request: Request,
+    payload: V1ResponsesRequest | Mapping[str, JsonValue] | None = None,
+) -> bool:
+    for header_name in request.headers:
+        normalized_header = header_name.lower()
+        if normalized_header.startswith("x-stainless-"):
+            return True
+    user_agent = request.headers.get("user-agent", "").lower()
+    if "openai" in user_agent:
+        return True
+    if payload is None or not _has_openai_responses_shape(payload):
+        return False
+    if isinstance(payload, Mapping):
+        payload_dict = cast("Mapping[str, JsonValue]", payload)
+        return _accepts_event_stream(request) or payload_dict.get("messages") is not None
+    return _accepts_event_stream(request) or payload.messages is not None
 
 
 async def _thread_goal_payload_from_request(request: Request) -> dict[str, JsonValue]:
@@ -393,24 +555,83 @@ async def wham_agent_identities_jwks(
 )
 async def responses(
     request: Request,
-    payload: ResponsesRequest = Body(...),
+    payload: dict[str, JsonValue] = Body(...),
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    openai_sdk_request = _is_openai_sdk_request(request, payload)
+    openai_compat_payload = _has_openai_responses_shape(payload)
+    try:
+        responses_payload = normalize_responses_request_payload(
+            payload,
+            openai_compat=openai_compat_payload,
+        )
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _logged_error_json_response(request, 400, error)
+    except ValidationError as exc:
+        error = openai_validation_error(exc)
+        return _logged_error_json_response(request, 400, error)
+
+    raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
+    apply_api_key_enforcement(responses_payload, api_key)
+    validate_model_access(api_key, responses_payload.model)
+    try:
+        compact_trigger_input = strip_terminal_compaction_trigger_input(responses_payload)
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _logged_error_json_response(request, 400, error)
+    source = None
+    if compact_trigger_input is None and not extract_input_file_ids(responses_payload.input):
+        source_selection = await _select_responses_model_source(
+            responses_payload.model,
+            api_key,
+            raw_model=raw_source_model,
+            require_streaming=True,
+        )
+        if source_selection is not None:
+            source, selected_model = source_selection
+            responses_payload.model = selected_model
+    if source is not None:
+        # Opportunistic admission gates subscription *account* capacity;
+        # source-routed requests use no account, so a closed/empty pool must
+        # not reject them.
+        responses_payload.stream = True
+        rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        return await _source_responses_response(
+            request,
+            responses_payload,
+            source=source,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
+
     return await _stream_responses(
         request,
-        payload,
+        responses_payload,
         context,
         api_key,
         codex_session_affinity=True,
         openai_cache_affinity=True,
         prefer_http_bridge=True,
         # The Codex CLI consumes codex.* vendor events and the upstream's
-        # native event ordering (it does not use the OpenAI Python SDK parser);
-        # forward the stream verbatim instead of enforcing the OpenAI SDK
-        # contract that /v1/responses applies.
-        enforce_openai_sdk_contract=False,
+        # native event ordering, while OpenAI SDK clients pointed at this
+        # compatibility route need the same SSE contract enforcement as /v1.
+        enforce_openai_sdk_contract=openai_sdk_request,
     )
+
+
+@router.get("/opportunistic/admission")
+async def opportunistic_admission(
+    request: Request,
+    model: str | None = None,
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    denial = await _opportunistic_admission_denial(request, context, api_key, model=model)
+    if denial is not None:
+        return denial
+    return JSONResponse({"admitted": True})
 
 
 @ws_router.websocket("/responses")
@@ -422,8 +643,8 @@ async def responses_websocket(
     if denial is not None:
         await websocket.send_denial_response(denial)
         return
-    turn_state = proxy_service_module.ensure_downstream_turn_state(websocket.headers)
-    await websocket.accept(headers=proxy_service_module.build_downstream_turn_state_accept_headers(turn_state))
+    turn_state = proxy_affinity_module.ensure_downstream_turn_state(websocket.headers)
+    await websocket.accept(headers=proxy_affinity_module.build_downstream_turn_state_accept_headers(turn_state))
     forwarded_headers = dict(websocket.headers)
     forwarded_headers.setdefault("x-codex-turn-state", turn_state)
     await context.service.proxy_responses_websocket(
@@ -432,6 +653,7 @@ async def responses_websocket(
         codex_session_affinity=True,
         openai_cache_affinity=True,
         api_key=api_key,
+        client_ip=resolve_request_client_host(websocket),
     )
 
 
@@ -464,6 +686,37 @@ async def v1_responses(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
+    raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
+    apply_api_key_enforcement(responses_payload, api_key)
+    validate_model_access(api_key, responses_payload.model)
+    # File-referencing Responses requests pin to the subscription account that
+    # registered the upload; that account-scoped invariant applies to /v1
+    # streams too, so such requests must not be source-routed.
+    source_selection = (
+        None
+        if extract_input_file_ids(responses_payload.input)
+        else await _select_responses_model_source(
+            responses_payload.model,
+            api_key,
+            raw_model=raw_source_model,
+            require_streaming=responses_payload.stream is True,
+        )
+    )
+    source = source_selection[0] if source_selection is not None else None
+    if source_selection is not None:
+        responses_payload.model = source_selection[1]
+    if source is not None:
+        # Opportunistic admission gates subscription *account* capacity;
+        # source-routed requests use no account, so a closed/empty pool must
+        # not reject them.
+        rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        return await _source_responses_response(
+            request,
+            responses_payload,
+            source=source,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
     if responses_payload.stream:
         return await _stream_responses(
             request,
@@ -532,6 +785,7 @@ async def internal_bridge_responses(
         forwarded_downstream_turn_state=forwarded_request_context.context.downstream_turn_state,
         forwarded_affinity_kind=forwarded_request_context.context.original_affinity_kind,
         forwarded_affinity_key=forwarded_request_context.context.original_affinity_key,
+        forwarded_client_ip=forwarded_request_context.context.client_ip,
         # The OpenAI-SDK contract rewrites (drop ``codex.*``, backfill terminal
         # output, synthesize ``response.created``) MUST be applied by the
         # origin instance — the one that actually responds to the client — so
@@ -555,8 +809,8 @@ async def v1_responses_websocket(
     if denial is not None:
         await websocket.send_denial_response(denial)
         return
-    turn_state = proxy_service_module.ensure_downstream_turn_state(websocket.headers)
-    await websocket.accept(headers=proxy_service_module.build_downstream_turn_state_accept_headers(turn_state))
+    turn_state = proxy_affinity_module.ensure_downstream_turn_state(websocket.headers)
+    await websocket.accept(headers=proxy_affinity_module.build_downstream_turn_state_accept_headers(turn_state))
     forwarded_headers = dict(websocket.headers)
     forwarded_headers.setdefault("x-codex-turn-state", turn_state)
     await context.service.proxy_responses_websocket(
@@ -565,6 +819,7 @@ async def v1_responses_websocket(
         codex_session_affinity=False,
         openai_cache_affinity=True,
         api_key=api_key,
+        client_ip=resolve_request_client_host(websocket),
     )
 
 
@@ -575,37 +830,404 @@ async def models(
     return await _build_codex_models_response(api_key)
 
 
-@v1_router.get("/models", response_model=ModelListResponse)
+@v1_router.get("/models", response_model=None)
 async def v1_models(
+    request: Request,
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    # Codex clients pointed at this proxy via `openai_base_url` fetch their model
+    # catalog from `<base_url>/models` and always append a `client_version` query
+    # parameter. They require the Codex catalog shape (`{"models": [...]}`); the
+    # OpenAI-compatible list shape fails to parse client-side, and the client
+    # silently falls back to its bundled model metadata (stale tool_mode /
+    # use_responses_lite flags and context windows). Serve the Codex catalog to
+    # Codex clients and keep the OpenAI-compatible shape for everyone else.
+    if request.query_params.get("client_version"):
+        return await _build_codex_models_response(api_key)
     return await _build_models_response(api_key)
 
 
 @v1_router.get("/usage", response_model=V1UsageResponse)
 async def v1_usage(
     api_key: ApiKeyData = Security(validate_usage_api_key),
-) -> V1UsageResponse:
+) -> V1UsageResponse | JSONResponse:
+    usage_sections = _parse_usage_sections(api_key.usage_sections)
     async with get_background_session() as session:
-        service = ApiKeysService(ApiKeysRepository(session))
+        service = ApiKeysService(ApiKeysRepository(session), usage_repository=UsageRepository(session))
         usage = await service.get_key_usage_summary_for_self(api_key.id)
-        aggregate_limits = await _build_aggregate_credit_limits(session)
+        aggregate_limits = await _build_aggregate_credit_limits(session) if "upstream_limits" in usage_sections else {}
+        hide_upstream_limits = await _hide_upstream_quota_for_api_key_clients(api_key)
+        account_pool_usage = (
+            await _build_account_pool_usage(
+                session,
+                assigned_account_ids=api_key.assigned_account_ids,
+                account_assignment_scope_enabled=api_key.account_assignment_scope_enabled,
+            )
+            if "account_pool_usage" in usage_sections and not hide_upstream_limits
+            else None
+        )
 
     if usage is None:
         raise ProxyAuthError("Invalid API key")
+
+    own_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
+    upstream_limits = [] if hide_upstream_limits else _ordered_aggregate_limits(aggregate_limits)
 
     return V1UsageResponse(
         request_count=usage.request_count,
         total_tokens=usage.total_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
-        limits=[_to_v1_usage_limit_response(limit) for limit in usage.limits],
-        upstream_limits=_ordered_aggregate_limits(aggregate_limits),
+        limits=own_limits or upstream_limits,
+        upstream_limits=upstream_limits,
+        account_pool_usage=account_pool_usage,
+    )
+
+
+def _is_reset_credit_selectable_account(account: Account) -> bool:
+    return bool(account.chatgpt_account_id) and account.status not in (
+        AccountStatus.REAUTH_REQUIRED,
+        AccountStatus.DEACTIVATED,
+        AccountStatus.PAUSED,
+    )
+
+
+def _eligible_reset_credit_accounts(accounts: list[Account], api_key: ApiKeyData) -> list[Account]:
+    if api_key.account_assignment_scope_enabled:
+        assigned_ids = {account_id for account_id in api_key.assigned_account_ids if account_id}
+        requested_accounts = [account for account in accounts if account.id in assigned_ids]
+    else:
+        requested_accounts = accounts
+    return [account for account in requested_accounts if _is_reset_credit_selectable_account(account)]
+
+
+def _project_reset_credit_accounts(accounts: list[Account], api_key: ApiKeyData) -> list[tuple[str, str]]:
+    eligible_accounts = sorted(
+        _eligible_reset_credit_accounts(accounts, api_key),
+        key=lambda account: (account.email, account.id),
+    )
+    return [(account.id, account.email) for account in eligible_accounts]
+
+
+def _list_available_reset_credits(account_id: str, email: str) -> list[V1ResetCreditEntry]:
+    snapshot = get_rate_limit_reset_credits_store().get(account_id)
+    if snapshot is None or snapshot.available_count <= 0:
+        return []
+
+    available_credits = [credit for credit in snapshot.credits if credit.status == "available"]
+    if not available_credits:
+        return []
+
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+    ordered_credits = sorted(
+        available_credits,
+        key=lambda credit: (credit.expires_at or far_future, credit.id),
+    )
+    return [
+        V1ResetCreditEntry(
+            account_id=account_id,
+            email=email,
+            redeem_id=credit.id,
+            expired_at=credit.expires_at,
+        )
+        for credit in ordered_credits
+    ]
+
+
+def _is_reset_credit_account_in_api_key_pool(account: Account | None, api_key: ApiKeyData) -> bool:
+    if account is None or not _is_reset_credit_selectable_account(account):
+        return False
+    if not api_key.account_assignment_scope_enabled:
+        return True
+    assigned_ids = {account_id for account_id in api_key.assigned_account_ids if account_id}
+    return account.id in assigned_ids
+
+
+def _select_available_reset_credit_by_id(account_id: str, redeem_id: str) -> ResetCreditItem | None:
+    snapshot = get_rate_limit_reset_credits_store().get(account_id)
+    if snapshot is None or snapshot.available_count <= 0:
+        return None
+    for credit in snapshot.credits:
+        if credit.id == redeem_id and credit.status == "available":
+            return credit
+    return None
+
+
+def _translate_v1_reset_credit_consume_error(exc: ConsumeResetCreditError) -> HTTPException:
+    status_code = exc.status_code if exc.status_code > 0 else 503
+    return HTTPException(status_code=status_code, detail=exc.message)
+
+
+def _should_invalidate_v1_reset_credit_snapshot_on_consume_error(exc: ConsumeResetCreditError) -> bool:
+    return exc.status_code == 409
+
+
+def _translate_v1_reset_credit_refresh_error(exc: RefreshError) -> HTTPException:
+    if exc.is_permanent:
+        get_account_selection_cache().invalidate()
+    return HTTPException(
+        status_code=409,
+        detail=f"Reset credit redeem could not refresh account credentials: {exc.message}",
+    )
+
+
+@asynccontextmanager
+async def _v1_reset_credit_accounts_refresh_scope() -> AsyncIterator[AccountsRepository]:
+    async with get_background_session() as session:
+        yield AccountsRepository(session)
+
+
+async def _ensure_v1_reset_credit_account_fresh(account_id: str) -> _V1ResetCreditFreshCredentials:
+    async with get_background_session() as session:
+        repo = AccountsRepository(session)
+        account = await repo.get_by_id(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Account not found")
+        auth_manager = AuthManager(
+            repo,
+            refresh_repo_factory=_v1_reset_credit_accounts_refresh_scope,
+        )
+        refreshed = await auth_manager.ensure_fresh(account, force=False)
+        return _V1ResetCreditFreshCredentials(
+            access_token_encrypted=refreshed.access_token_encrypted,
+            chatgpt_account_id=refreshed.chatgpt_account_id,
+        )
+
+
+@usage_router.get("/v1/reset-credit", response_model=list[V1ResetCreditEntry])
+async def v1_reset_credit(
+    api_key: ApiKeyData = Security(validate_usage_api_key),
+) -> list[V1ResetCreditEntry]:
+    async with get_background_session() as session:
+        accounts = await AccountsRepository(session).list_accounts(refresh_existing=True)
+        eligible_accounts = _project_reset_credit_accounts(accounts, api_key)
+
+    response: list[V1ResetCreditEntry] = []
+    for account_id, account_email in eligible_accounts:
+        response.extend(_list_available_reset_credits(account_id, account_email))
+    return response
+
+
+@usage_router.post("/v1/reset-credit", response_model=V1ResetCreditRedeemResponse)
+async def v1_redeem_reset_credit(
+    payload: V1ResetCreditRedeemRequest,
+    api_key: ApiKeyData = Security(validate_usage_api_key),
+) -> V1ResetCreditRedeemResponse:
+    async with get_background_session() as session:
+        account = await AccountsRepository(session).get_by_id(payload.account_id)
+        if not _is_reset_credit_account_in_api_key_pool(account, api_key):
+            raise HTTPException(status_code=403, detail="Account is outside the API key pool")
+        if account is None:
+            raise HTTPException(status_code=403, detail="Account is outside the API key pool")
+        account_id = account.id
+
+        async with serialize_reset_credit_redeem(account_id, session=session):
+            credit = _select_available_reset_credit_by_id(account_id, payload.redeem_id)
+            if credit is None:
+                raise HTTPException(status_code=409, detail="Requested reset credit is unavailable")
+            try:
+                route = await _resolve_reset_credit_route(session, account_id)
+            except UpstreamProxyRouteError as exc:
+                raise HTTPException(status_code=503, detail="Unable to resolve upstream proxy route") from exc
+            try:
+                redeem_credentials = await _ensure_v1_reset_credit_account_fresh(account_id)
+            except RefreshError as exc:
+                raise _translate_v1_reset_credit_refresh_error(exc) from exc
+            access_token = TokenEncryptor().decrypt(redeem_credentials.access_token_encrypted)
+            try:
+                result = await consume_reset_credit(
+                    access_token,
+                    redeem_credentials.chatgpt_account_id,
+                    credit.id,
+                    route=route,
+                    allow_direct_egress=route is None,
+                )
+            except ConsumeResetCreditError as exc:
+                if _should_invalidate_v1_reset_credit_snapshot_on_consume_error(exc):
+                    await get_rate_limit_reset_credits_store().invalidate(account_id)
+                raise _translate_v1_reset_credit_consume_error(exc) from exc
+            await get_rate_limit_reset_credits_store().invalidate(account_id)
+            try:
+                await _refresh_usage_after_v1_reset_credit_redeem(account_id)
+            except Exception:
+                logger.warning(
+                    "V1 reset credit consume succeeded but usage refresh failed account_id=%s",
+                    account_id,
+                    exc_info=True,
+                )
+            redeemed_at = result.credit.redeemed_at if result.credit else None
+            return V1ResetCreditRedeemResponse(
+                code=result.code,
+                windows_reset=result.windows_reset,
+                redeemed_at=redeemed_at,
+            )
+
+
+async def _resolve_reset_credit_route(session: AsyncSession, account_id: str) -> ResolvedUpstreamRoute | None:
+    return await resolve_upstream_route(
+        session,
+        account_id=account_id,
+        operation="reset_credits_consume",
+        scope="account",
+    )
+
+
+async def _refresh_usage_after_v1_reset_credit_redeem(account_id: str) -> None:
+    async with get_background_session() as session:
+        account = await AccountsRepository(session).get_by_id(account_id)
+        if account is None:
+            logger.warning(
+                "V1 reset credit consume succeeded but account disappeared before usage refresh account_id=%s",
+                account_id,
+            )
+            return
+        usage_updater = UsageUpdater(
+            UsageRepository(session),
+            AccountsRepository(session),
+            AdditionalUsageRepository(session),
+        )
+        refreshed = await usage_updater.force_refresh(account)
+    if refreshed:
+        get_account_selection_cache().invalidate()
+        return
+    logger.warning(
+        "V1 reset credit consume succeeded but usage refresh returned no update account_id=%s",
+        account_id,
+    )
+
+
+async def _run_v1_warmup(
+    request: Request,
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = None,
+    *,
+    mode: str,
+) -> Response:
+    if mode not in _WARMUP_MODES:
+        return _logged_error_json_response(
+            request,
+            400,
+            openai_error(
+                "invalid_request_error",
+                "Invalid warmup mode. Supported values: normal, strict, force.",
+                error_type="invalid_request_error",
+            ),
+        )
+
+    try:
+        result = await context.service.warmup(mode=mode, headers=request.headers, api_key=api_key)
+    except ValueError as exc:
+        return _logged_error_json_response(
+            request,
+            400,
+            openai_error(
+                "invalid_request_error",
+                str(exc),
+                error_type="invalid_request_error",
+            ),
+        )
+
+    response = WarmupResponse(
+        mode=result.mode,
+        total_accounts=result.total_accounts,
+        submitted=[
+            WarmupSubmittedAccount(
+                account_id=entry.account_id,
+                request_id=entry.request_id,
+                model=entry.model,
+            )
+            for entry in result.submitted
+        ],
+        skipped=[
+            WarmupSkippedAccount(
+                account_id=entry.account_id,
+                reason=entry.reason,
+            )
+            for entry in result.skipped
+        ],
+        failed=[
+            WarmupFailedAccount(
+                account_id=entry.account_id,
+                error_code=entry.error_code,
+                error_message=entry.error_message,
+            )
+            for entry in result.failed
+        ],
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))
+
+
+@v1_router.post("/warmup", response_model=WarmupResponse)
+async def v1_warmup(
+    request: Request,
+    payload: WarmupRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    return await _run_v1_warmup(
+        request,
+        context,
+        api_key,
+        mode=payload.mode.strip().lower(),
+    )
+
+
+@v1_router.post("/warmup/{mode}", response_model=WarmupResponse)
+async def v1_warmup_by_mode(
+    request: Request,
+    mode: str,
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    return await _run_v1_warmup(
+        request,
+        context,
+        api_key,
+        mode=mode.strip().lower(),
     )
 
 
 def _ordered_aggregate_limits(aggregate_limits: dict[str, V1UsageLimitResponse]) -> list[V1UsageLimitResponse]:
-    return [limit for window in ("5h", "7d") if (limit := aggregate_limits.get(window)) is not None]
+    return [limit for window in ("5h", "7d", "monthly") if (limit := aggregate_limits.get(window)) is not None]
+
+
+def _parse_usage_sections(raw: str) -> set[str]:
+    if not raw or not raw.strip():
+        return set()
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+async def _build_account_pool_usage(
+    session: AsyncSession,
+    *,
+    assigned_account_ids: list[str],
+    account_assignment_scope_enabled: bool,
+) -> AccountPoolUsageResponse | None:
+    from app.modules.api_keys.repository import ApiKeysRepository
+
+    repo = ApiKeysRepository(session)
+    usage_repo = UsageRepository(session)
+    if account_assignment_scope_enabled:
+        all_accounts = await repo.list_accounts_by_ids(assigned_account_ids)
+        usage_account_ids: list[str] | None = assigned_account_ids
+    else:
+        all_accounts = await repo.list_all_accounts()
+        usage_account_ids = None
+
+    primary_usage = await usage_repo.latest_by_account("primary", account_ids=usage_account_ids)
+    secondary_usage = await usage_repo.latest_by_account("secondary", account_ids=usage_account_ids)
+
+    data = _compute_pooled_credits(
+        assigned_account_ids=assigned_account_ids,
+        all_accounts=all_accounts,
+        primary_usage=primary_usage,
+        secondary_usage=secondary_usage,
+        account_assignment_scope_enabled=account_assignment_scope_enabled,
+    )
+    return AccountPoolUsageResponse(
+        primary=data.remaining_percent_primary,
+        secondary=data.remaining_percent_secondary,
+    )
 
 
 def _to_v1_usage_limit_response(limit: ApiKeySelfLimitData) -> V1UsageLimitResponse:
@@ -632,20 +1254,36 @@ async def _build_codex_usage_payload_for_api_key(api_key: ApiKeyData) -> RateLim
 
     key_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
     primary_credit_limit = _select_codex_usage_limit(key_limits, "5h") or _select_codex_usage_limit(key_limits, "daily")
-    secondary_credit_limit = (
-        _select_codex_usage_limit(key_limits, "7d")
-        or _select_codex_usage_limit(key_limits, "weekly")
-        or _select_codex_usage_limit(key_limits, "monthly")
+    secondary_credit_limit = _select_codex_usage_limit(key_limits, "7d") or _select_codex_usage_limit(
+        key_limits, "weekly"
     )
+    monthly_credit_limit = _select_codex_usage_limit(key_limits, "monthly")
 
     return RateLimitStatusPayloadData(
         plan_type="api_key",
         rate_limit=_rate_limit_details(
             _codex_usage_window_snapshot(primary_credit_limit),
             _codex_usage_window_snapshot(secondary_credit_limit),
+            _codex_usage_window_snapshot(monthly_credit_limit),
         ),
-        credits=_codex_usage_credit_snapshot(primary_credit_limit, secondary_credit_limit),
+        credits=_codex_usage_credit_snapshot(primary_credit_limit, secondary_credit_limit, monthly_credit_limit),
     )
+
+
+async def _hide_upstream_quota_for_api_key_clients(api_key: ApiKeyData | None) -> bool:
+    if api_key is None:
+        return False
+    settings = await get_settings_cache().get()
+    return bool(getattr(settings, "hide_upstream_quota_from_api_keys", False))
+
+
+async def _rate_limit_headers_for_request(
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> dict[str, str]:
+    if await _hide_upstream_quota_for_api_key_clients(api_key):
+        return {}
+    return await context.service.rate_limit_headers()
 
 
 def _select_codex_usage_limit(
@@ -681,8 +1319,9 @@ def _codex_usage_window_snapshot(limit: V1UsageLimitResponse | None) -> RateLimi
 def _codex_usage_credit_snapshot(
     primary_limit: V1UsageLimitResponse | None,
     secondary_limit: V1UsageLimitResponse | None,
+    monthly_limit: V1UsageLimitResponse | None = None,
 ) -> CreditStatusDetailsData | None:
-    preferred = secondary_limit or primary_limit
+    preferred = monthly_limit or secondary_limit or primary_limit
     if preferred is None or preferred.limit_type != "credits":
         return None
     return CreditStatusDetailsData(
@@ -694,16 +1333,40 @@ def _codex_usage_credit_snapshot(
     )
 
 
+def _codex_usage_reset_credits_from_request(request: Request) -> RateLimitResetCreditsData | None:
+    usage_payload = getattr(request.state, "codex_usage_identity_payload", None)
+    summary = getattr(usage_payload, "rate_limit_reset_credits", None)
+    if summary is None:
+        return None
+    return RateLimitResetCreditsData(available_count=max(0, int(summary.available_count or 0)))
+
+
+def _attach_codex_usage_reset_credits(
+    payload: RateLimitStatusPayloadData,
+    request: Request,
+) -> RateLimitStatusPayloadData:
+    reset_credits = _codex_usage_reset_credits_from_request(request)
+    if reset_credits is None:
+        return payload
+    return replace(payload, rate_limit_reset_credits=reset_credits)
+
+
 async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1UsageLimitResponse]:
     usage_repository = UsageRepository(session)
     primary_latest = await usage_repository.latest_by_account(window="primary")
     secondary_latest = await usage_repository.latest_by_account(window="secondary")
+    monthly_latest = await usage_repository.latest_by_account(window="monthly")
 
-    primary_rows = [_usage_entry_to_window_row(entry) for entry in primary_latest.values()]
-    secondary_rows = [_usage_entry_to_window_row(entry) for entry in secondary_latest.values()]
+    primary_rows = [usage_history_to_window_row(entry) for entry in primary_latest.values()]
+    secondary_rows = [usage_history_to_window_row(entry) for entry in secondary_latest.values()]
+    monthly_rows = [usage_history_to_window_row(entry) for entry in monthly_latest.values()]
     primary_rows, secondary_rows = usage_core.normalize_weekly_only_rows(primary_rows, secondary_rows)
 
-    account_ids = {row.account_id for row in primary_rows} | {row.account_id for row in secondary_rows}
+    account_ids = (
+        {row.account_id for row in primary_rows}
+        | {row.account_id for row in secondary_rows}
+        | {row.account_id for row in monthly_rows}
+    )
     if not account_ids:
         return {}
 
@@ -714,9 +1377,14 @@ async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1U
     active_account_ids = set(account_map)
     primary_rows = [row for row in primary_rows if row.account_id in active_account_ids]
     secondary_rows = [row for row in secondary_rows if row.account_id in active_account_ids]
+    monthly_rows = [row for row in monthly_rows if row.account_id in active_account_ids]
     limits: dict[str, V1UsageLimitResponse] = {}
 
-    for window_key, rows, label in (("primary", primary_rows, "5h"), ("secondary", secondary_rows, "7d")):
+    for window_key, rows, label in (
+        ("primary", primary_rows, "5h"),
+        ("secondary", secondary_rows, "7d"),
+        ("monthly", monthly_rows, "monthly"),
+    ):
         if not rows:
             continue
         summary = usage_core.summarize_usage_window(rows, account_map, window_key)
@@ -746,20 +1414,10 @@ async def _load_accounts_by_id(session: AsyncSession, account_ids: set[str]) -> 
     result = await session.execute(
         select(Account).where(
             Account.id.in_(account_ids),
-            Account.status.notin_((AccountStatus.DEACTIVATED, AccountStatus.PAUSED)),
+            Account.status.notin_((AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED)),
         )
     )
     return list(result.scalars().all())
-
-
-def _usage_entry_to_window_row(entry: UsageHistory) -> UsageWindowRow:
-    return UsageWindowRow(
-        account_id=entry.account_id,
-        used_percent=entry.used_percent,
-        reset_at=entry.reset_at,
-        window_minutes=entry.window_minutes,
-        recorded_at=entry.recorded_at,
-    )
 
 
 @transcribe_router.post("/transcribe")
@@ -884,7 +1542,19 @@ async def v1_audio_transcriptions(
     prompt: str | None = Form(None),
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
-) -> JSONResponse:
+) -> Response:
+    source = await _select_audio_transcriptions_model_source(model, api_key)
+    if source is not None:
+        validate_model_access(api_key, model)
+        rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        return await _source_audio_transcription_response(
+            request=request,
+            model=model,
+            file=file,
+            source=source,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
     if model != _TRANSCRIPTION_MODEL:
         return _logged_error_json_response(
             request,
@@ -900,6 +1570,7 @@ async def v1_audio_transcriptions(
     )
 
 
+@router.post("/images/generations", response_model=None, include_in_schema=False)
 @v1_router.post("/images/generations", response_model=None)
 async def v1_images_generations(
     request: Request,
@@ -912,6 +1583,28 @@ async def v1_images_generations(
         payload=payload,
         context=context,
         api_key=api_key,
+    )
+
+
+def _coerce_image_form_stream_for_observability(stream: str | None) -> bool:
+    if stream is None:
+        return False
+    return stream.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _record_images_edit_early_rejection(
+    *,
+    model: str | None,
+    stream: bool,
+    started_at: float,
+) -> None:
+    record_images_route_observability(
+        route="edits",
+        model=model,
+        stream=stream,
+        status=400,
+        outcome="invalid_request",
+        started_at=started_at,
     )
 
 
@@ -946,6 +1639,7 @@ async def v1_images_edits(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    started_at = time.perf_counter()
     raw_form: dict[str, object] = {
         "model": model,
         "prompt": prompt,
@@ -978,6 +1672,11 @@ async def v1_images_edits(
     try:
         form_payload = V1ImagesEditsForm.model_validate(raw_form)
     except ValidationError as exc:
+        _record_images_edit_early_rejection(
+            model=model,
+            stream=_coerce_image_form_stream_for_observability(stream),
+            started_at=started_at,
+        )
         return _logged_error_json_response(request, 400, openai_validation_error(exc))
 
     # Merge ``image`` and ``image[]`` into a single ordered list. Both
@@ -989,6 +1688,11 @@ async def v1_images_edits(
     if image_brackets:
         merged_images.extend(image_brackets)
     if not merged_images:
+        _record_images_edit_early_rejection(
+            model=form_payload.model,
+            stream=bool(form_payload.stream),
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             400,
@@ -1005,6 +1709,11 @@ async def v1_images_edits(
         finally:
             await upload.close()
         if not data:
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
             return _logged_error_json_response(
                 request,
                 400,
@@ -1022,6 +1731,11 @@ async def v1_images_edits(
         finally:
             await mask.close()
         if not data:
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
             return _logged_error_json_response(
                 request,
                 400,
@@ -1039,6 +1753,139 @@ async def v1_images_edits(
         mask=mask_payload,
         context=context,
         api_key=api_key,
+        started_at=started_at,
+    )
+
+
+@router.post("/images/edits", response_model=None, include_in_schema=False)
+async def codex_images_edits(
+    request: Request,
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    """Accept Codex's JSON data-URL image-edit payload on its native base URL.
+
+    The built-in Codex image tool sends ``images: [{"image_url":
+    "data:<mime>;base64,..."}]`` rather than the multipart ``image`` parts
+    used by the public OpenAI Images API. Decode that transport shape here,
+    then delegate to the shared edit pipeline so validation and upstream
+    behavior remain identical.
+    """
+    started_at = time.perf_counter()
+    try:
+        raw_payload = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError):
+        _record_images_edit_early_rejection(
+            model=None,
+            stream=False,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "Expected a JSON request body.",
+                param="prompt",
+            ),
+        )
+    if not is_json_mapping(raw_payload):
+        _record_images_edit_early_rejection(
+            model=None,
+            stream=False,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "Expected a JSON object request body.",
+                param="prompt",
+            ),
+        )
+
+    raw_model = raw_payload.get("model")
+    observability_model = raw_model if isinstance(raw_model, str) else None
+    raw_stream = raw_payload.get("stream", False)
+    observability_stream = raw_stream if isinstance(raw_stream, bool) else False
+    raw_form: dict[str, object] = {
+        "model": raw_model,
+        "prompt": raw_payload.get("prompt"),
+        "n": raw_payload.get("n", 1),
+        "size": raw_payload.get("size", "auto"),
+        "quality": raw_payload.get("quality", "auto"),
+        "background": raw_payload.get("background", "auto"),
+        "output_format": raw_payload.get("output_format", "png"),
+        "output_compression": raw_payload.get("output_compression", 100),
+        "moderation": raw_payload.get("moderation", "auto"),
+        "partial_images": raw_payload.get("partial_images"),
+        "stream": raw_payload.get("stream", False),
+        "input_fidelity": raw_payload.get("input_fidelity"),
+        "user": raw_payload.get("user"),
+    }
+    try:
+        form_payload = V1ImagesEditsForm.model_validate(raw_form)
+    except ValidationError as exc:
+        _record_images_edit_early_rejection(
+            model=observability_model,
+            stream=observability_stream,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(request, 400, openai_validation_error(exc))
+
+    raw_images = raw_payload.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        _record_images_edit_early_rejection(
+            model=form_payload.model,
+            stream=bool(form_payload.stream),
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "At least one `images[].image_url` data URL is required.",
+                param="images",
+            ),
+        )
+
+    images: list[tuple[bytes, str | None]] = []
+    for index, raw_image in enumerate(raw_images):
+        if not is_json_mapping(raw_image) or not isinstance(image_url := raw_image.get("image_url"), str):
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(
+                    f"images[{index}].image_url must be a base64 data URL.",
+                    param="images",
+                ),
+            )
+        try:
+            images.append(images_service_module.decode_data_url(image_url))
+        except ValueError as exc:
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(str(exc), param="images"),
+            )
+
+    return await _proxy_images_edit_request(
+        request=request,
+        payload=form_payload,
+        images=images,
+        mask=None,
+        context=context,
+        api_key=api_key,
+        started_at=started_at,
     )
 
 
@@ -1111,6 +1958,9 @@ async def _proxy_images_generation_request(
     context: ProxyContext,
     api_key: ApiKeyData | None,
 ) -> Response:
+    started_at = time.perf_counter()
+    route: Literal["generations"] = "generations"
+    stream_requested = bool(payload.stream)
     # Apply the API key's enforced model BEFORE running the cross-field
     # validation matrix. Otherwise a request that passes validation
     # under the client-supplied ``model`` (e.g. gpt-image-2 with a 16-
@@ -1125,6 +1975,14 @@ async def _proxy_images_generation_request(
         requested_model or settings.images_default_model,
     )
     if not images_service_module.is_supported_image_model(effective_model):
+        record_images_route_observability(
+            route=route,
+            model=effective_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             400,
@@ -1144,6 +2002,14 @@ async def _proxy_images_generation_request(
     try:
         payload = images_service_module.validate_generations_payload(payload)
     except ClientPayloadError as exc:
+        record_images_route_observability(
+            route=route,
+            model=effective_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
 
     public_model = payload.model
@@ -1152,21 +2018,47 @@ async def _proxy_images_generation_request(
 
     try:
         validate_model_access(api_key, effective_model)
-    except Exception:
-        # Re-raise so the global handler maps to 403.
+    except ProxyModelNotAllowed:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=403,
+            outcome="model_not_allowed",
+            started_at=started_at,
+        )
         raise
 
-    rate_limit_headers = await context.service.rate_limit_headers()
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=effective_model,
-        request_service_tier=None,
-    )
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+    try:
+        reservation = await _enforce_request_limits(
+            api_key,
+            request_model=effective_model,
+            request_service_tier=None,
+        )
+    except ProxyRateLimitError:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=429,
+            outcome="rate_limited",
+            started_at=started_at,
+        )
+        raise
 
     try:
         responses_payload = images_service_module.images_generation_to_responses_request(payload, host_model=host_model)
     except ValidationError as exc:
         await _release_reservation(reservation)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             400,
@@ -1194,6 +2086,7 @@ async def _proxy_images_generation_request(
         openai_cache_affinity=True,
         api_key=api_key,
         api_key_reservation=None,
+        client_ip=resolve_request_client_host(request),
     )
 
     # ``images_service`` populates ``response_id`` once the upstream stream
@@ -1215,6 +2108,14 @@ async def _proxy_images_generation_request(
         on_error=lambda: _release_reservation(reservation),
     )
     if prime_error is not None:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=prime_error.status_code,
+            outcome="upstream_error",
+            started_at=started_at,
+        )
         return prime_error
     assert primed_upstream is not None
 
@@ -1227,6 +2128,9 @@ async def _proxy_images_generation_request(
             try:
                 async for chunk in translated:
                     yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            except ProxyResponseError:
+                captured["image_stream_outcome"] = "upstream_error"
+                raise
             finally:
                 # Run the request-log model rewrite even when the stream
                 # is cancelled mid-flight (e.g. client disconnect). Without
@@ -1251,6 +2155,17 @@ async def _proxy_images_generation_request(
                     output_tokens=_output if isinstance(_output, int) else None,
                     cached_input_tokens=_cached if isinstance(_cached, int) else None,
                 )
+                stream_outcome = captured.get("image_stream_outcome")
+                if not isinstance(stream_outcome, str):
+                    stream_outcome = "stream_closed"
+                record_images_route_observability(
+                    route=route,
+                    model=public_model,
+                    stream=True,
+                    status=200,
+                    outcome=stream_outcome,
+                    started_at=started_at,
+                )
 
         return StreamingResponse(
             _stream_with_log_rewrite(),
@@ -1265,6 +2180,14 @@ async def _proxy_images_generation_request(
         )
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=exc.status_code,
+            outcome="upstream_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             exc.status_code,
@@ -1287,21 +2210,47 @@ async def _proxy_images_generation_request(
     )
 
     if error_envelope is not None:
+        error_status = _status_for_image_error_envelope(error_envelope)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=error_status,
+            outcome="image_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
-            _status_for_image_error_envelope(error_envelope),
+            error_status,
             error_envelope,
             headers=rate_limit_headers,
         )
     assert response_payload is not None
     images_result = images_service_module.images_response_from_responses(response_payload)
     if not isinstance(images_result, V1ImageResponse):
+        image_status = _status_for_image_error_envelope(images_result)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=image_status,
+            outcome="image_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
-            _status_for_image_error_envelope(images_result),
+            image_status,
             images_result,
             headers=rate_limit_headers,
         )
+    record_images_route_observability(
+        route=route,
+        model=public_model,
+        stream=False,
+        status=200,
+        outcome="success",
+        started_at=started_at,
+    )
     return JSONResponse(
         content=images_result.model_dump(mode="json", exclude_none=True),
         headers=rate_limit_headers,
@@ -1316,7 +2265,10 @@ async def _proxy_images_edit_request(
     mask: tuple[bytes, str | None] | None,
     context: ProxyContext,
     api_key: ApiKeyData | None,
+    started_at: float,
 ) -> Response:
+    route: Literal["edits"] = "edits"
+    stream_requested = bool(payload.stream)
     # Apply the API key's enforced model BEFORE validating the
     # cross-field matrix, so the matrix is checked against the model we
     # will actually send upstream. See the matching comment in
@@ -1328,6 +2280,14 @@ async def _proxy_images_edit_request(
         requested_model or settings.images_default_model,
     )
     if not images_service_module.is_supported_image_model(effective_model):
+        record_images_route_observability(
+            route=route,
+            model=effective_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             400,
@@ -1344,20 +2304,50 @@ async def _proxy_images_edit_request(
     try:
         payload = images_service_module.validate_edits_payload(payload)
     except ClientPayloadError as exc:
+        record_images_route_observability(
+            route=route,
+            model=effective_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
 
     public_model = payload.model
     assert public_model is not None
     host_model = settings.images_host_model
 
-    validate_model_access(api_key, effective_model)
+    try:
+        validate_model_access(api_key, effective_model)
+    except ProxyModelNotAllowed:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=403,
+            outcome="model_not_allowed",
+            started_at=started_at,
+        )
+        raise
 
-    rate_limit_headers = await context.service.rate_limit_headers()
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=effective_model,
-        request_service_tier=None,
-    )
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+    try:
+        reservation = await _enforce_request_limits(
+            api_key,
+            request_model=effective_model,
+            request_service_tier=None,
+        )
+    except ProxyRateLimitError:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=429,
+            outcome="rate_limited",
+            started_at=started_at,
+        )
+        raise
 
     try:
         responses_payload = images_service_module.images_edit_to_responses_request(
@@ -1368,6 +2358,14 @@ async def _proxy_images_edit_request(
         )
     except (ValidationError, ValueError) as exc:
         await _release_reservation(reservation)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=400,
+            outcome="invalid_request",
+            started_at=started_at,
+        )
         if isinstance(exc, ValidationError):
             return _logged_error_json_response(
                 request,
@@ -1393,6 +2391,7 @@ async def _proxy_images_edit_request(
         openai_cache_affinity=True,
         api_key=api_key,
         api_key_reservation=None,
+        client_ip=resolve_request_client_host(request),
     )
 
     captured: dict[str, object] = {}
@@ -1404,6 +2403,14 @@ async def _proxy_images_edit_request(
         on_error=lambda: _release_reservation(reservation),
     )
     if prime_error is not None:
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=stream_requested,
+            status=prime_error.status_code,
+            outcome="upstream_error",
+            started_at=started_at,
+        )
         return prime_error
     assert primed_upstream is not None
 
@@ -1416,6 +2423,9 @@ async def _proxy_images_edit_request(
             try:
                 async for chunk in translated:
                     yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            except ProxyResponseError:
+                captured["image_stream_outcome"] = "upstream_error"
+                raise
             finally:
                 # Run the request-log model rewrite even when the stream
                 # is cancelled mid-flight (e.g. client disconnect). Without
@@ -1440,6 +2450,17 @@ async def _proxy_images_edit_request(
                     output_tokens=_output if isinstance(_output, int) else None,
                     cached_input_tokens=_cached if isinstance(_cached, int) else None,
                 )
+                stream_outcome = captured.get("image_stream_outcome")
+                if not isinstance(stream_outcome, str):
+                    stream_outcome = "stream_closed"
+                record_images_route_observability(
+                    route=route,
+                    model=public_model,
+                    stream=True,
+                    status=200,
+                    outcome=stream_outcome,
+                    started_at=started_at,
+                )
 
         return StreamingResponse(
             _stream_with_log_rewrite(),
@@ -1454,6 +2475,14 @@ async def _proxy_images_edit_request(
         )
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=exc.status_code,
+            outcome="upstream_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
             exc.status_code,
@@ -1476,21 +2505,47 @@ async def _proxy_images_edit_request(
     )
 
     if error_envelope is not None:
+        error_status = _status_for_image_error_envelope(error_envelope)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=error_status,
+            outcome="image_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
-            _status_for_image_error_envelope(error_envelope),
+            error_status,
             error_envelope,
             headers=rate_limit_headers,
         )
     assert response_payload is not None
     images_result = images_service_module.images_response_from_responses(response_payload)
     if not isinstance(images_result, V1ImageResponse):
+        image_status = _status_for_image_error_envelope(images_result)
+        record_images_route_observability(
+            route=route,
+            model=public_model,
+            stream=False,
+            status=image_status,
+            outcome="image_error",
+            started_at=started_at,
+        )
         return _logged_error_json_response(
             request,
-            _status_for_image_error_envelope(images_result),
+            image_status,
             images_result,
             headers=rate_limit_headers,
         )
+    record_images_route_observability(
+        route=route,
+        model=public_model,
+        stream=False,
+        status=200,
+        outcome="success",
+        started_at=started_at,
+    )
     return JSONResponse(
         content=images_result.model_dump(mode="json", exclude_none=True),
         headers=rate_limit_headers,
@@ -1505,21 +2560,71 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
     )
 
     allowed_models = _allowed_models_for_api_key(api_key)
+    exact_source_allowed_models = _exact_source_allowed_models_for_api_key(api_key)
+    visibility_allowed_models = _codex_model_visibility_allowed_models(api_key)
 
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
+    source_models = [
+        model
+        for model in await _list_enabled_source_catalog_models(api_key, require_responses=True)
+        if model.raw.get("supports_streaming") is True
+    ]
 
-    if not models:
+    if not models and not source_models:
         await _release_reservation(reservation)
-        return JSONResponse(content=CodexModelsResponse(models=[]).model_dump(mode="json"))
+        return JSONResponse(content=CodexModelsResponse(models=[], data=[]).model_dump(mode="json"))
 
     entries: list[CodexModelEntry] = []
+    data: list[ModelListItem] = []
+    seen_slugs: set[str] = set()
     for slug, model in models.items():
-        if not is_public_model(model, allowed_models):
+        if not _is_codex_backend_catalog_model(model):
             continue
-        entries.append(_to_codex_model_entry(model))
+        if visibility_allowed_models is None:
+            if allowed_models is not None and slug not in allowed_models:
+                continue
+            entry = _to_codex_model_entry(model)
+            entries.append(entry)
+            seen_slugs.add(slug)
+            if model.supported_in_api and entry.visibility == "list":
+                data.append(_to_model_list_item(slug, model, created=_model_list_created_at(model)))
+            continue
+        entry = _to_codex_model_entry(
+            model,
+            visibility="list" if slug in visibility_allowed_models else "hide",
+        )
+        entries.append(entry)
+        seen_slugs.add(slug)
+        if model.supported_in_api and entry.visibility == "list":
+            data.append(_to_model_list_item(slug, model, created=_model_list_created_at(model)))
+    for model in source_models:
+        if model.slug in seen_slugs:
+            continue
+        if visibility_allowed_models is None:
+            if exact_source_allowed_models is not None:
+                if model.slug not in exact_source_allowed_models:
+                    continue
+            elif not is_public_model(model, allowed_models):
+                continue
+            entry = _to_codex_model_entry(model)
+            entries.append(entry)
+            seen_slugs.add(model.slug)
+            if model.supported_in_api and entry.visibility == "list":
+                data.append(_to_model_list_item(model.slug, model, created=_model_list_created_at(model)))
+            continue
+        entry = _to_codex_model_entry(
+            model,
+            visibility=(
+                "list" if exact_source_allowed_models is None or model.slug in exact_source_allowed_models else "hide"
+            ),
+        )
+        entries.append(entry)
+        seen_slugs.add(model.slug)
+        if model.supported_in_api and entry.visibility == "list":
+            data.append(_to_model_list_item(model.slug, model, created=_model_list_created_at(model)))
     await _release_reservation(reservation)
-    return JSONResponse(content=CodexModelsResponse(models=entries).model_dump(mode="json"))
+    return JSONResponse(content=CodexModelsResponse(models=entries, data=data).model_dump(mode="json"))
 
 
 async def _build_models_response(api_key: ApiKeyData | None) -> Response:
@@ -1530,40 +2635,141 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
     )
 
     allowed_models = _allowed_models_for_api_key(api_key)
+    exact_source_allowed_models = _exact_source_allowed_models_for_api_key(api_key)
     created = int(time.time())
 
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
+    source_models = await _list_enabled_source_catalog_models(api_key)
 
-    if not models:
+    if not models and not source_models:
         await _release_reservation(reservation)
-        return JSONResponse(content=ModelListResponse(data=[]).model_dump(mode="json"))
+        return JSONResponse(content=_dump_v1_models_response(ModelListResponse(data=[])))
 
     items: list[ModelListItem] = []
+    seen_slugs: set[str] = set()
     for slug, model in models.items():
         if not is_public_model(model, allowed_models):
             continue
-        items.append(
-            ModelListItem(
-                id=slug,
-                created=created,
-                owned_by="codex-lb",
-                metadata=_to_model_metadata(model),
-            )
-        )
+        items.append(_to_model_list_item(slug, model, created=created))
+        seen_slugs.add(slug)
+    for model in source_models:
+        if model.slug in seen_slugs:
+            continue
+        if exact_source_allowed_models is not None:
+            if model.slug not in exact_source_allowed_models:
+                continue
+        elif not is_public_model(model, allowed_models):
+            continue
+        items.append(_to_model_list_item(model.slug, model, created=created))
+        seen_slugs.add(model.slug)
     await _release_reservation(reservation)
-    return JSONResponse(content=ModelListResponse(data=items).model_dump(mode="json"))
+    return JSONResponse(content=_dump_v1_models_response(ModelListResponse(data=items)))
+
+
+async def _list_enabled_source_catalog_models(
+    api_key: ApiKeyData | None,
+    *,
+    require_responses: bool = False,
+) -> list[UpstreamModel]:
+    async with get_background_session() as session:
+        sources = await ModelSourcesRepository(session).list_enabled_sources()
+        # ``close_session`` rolls back the read transaction, which would
+        # expire the loaded rows; detach them so their attributes stay
+        # readable after this session boundary.
+        detach_session_objects(session)
+    if require_responses:
+        sources = [source for source in sources if source.supports_responses]
+    assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
+    if assigned_source_ids is not None:
+        sources = [source for source in sources if source.id in assigned_source_ids]
+    return source_models_to_upstream_models(sources)
+
+
+def _dump_v1_models_response(response: ModelListResponse) -> dict[str, JsonValue]:
+    payload = response.model_dump(mode="json")
+    for item in payload["data"]:
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("additional_speed_tiers", "service_tiers", "default_service_tier"):
+            if metadata.get(key) is None:
+                metadata.pop(key, None)
+    return payload
 
 
 def _allowed_models_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
-    allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
+    allowed_models = _canonical_model_set(api_key.allowed_models) if api_key and api_key.allowed_models else None
     if api_key and api_key.enforced_model:
+        forced = {_canonical_model_slug(api_key.enforced_model)}
+        return forced if allowed_models is None else (allowed_models & forced)
+    return allowed_models
+
+
+def _exact_source_allowed_models_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
+    if api_key is None:
+        return None
+    allowed_models = set(api_key.allowed_models) if api_key.allowed_models else None
+    if api_key.enforced_model:
         forced = {api_key.enforced_model}
         return forced if allowed_models is None else (allowed_models & forced)
     return allowed_models
 
 
-def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
+def _canonical_model_set(models: Iterable[str]) -> set[str]:
+    return {_canonical_model_slug(model) for model in models}
+
+
+def _canonical_model_slug(model: str) -> str:
+    return resolve_model_alias(model) or model
+
+
+def _to_model_list_item(slug: str, model: UpstreamModel, *, created: int) -> ModelListItem:
+    return ModelListItem.model_validate(
+        {
+            "id": slug,
+            "created": created,
+            "owned_by": "codex-lb",
+            "metadata": _to_model_metadata(model),
+            "api_types": ["chat_completions"],
+            "capabilities": _v1_model_capabilities(model),
+            "context_length": _v1_input_context_window(model),
+            "contextLength": _v1_input_context_window(model),
+            "max_output_tokens": _v1_max_output_tokens(model),
+            "maxOutputTokens": _v1_max_output_tokens(model),
+            "supports_reasoning": _v1_supports_reasoning(model),
+            "supportsReasoning": _v1_supports_reasoning(model),
+            "supports_images": _v1_supports_vision(model),
+            "supportsImages": _v1_supports_vision(model),
+            "supports_vision": _v1_supports_vision(model),
+            "supportsVision": _v1_supports_vision(model),
+        }
+    )
+
+
+def _model_list_created_at(model: UpstreamModel) -> int:
+    for key in ("created", "created_at", "createdAt"):
+        raw_value = model.raw.get(key)
+        if isinstance(raw_value, int):
+            return raw_value
+        if isinstance(raw_value, float):
+            return int(raw_value)
+    return 0
+
+
+def _codex_model_visibility_allowed_models(api_key: ApiKeyData | None) -> set[str] | None:
+    if api_key is None or not api_key.apply_to_codex_model or not api_key.allowed_models:
+        return None
+    return _allowed_models_for_api_key(api_key)
+
+
+def _is_codex_backend_catalog_model(model: UpstreamModel) -> bool:
+    if model.supported_in_api:
+        return True
+    return model.raw.get("shell_type") == "shell_command"
+
+
+def _to_codex_model_entry(model: UpstreamModel, *, visibility: str | None = None) -> CodexModelEntry:
     raw = model.raw
 
     extra: dict[str, JsonValue] = {}
@@ -1617,7 +2823,7 @@ def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
         input_modalities=list(model.input_modalities),
         available_in_plans=sorted(model.available_in_plans),
         prefer_websockets=model.prefer_websockets,
-        visibility=_model_visibility(model),
+        visibility=visibility or _model_visibility(model),
         **extra,
     )
 
@@ -1627,38 +2833,49 @@ def _effective_context_window(model: UpstreamModel) -> int:
     return overrides.get(model.slug, model.context_window)
 
 
-def _raw_positive_int(raw: Mapping[str, JsonValue], key: str) -> int | None:
-    value = raw.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
-
-
 def _v1_full_context_window(model: UpstreamModel) -> int:
     overrides = get_settings().model_context_window_overrides
-    explicit_override = overrides.get(model.slug)
-    if explicit_override is not None:
-        return explicit_override
-
-    known_context_window = _V1_FULL_CONTEXT_WINDOW_OVERRIDES.get(model.slug)
-    if known_context_window is not None:
-        return known_context_window
-
-    upstream_context_window = model.context_window
-    raw_max_context_window = _raw_positive_int(model.raw, "max_context_window")
-    if raw_max_context_window is not None and raw_max_context_window > upstream_context_window:
-        return raw_max_context_window
-
-    return upstream_context_window
+    return overrides.get(model.slug, model.context_window)
 
 
-def _v1_input_context_window(model: UpstreamModel) -> int | None:
-    input_context_window = model.context_window
-    return input_context_window if input_context_window != _v1_full_context_window(model) else None
+def _v1_input_context_window(model: UpstreamModel) -> int:
+    return model.context_window
 
 
 def _v1_max_output_tokens(model: UpstreamModel) -> int | None:
+    raw_value = model.raw.get("max_output_tokens")
+    if isinstance(raw_value, int):
+        return raw_value
     return _V1_MAX_OUTPUT_TOKEN_OVERRIDES.get(model.slug)
+
+
+def _v1_model_capabilities(model: UpstreamModel) -> dict[str, JsonValue]:
+    supports_streaming_raw = model.raw.get("supports_streaming")
+    supports_streaming = supports_streaming_raw if isinstance(supports_streaming_raw, bool) else True
+    return {
+        "context_length": _v1_input_context_window(model),
+        "max_output_tokens": _v1_max_output_tokens(model),
+        "supports_reasoning": _v1_supports_reasoning(model),
+        "supports_images": _v1_supports_vision(model),
+        "supportsImages": _v1_supports_vision(model),
+        "supports_vision": _v1_supports_vision(model),
+        "supports_tool_use": model.supports_parallel_tool_calls,
+        "supports_streaming": supports_streaming,
+        "input_modalities": list(model.input_modalities),
+        "output_modalities": ["text"],
+    }
+
+
+def _v1_supports_reasoning(model: UpstreamModel) -> bool:
+    if bool(model.supported_reasoning_levels) or model.supports_reasoning_summaries:
+        return True
+    # OpenAI-compatible source models advertise no reasoning levels; their
+    # catalog entries opt in via raw metadata so /v1/models reflects reality.
+    return model.raw.get("supports_reasoning") is True
+
+
+def _v1_supports_vision(model: UpstreamModel) -> bool:
+    return "image" in model.input_modalities
 
 
 def _model_visibility(model: UpstreamModel) -> str:
@@ -1687,7 +2904,29 @@ def _to_model_metadata(model: UpstreamModel) -> ModelMetadata:
         supported_in_api=model.supported_in_api,
         minimal_client_version=model.minimal_client_version,
         priority=model.priority,
+        additional_speed_tiers=_raw_string_list(model.raw, "additional_speed_tiers"),
+        service_tiers=_raw_object_list(model.raw, "service_tiers"),
+        default_service_tier=_raw_optional_string(model.raw, "default_service_tier"),
     )
+
+
+def _raw_string_list(raw: Mapping[str, JsonValue], key: str) -> list[str] | None:
+    value = raw.get(key)
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, str)]
+
+
+def _raw_object_list(raw: Mapping[str, JsonValue], key: str) -> list[dict[str, JsonValue]] | None:
+    value = raw.get(key)
+    if not isinstance(value, list):
+        return None
+    return [dict(cast(Mapping[str, JsonValue], item)) for item in value if isinstance(item, Mapping)]
+
+
+def _raw_optional_string(raw: Mapping[str, JsonValue], key: str) -> str | None:
+    value = raw.get(key)
+    return value if isinstance(value, str) else None
 
 
 @v1_router.post(
@@ -1709,39 +2948,76 @@ async def v1_chat_completions(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    cursor_compat_client = _is_cursor_compat_client(request, api_key)
     effective_model = _effective_model_for_api_key(api_key, payload.model)
     validate_model_access(api_key, effective_model)
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     try:
-        # Validate strict function tool schemas against the *original* request
-        # ``tools`` list before ``to_responses_request()`` runs. The chat
-        # normalizer (``_normalize_chat_tools``) silently drops invalid
-        # entries (non-dict tools, function tools with missing/empty
-        # ``name``), so validating the normalized output would surface
-        # ``tools[i].function.parameters`` with an ``i`` that no longer maps
-        # to the client's inbound payload. Using ``payload.tools`` keeps the
-        # error envelope's ``param`` aligned with what the client sent.
-        enforce_strict_function_tools_format(
-            payload.tools,
-            param_template="tools[{index}].function.parameters",
-            nested=True,
-        )
+        responses_shaped_payload = not payload.messages and payload.input is not None
+        if not responses_shaped_payload:
+            # Validate strict function tool schemas against the *original* request
+            # ``tools`` list before ``to_responses_request()`` runs. The chat
+            # normalizer (``_normalize_chat_tools``) silently drops invalid
+            # entries (non-dict tools, function tools with missing/empty
+            # ``name``), so validating the normalized output would surface
+            # ``tools[i].function.parameters`` with an ``i`` that no longer maps
+            # to the client's inbound payload. Using ``payload.tools`` keeps the
+            # error envelope's ``param`` aligned with what the client sent.
+            enforce_strict_function_tools_format(
+                payload.tools,
+                param_template="tools[{index}].function.parameters",
+                nested=True,
+            )
         responses_payload = payload.to_responses_request()
         enforce_strict_text_format(responses_payload)
+        if responses_shaped_payload:
+            enforce_strict_function_tools_format(responses_payload.tools)
     except ClientPayloadError as exc:
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
+    apply_api_key_enforcement(responses_payload, api_key)
+    source_selection = (
+        await _select_chat_model_source(
+            responses_payload.model,
+            api_key,
+            raw_model=effective_model,
+            require_streaming=payload.stream is True,
+        )
+        if not responses_shaped_payload and payload.messages is not None
+        else None
+    )
+    source = source_selection[0] if source_selection is not None else None
+    request_model = source_selection[1] if source_selection is not None else responses_payload.model
+    if source is None:
+        # Opportunistic admission gates subscription *account* capacity;
+        # source-routed requests use no account, so a closed/empty pool must
+        # not reject them.
+        admission_denial = await _opportunistic_admission_denial(
+            request, context, api_key, model=responses_payload.model
+        )
+        if admission_denial is not None:
+            return admission_denial
     reservation = await _enforce_request_limits(
         api_key,
-        request_model=effective_model,
+        request_model=request_model,
         request_service_tier=responses_payload.service_tier,
+        request_usage_budget=estimate_api_key_request_usage(responses_payload),
     )
+    if source is not None:
+        return await _source_chat_completion_response(
+            request,
+            payload,
+            source=source,
+            model=request_model,
+            api_key=api_key,
+            reservation=reservation,
+            rate_limit_headers=rate_limit_headers,
+        )
     responses_payload.stream = True
-    apply_api_key_enforcement(responses_payload, api_key)
     stream = context.service.stream_responses(
         responses_payload,
         request.headers,
@@ -1751,20 +3027,40 @@ async def v1_chat_completions(
         api_key=api_key,
         api_key_reservation=reservation,
         suppress_text_done_events=True,
+        client_ip=resolve_request_client_host(request),
     )
-    stream, startup_error = await _probe_stream_startup_error(stream)
+    startup_probe_timeout = (
+        _CURSOR_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS
+        if cursor_compat_client
+        else _CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS
+    )
+    stream, startup_error = await _probe_chat_stream_startup_error(stream, timeout_seconds=startup_probe_timeout)
     if startup_error is not None:
+        if cursor_compat_client and _is_context_length_startup_error(startup_error):
+            await _release_reservation(reservation)
+            if payload.stream:
+                return _cursor_context_limit_usage_stream(
+                    payload,
+                    headers=rate_limit_headers,
+                )
+            return _cursor_context_limit_usage_completion(
+                payload,
+                headers=rate_limit_headers,
+            )
         return _stream_startup_error_response(request, startup_error, headers=rate_limit_headers)
     if payload.stream:
         stream_options = payload.stream_options
-        include_usage = bool(stream_options and stream_options.include_usage)
+        include_usage = cursor_compat_client or bool(stream_options and stream_options.include_usage)
+        chat_stream = stream_chat_chunks(
+            _stream_proxy_errors_as_response_failed(stream),
+            model=responses_payload.model,
+            include_usage=include_usage,
+        )
+        if cursor_compat_client:
+            chat_stream = _stream_with_cursor_usage_fallback(chat_stream, payload)
         return StreamingResponse(
             inject_sse_keepalives(
-                stream_chat_chunks(
-                    _stream_proxy_errors_as_response_failed(stream),
-                    model=responses_payload.model,
-                    include_usage=include_usage,
-                ),
+                chat_stream,
                 get_settings().sse_keepalive_interval_seconds,
             ),
             media_type="text/event-stream",
@@ -1790,11 +3086,878 @@ async def v1_chat_completions(
             content=result.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
+    if cursor_compat_client and isinstance(result, ChatCompletion):
+        _apply_cursor_usage_fallback(result, payload, source="non_stream")
     return JSONResponse(
         content=result.model_dump(mode="json", exclude_none=True),
         status_code=200,
         headers=rate_limit_headers,
     )
+
+
+async def _select_chat_model_source(
+    model: str,
+    api_key: ApiKeyData | None,
+    *,
+    raw_model: str | None = None,
+    require_streaming: bool = False,
+) -> tuple[ModelSource, str] | None:
+    assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
+    exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
+    candidates = [candidate for candidate in (raw_model, model) if candidate]
+    if not candidates:
+        return None
+    deduped_candidates = list(dict.fromkeys(candidates))
+    registry_models = get_model_registry().get_models_with_fallback()
+    async with get_background_session() as session:
+        repository = ModelSourcesRepository(session)
+        for candidate in deduped_candidates:
+            if exact_allowed_models is not None and candidate not in exact_allowed_models:
+                continue
+            subscription_model = registry_models.get(candidate)
+            if assigned_source_ids is None and subscription_model is not None:
+                continue
+            source = await repository.find_chat_source_for_model(
+                candidate,
+                allowed_source_ids=assigned_source_ids,
+                require_streaming=require_streaming,
+            )
+            if source is not None:
+                break
+        else:
+            source = None
+        # ``close_session`` rolls back the read transaction, which would
+        # expire the loaded row; detach it so the forwarding path can read
+        # its attributes after this session boundary.
+        detach_session_objects(session)
+        return (source, candidate) if source is not None else None
+
+
+async def _select_responses_model_source(
+    model: str,
+    api_key: ApiKeyData | None,
+    *,
+    raw_model: str | None = None,
+    require_streaming: bool = False,
+) -> tuple[ModelSource, str] | None:
+    assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
+    exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
+    candidates = [candidate for candidate in (raw_model, model) if candidate]
+    if not candidates:
+        return None
+    deduped_candidates = list(dict.fromkeys(candidates))
+    registry_models = get_model_registry().get_models_with_fallback()
+    async with get_background_session() as session:
+        repository = ModelSourcesRepository(session)
+        for candidate in deduped_candidates:
+            if exact_allowed_models is not None and candidate not in exact_allowed_models:
+                continue
+            subscription_model = registry_models.get(candidate)
+            if assigned_source_ids is None and subscription_model is not None:
+                continue
+            source = await repository.find_responses_source_for_model(
+                candidate,
+                allowed_source_ids=assigned_source_ids,
+                require_streaming=require_streaming,
+            )
+            if source is not None:
+                break
+        else:
+            source = None
+        # ``close_session`` rolls back the read transaction, which would
+        # expire the loaded row; detach it so the forwarding path can read
+        # its attributes after this session boundary.
+        detach_session_objects(session)
+        return (source, candidate) if source is not None else None
+
+
+async def _select_audio_transcriptions_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:
+    assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
+    exact_allowed_models = _exact_source_allowed_models_for_api_key(api_key)
+    if exact_allowed_models is not None and model not in exact_allowed_models:
+        return None
+    if assigned_source_ids is None and model == _TRANSCRIPTION_MODEL:
+        return None
+    async with get_background_session() as session:
+        source = await ModelSourcesRepository(session).find_audio_transcriptions_source_for_model(
+            model,
+            allowed_source_ids=assigned_source_ids,
+        )
+        detach_session_objects(session)
+        return source
+
+
+def _allowed_source_ids_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
+    if api_key is None or not api_key.source_assignment_scope_enabled:
+        return None
+    return set(api_key.assigned_source_ids)
+
+
+async def _source_audio_transcription_response(
+    *,
+    request: Request,
+    model: str,
+    file: UploadFile,
+    source: ModelSource,
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+) -> Response:
+    # Read the downstream form and file before reserving usage: a parse or
+    # upload failure here must not leave the API key's budget held.
+    fields = await _audio_transcription_form_fields(request)
+    audio_bytes = await file.read()
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=model,
+        request_service_tier=None,
+    )
+    try:
+        result = await forward_source_audio_transcription(
+            source,
+            audio_bytes=audio_bytes,
+            filename=file.filename or "audio.wav",
+            content_type=file.content_type,
+            fields=fields,
+        )
+    except ModelSourceForwardingError as exc:
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code=_source_error_code(exc.payload),
+            error_message=_source_error_message(exc.payload),
+            upstream_status_code=exc.upstream_status_code,
+        )
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+
+    # ASR billing prefers audio duration: when the source model has a
+    # per-minute rate and the response carries a duration, settle cost from
+    # the duration with zero tokens. Only when there is no usable duration
+    # cost do we fall back to token usage (and fail closed for limited keys
+    # if neither is available).
+    audio_cost_usd = (
+        source_model_audio_cost_usd(source, model, result.audio_seconds) if result.audio_seconds is not None else None
+    )
+    if audio_cost_usd is not None:
+        settle_usage: SourceUsage | None = SourceUsage(input_tokens=0, output_tokens=0)
+        cost_override: float | None = audio_cost_usd
+    else:
+        settle_usage = result.usage
+        cost_override = None
+        if result.usage is None and _reservation_requires_usage(reservation):
+            await _release_reservation(reservation)
+            error = openai_error(
+                "usage_unavailable",
+                "OpenAI-compatible model source transcription response did not include token usage "
+                "or a usable duration for a limited API key",
+                error_type="server_error",
+            )
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code="usage_unavailable",
+                error_message="source transcription response missing token usage and duration cost",
+                upstream_status_code=result.upstream_status_code,
+            )
+            return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    settled = await _settle_source_reservation(
+        reservation,
+        source=source,
+        model=model,
+        usage=settle_usage,
+        cost_usd_override=cost_override,
+    )
+    if not settled:
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="usage_settlement_failed",
+            error_message="source usage settlement failed",
+            upstream_status_code=result.upstream_status_code,
+        )
+        return _logged_error_json_response(
+            request,
+            502,
+            _source_usage_settlement_failed_error(),
+            headers=rate_limit_headers,
+        )
+    await _log_source_chat_completion(
+        request,
+        source=source,
+        api_key=api_key,
+        model=model,
+        status="success",
+        usage=settle_usage,
+        cost_usd_override=cost_override,
+        upstream_status_code=result.upstream_status_code,
+    )
+    headers = dict(rate_limit_headers)
+    if result.content_type is not None:
+        headers["content-type"] = result.content_type
+    return Response(content=result.body, status_code=200, headers=headers)
+
+
+async def _audio_transcription_form_fields(request: Request) -> list[tuple[str, str]]:
+    form = await request.form()
+    fields: list[tuple[str, str]] = []
+    for key, value in form.multi_items():
+        if key == "file":
+            continue
+        if isinstance(value, str):
+            fields.append((key, value))
+    return fields
+
+
+async def _source_responses_response(
+    request: Request,
+    payload: ResponsesRequest,
+    *,
+    source: ModelSource,
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+) -> Response:
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=payload.model,
+        request_service_tier=payload.service_tier,
+        request_usage_budget=estimate_api_key_request_usage(payload),
+    )
+    source_payload = payload.model_dump(mode="json", exclude_none=True)
+    source_payload["stream"] = bool(payload.stream)
+    _apply_source_response_request_overrides(source_payload, source_model_request_overrides(source, payload.model))
+    _drop_unsupported_source_response_tools(
+        source_payload,
+        supported_tool_types=source_model_supported_tool_types(source, payload.model),
+    )
+
+    if payload.stream:
+        try:
+            stream = await stream_source_responses(source, source_payload)
+        except ModelSourceForwardingError as exc:
+            await _release_reservation(reservation)
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=payload.model,
+                status="error",
+                error_code=_source_error_code(exc.payload),
+                error_message=_source_error_message(exc.payload),
+                upstream_status_code=exc.upstream_status_code,
+            )
+            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if _reservation_requires_usage(reservation):
+            return await _buffered_limited_source_chat_stream_response(
+                request,
+                source=source,
+                api_key=api_key,
+                model=payload.model,
+                reservation=reservation,
+                stream=stream.body,
+                usage_holder=stream.usage_holder,
+                rate_limit_headers=rate_limit_headers,
+            )
+        body = _source_chat_stream_with_settlement(
+            stream.body,
+            usage_holder=stream.usage_holder,
+            request=request,
+            source=source,
+            api_key=api_key,
+            model=payload.model,
+            reservation=reservation,
+        )
+        return StreamingResponse(
+            body,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                **rate_limit_headers,
+            },
+        )
+
+    try:
+        result = await forward_source_responses(source, source_payload)
+    except ModelSourceForwardingError as exc:
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=payload.model,
+            status="error",
+            error_code=_source_error_code(exc.payload),
+            error_message=_source_error_message(exc.payload),
+            upstream_status_code=exc.upstream_status_code,
+        )
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+
+    if result.usage is None and _reservation_requires_usage(reservation):
+        await _release_reservation(reservation)
+        error = openai_error(
+            "usage_unavailable",
+            "OpenAI-compatible model source response did not include usage for a limited API key",
+            error_type="server_error",
+        )
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=payload.model,
+            status="error",
+            error_code="usage_unavailable",
+            error_message="source response missing usage",
+            upstream_status_code=result.upstream_status_code,
+        )
+        return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    settled = await _settle_source_reservation(reservation, source=source, model=payload.model, usage=result.usage)
+    if not settled:
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=payload.model,
+            status="error",
+            error_code="usage_settlement_failed",
+            error_message="source usage settlement failed",
+            upstream_status_code=result.upstream_status_code,
+        )
+        return _logged_error_json_response(
+            request,
+            502,
+            _source_usage_settlement_failed_error(),
+            headers=rate_limit_headers,
+        )
+    await _log_source_chat_completion(
+        request,
+        source=source,
+        api_key=api_key,
+        model=payload.model,
+        status="success",
+        usage=result.usage,
+        upstream_status_code=result.upstream_status_code,
+    )
+    return JSONResponse(content=result.payload, status_code=200, headers=rate_limit_headers)
+
+
+# Keys that source_request_overrides must never clobber: the routed model slug
+# is owned by source selection, and the stream flag drives SSE-vs-JSON response
+# handling on the proxy side.
+_SOURCE_RESPONSE_OVERRIDE_PROTECTED_KEYS = frozenset({"model", "stream"})
+
+
+def _apply_source_response_request_overrides(
+    payload: dict[str, JsonValue],
+    overrides: Mapping[str, JsonValue],
+) -> None:
+    for key, value in overrides.items():
+        if key in _SOURCE_RESPONSE_OVERRIDE_PROTECTED_KEYS:
+            continue
+        if key == "options" and isinstance(value, Mapping):
+            existing_options = payload.get("options")
+            merged_options = dict(existing_options) if isinstance(existing_options, Mapping) else {}
+            merged_options.update(value)
+            payload["options"] = merged_options
+            continue
+        payload[key] = value
+
+
+def _source_tool_type_supported(tool_type: JsonValue | None, supported_tool_types: frozenset[str]) -> bool:
+    if tool_type == "function":
+        return True
+    return isinstance(tool_type, str) and tool_type in supported_tool_types
+
+
+def _normalize_source_allowed_tool_choice_aliases(payload: dict[str, JsonValue]) -> None:
+    """Normalize legacy tool-type aliases nested under ``allowed_tools``.
+
+    Request validation normalizes the ``tools`` list and the top-level
+    ``tool_choice`` type (``web_search_preview`` -> ``web_search``) but leaves
+    entries nested under an ``allowed_tools`` choice untouched. Sources that
+    reject the legacy alias or validate the forced choice against the
+    (normalized) tools list would fail such requests, so source-bound payloads
+    always get the same alias normalization applied to the nested entries.
+    """
+    tool_choice = payload.get("tool_choice")
+    if not is_json_mapping(tool_choice):
+        return
+    if tool_choice.get("type") != "allowed_tools":
+        return
+    allowed = tool_choice.get("tools")
+    if not is_json_list(allowed):
+        return
+    normalized_allowed: list[JsonValue] = []
+    changed = False
+    for entry in allowed:
+        if is_json_mapping(entry):
+            entry_type = entry.get("type")
+            if isinstance(entry_type, str):
+                normalized_type = normalize_tool_type(entry_type)
+                if normalized_type != entry_type:
+                    entry = {**entry, "type": normalized_type}
+                    changed = True
+        normalized_allowed.append(entry)
+    if not changed:
+        return
+    updated_choice: dict[str, JsonValue] = dict(tool_choice)
+    updated_choice["tools"] = normalized_allowed
+    payload["tool_choice"] = updated_choice
+
+
+# Maps hosted tool types to the Responses ``include`` prefixes that only make
+# sense while that tool is present (see _RESPONSES_INCLUDE_ALLOWLIST in
+# app.core.openai.requests). When the source filter drops a hosted tool, the
+# matching include entries must be pruned with it: sources that validate
+# ``include`` would otherwise reject the request the filter just repaired.
+# Non-tool-specific entries (``reasoning.*``, ``message.*``) are never pruned.
+_SOURCE_TOOL_INCLUDE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "web_search": ("web_search_call.",),
+    "file_search": ("file_search_call.",),
+    "code_interpreter": ("code_interpreter_call.",),
+    "computer_use": ("computer_call_output.",),
+    "computer_use_preview": ("computer_call_output.",),
+}
+
+
+def _prune_source_tool_specific_includes(payload: dict[str, JsonValue], dropped_tool_types: frozenset[str]) -> None:
+    prefixes = tuple(
+        prefix for tool_type in dropped_tool_types for prefix in _SOURCE_TOOL_INCLUDE_PREFIXES.get(tool_type, ())
+    )
+    if not prefixes:
+        return
+    include = payload.get("include")
+    if not is_json_list(include):
+        return
+    kept_include: list[JsonValue] = [
+        entry for entry in include if not (isinstance(entry, str) and entry.startswith(prefixes))
+    ]
+    if len(kept_include) == len(include):
+        return
+    if not kept_include:
+        payload.pop("include", None)
+        return
+    payload["include"] = kept_include
+
+
+def _drop_unsupported_source_response_tools(
+    payload: dict[str, JsonValue],
+    *,
+    supported_tool_types: frozenset[str],
+) -> None:
+    _normalize_source_allowed_tool_choice_aliases(payload)
+    tools = payload.get("tools")
+    if not is_json_list(tools):
+        return
+    kept_tools: list[JsonValue] = []
+    kept_types: set[str] = set()
+    dropped_types: set[str] = set()
+    for tool in tools:
+        if not is_json_mapping(tool):
+            continue
+        tool_type = tool.get("type")
+        if not _source_tool_type_supported(tool_type, supported_tool_types):
+            if isinstance(tool_type, str):
+                dropped_types.add(normalize_tool_type(tool_type))
+            continue
+        kept_tools.append(tool)
+        if isinstance(tool_type, str):
+            kept_types.add(tool_type)
+    if len(kept_tools) == len(tools):
+        return
+    _prune_source_tool_specific_includes(payload, frozenset(dropped_types))
+    if not kept_tools:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        payload.pop("parallel_tool_calls", None)
+        return
+    payload["tools"] = kept_tools
+    _drop_dangling_source_tool_choice(payload, frozenset(kept_types))
+
+
+def _drop_dangling_source_tool_choice(payload: dict[str, JsonValue], kept_types: frozenset[str]) -> None:
+    """Keep tool_choice consistent with the tools that survived filtering.
+
+    A forced tool_choice that references a dropped hosted tool (for example
+    ``{"type": "web_search"}``) would make the source reject the request, so it
+    falls back to the provider default by removing the key. ``function``-typed
+    choices always stay: function tools are never dropped by the filter.
+
+    Entries under ``allowed_tools`` carry the same tool-type alias
+    normalization as the ``tools`` list by the time this runs (see
+    ``_normalize_source_allowed_tool_choice_aliases``), so a legacy-alias
+    forced choice keeps matching the normalized tool it targets.
+    """
+    tool_choice = payload.get("tool_choice")
+    if not is_json_mapping(tool_choice):
+        return
+    choice_type = tool_choice.get("type")
+    if choice_type == "function":
+        return
+    if choice_type == "allowed_tools":
+        allowed = tool_choice.get("tools")
+        if not is_json_list(allowed):
+            return
+        kept_allowed: list[JsonValue] = [
+            entry
+            for entry in allowed
+            if is_json_mapping(entry) and _source_tool_type_supported(entry.get("type"), kept_types)
+        ]
+        if len(kept_allowed) == len(allowed):
+            return
+        if not kept_allowed:
+            payload.pop("tool_choice", None)
+            return
+        updated_choice: dict[str, JsonValue] = dict(tool_choice)
+        updated_choice["tools"] = kept_allowed
+        payload["tool_choice"] = updated_choice
+        return
+    if not _source_tool_type_supported(choice_type, kept_types):
+        payload.pop("tool_choice", None)
+
+
+async def _source_chat_completion_response(
+    request: Request,
+    payload: ChatCompletionsRequest,
+    *,
+    source: ModelSource,
+    model: str,
+    api_key: ApiKeyData | None,
+    reservation: ApiKeyUsageReservationData | None,
+    rate_limit_headers: Mapping[str, str],
+) -> Response:
+    source_payload = payload.model_dump(mode="json", exclude_none=True)
+    source_payload["model"] = model
+    source_payload["stream"] = bool(payload.stream)
+    apply_api_key_enforcement_to_chat_payload(source_payload, api_key)
+    sanitize_source_chat_payload(
+        source_payload,
+        allow_reasoning=source_model_supports_reasoning(source, model),
+    )
+
+    if payload.stream:
+        stream_options = source_payload.get("stream_options")
+        if isinstance(stream_options, dict):
+            stream_options["include_usage"] = True
+        else:
+            source_payload["stream_options"] = {"include_usage": True}
+        try:
+            stream = await stream_source_chat_completion(source, source_payload)
+        except ModelSourceForwardingError as exc:
+            await _release_reservation(reservation)
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code=_source_error_code(exc.payload),
+                error_message=_source_error_message(exc.payload),
+                upstream_status_code=exc.upstream_status_code,
+            )
+            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if _reservation_requires_usage(reservation):
+            return await _buffered_limited_source_chat_stream_response(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                reservation=reservation,
+                stream=stream.body,
+                usage_holder=stream.usage_holder,
+                rate_limit_headers=rate_limit_headers,
+            )
+        body = _source_chat_stream_with_settlement(
+            stream.body,
+            usage_holder=stream.usage_holder,
+            request=request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            reservation=reservation,
+        )
+        return StreamingResponse(
+            body,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        result = await forward_chat_completion(source, source_payload)
+    except ModelSourceForwardingError as exc:
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code=_source_error_code(exc.payload),
+            error_message=_source_error_message(exc.payload),
+            upstream_status_code=exc.upstream_status_code,
+        )
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+
+    if result.usage is None and _reservation_requires_usage(reservation):
+        await _release_reservation(reservation)
+        error = openai_error(
+            "usage_unavailable",
+            "OpenAI-compatible model source response did not include usage for a limited API key",
+            error_type="server_error",
+        )
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="usage_unavailable",
+            error_message="source response missing usage",
+            upstream_status_code=result.upstream_status_code,
+        )
+        return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    settled = await _settle_source_reservation(reservation, source=source, model=model, usage=result.usage)
+    if not settled:
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="usage_settlement_failed",
+            error_message="source usage settlement failed",
+            upstream_status_code=result.upstream_status_code,
+        )
+        return _logged_error_json_response(
+            request,
+            502,
+            _source_usage_settlement_failed_error(),
+            headers=rate_limit_headers,
+        )
+    await _log_source_chat_completion(
+        request,
+        source=source,
+        api_key=api_key,
+        model=model,
+        status="success",
+        usage=result.usage,
+        upstream_status_code=result.upstream_status_code,
+    )
+    return JSONResponse(content=result.payload, status_code=200, headers=rate_limit_headers)
+
+
+async def _buffered_limited_source_chat_stream_response(
+    request: Request,
+    *,
+    source: ModelSource,
+    api_key: ApiKeyData | None,
+    model: str,
+    reservation: ApiKeyUsageReservationData | None,
+    stream: AsyncIterator[bytes],
+    usage_holder: SourceUsageHolder,
+    rate_limit_headers: Mapping[str, str],
+) -> Response:
+    chunks: list[bytes] = []
+    total_bytes = 0
+    buffer_limit_exceeded = False
+    try:
+        async for chunk in stream:
+            total_bytes += len(chunk)
+            if total_bytes > _SOURCE_LIMITED_STREAM_BUFFER_BYTES:
+                buffer_limit_exceeded = True
+                break
+            chunks.append(chunk)
+        if buffer_limit_exceeded:
+            # Returning while the generator is suspended at a yield would keep
+            # the leased upstream session/response open until GC finalizes the
+            # abandoned generator; close it deterministically.
+            await _aclose_stream(stream)
+            await _release_reservation(reservation)
+            error = openai_error(
+                "source_stream_buffer_limit_exceeded",
+                "OpenAI-compatible model source stream exceeded the limited-key accounting buffer",
+                error_type="server_error",
+            )
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code="source_stream_buffer_limit_exceeded",
+                error_message="source stream buffer limit exceeded",
+            )
+            return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+    except asyncio.CancelledError:
+        # Starlette cancels this task when the downstream client disconnects;
+        # CancelledError is a BaseException, so without this branch the
+        # reservation would stay charged until stale-reservation cleanup.
+        await _aclose_stream(stream)
+        await _release_reservation(reservation)
+        raise
+    except ModelSourceForwardingError as exc:
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code=_source_error_code(exc.payload),
+            error_message=_source_error_message(exc.payload),
+            upstream_status_code=exc.upstream_status_code,
+        )
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+    except Exception as exc:
+        await _release_reservation(reservation)
+        error = openai_error(
+            "model_source_stream_error",
+            "OpenAI-compatible model source stream failed",
+            error_type="server_error",
+        )
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="model_source_stream_error",
+            error_message=exc.__class__.__name__,
+        )
+        return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    if usage_holder.usage is None:
+        await _release_reservation(reservation)
+        error = openai_error(
+            "usage_unavailable",
+            "OpenAI-compatible model source stream did not include usage for a limited API key",
+            error_type="server_error",
+        )
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="usage_unavailable",
+            error_message="source stream missing usage",
+        )
+        return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    settled = await _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
+    if not settled:
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            error_code="usage_settlement_failed",
+            error_message="source usage settlement failed",
+        )
+        return _logged_error_json_response(
+            request,
+            502,
+            _source_usage_settlement_failed_error(),
+            headers=rate_limit_headers,
+        )
+    await _log_source_chat_completion(
+        request,
+        source=source,
+        api_key=api_key,
+        model=model,
+        status="success",
+        usage=usage_holder.usage,
+    )
+
+    async def body() -> AsyncIterator[bytes]:
+        for chunk in chunks:
+            yield chunk
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", **rate_limit_headers},
+    )
+
+
+async def _source_chat_stream_with_settlement(
+    stream: AsyncIterator[bytes],
+    *,
+    usage_holder: SourceUsageHolder,
+    request: Request,
+    source: ModelSource,
+    api_key: ApiKeyData | None,
+    model: str,
+    reservation: ApiKeyUsageReservationData | None,
+) -> AsyncIterator[bytes]:
+    status = "success"
+    error_code: str | None = None
+    error_message: str | None = None
+    try:
+        async for chunk in stream:
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        # Client disconnect surfaces as CancelledError (task cancellation) or
+        # GeneratorExit (generator aclose); both bypass ``except Exception``
+        # and would leave the reservation charged until stale cleanup.
+        status = "error"
+        error_code = "client_disconnected"
+        error_message = "client disconnected before stream completed"
+        await _aclose_stream(stream)
+        await _release_reservation(reservation)
+        raise
+    except ModelSourceForwardingError as exc:
+        status = "error"
+        error_code = _source_error_code(exc.payload)
+        error_message = _source_error_message(exc.payload)
+        await _release_reservation(reservation)
+        raise
+    except Exception as exc:
+        status = "error"
+        error_code = "model_source_stream_error"
+        error_message = exc.__class__.__name__
+        await _release_reservation(reservation)
+        raise
+    else:
+        settled = await _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
+        if not settled:
+            status = "error"
+            error_code = "usage_settlement_failed"
+            error_message = "source usage settlement failed"
+        if usage_holder.usage is None and _reservation_requires_usage(reservation):
+            status = "error"
+            error_code = "usage_unavailable"
+            error_message = "source stream missing usage"
+            logger.warning(
+                "source stream completed without usage for limited API key source_id=%s key_id=%s model=%s",
+                source.id,
+                api_key.id if api_key else None,
+                model,
+            )
+    finally:
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status=status,
+            usage=usage_holder.usage,
+            error_code=error_code,
+            error_message=error_message,
+            upstream_status_code=None,
+        )
 
 
 async def _stream_responses(
@@ -1815,10 +3978,48 @@ async def _stream_responses(
     forwarded_downstream_turn_state: str | None = None,
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
+    forwarded_client_ip: str | None = None,
     enforce_openai_sdk_contract: bool = True,
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    compact_payload: ResponsesCompactRequest | None = None
+    if codex_session_affinity:
+        try:
+            compact_trigger_input = strip_terminal_compaction_trigger_input(payload)
+            if compact_trigger_input is not None:
+                compact_payload_data = payload.model_dump(
+                    mode="json",
+                    include={
+                        "model",
+                        "instructions",
+                        "reasoning",
+                        "store",
+                        "service_tier",
+                        "prompt_cache_key",
+                    },
+                    exclude_none=True,
+                )
+                if isinstance(payload.model_extra, dict):
+                    prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
+                    if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
+                        compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
+                compact_payload_data["input"] = compact_trigger_input
+                if payload.previous_response_id is not None:
+                    compact_payload_data["previous_response_id"] = payload.previous_response_id
+                if payload.conversation is not None:
+                    compact_payload_data["conversation"] = payload.conversation
+                compact_payload = ResponsesCompactRequest.model_validate(compact_payload_data)
+                # Validate the exact compact wire payload before admission or
+                # reservation work so an untrimmable trigger is a client 400,
+                # not a late service exception that reaches the global 500.
+                compact_payload.to_payload()
+        except ClientPayloadError as exc:
+            error = openai_client_payload_error(exc)
+            return _logged_error_json_response(request, 400, error)
+    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
+    if admission_denial is not None:
+        return admission_denial
     owns_reservation = api_key_reservation_override is None
     reservation = (
         api_key_reservation_override
@@ -1827,24 +4028,85 @@ async def _stream_responses(
             api_key,
             request_model=payload.model,
             request_service_tier=payload.service_tier,
+            request_usage_budget=estimate_api_key_request_usage(payload),
         )
     )
 
-    rate_limit_headers = await context.service.rate_limit_headers() if include_rate_limit_headers else {}
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key) if include_rate_limit_headers else {}
     bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
     effective_headers = forwarded_headers or request.headers
+    client_ip = forwarded_client_ip if forwarded_request else resolve_request_client_host(request)
     downstream_turn_state = (
         forwarded_downstream_turn_state
         if bridge_active and forwarded_downstream_turn_state is not None
-        else proxy_service_module.ensure_http_downstream_turn_state(effective_headers)
+        else proxy_affinity_module.ensure_http_downstream_turn_state(effective_headers)
         if bridge_active
         else None
     )
     turn_state_headers = (
-        proxy_service_module.build_downstream_turn_state_response_headers(downstream_turn_state)
+        proxy_affinity_module.build_downstream_turn_state_response_headers(downstream_turn_state)
         if downstream_turn_state is not None
         else {}
     )
+    if compact_payload is not None:
+        try:
+            try:
+                compact_result = await context.service.compact_responses(
+                    compact_payload,
+                    effective_headers,
+                    codex_session_affinity=codex_session_affinity,
+                    openai_cache_affinity=openai_cache_affinity,
+                    api_key=api_key,
+                    api_key_reservation=reservation,
+                    client_ip=client_ip,
+                )
+            except NotImplementedError:
+                error = OpenAIErrorEnvelopeModel(
+                    error=OpenAIError(
+                        message="responses/compact is not implemented",
+                        type="server_error",
+                        code="not_implemented",
+                    )
+                )
+                return _logged_error_json_response(
+                    request,
+                    501,
+                    error.model_dump(mode="json", exclude_none=True),
+                    headers=rate_limit_headers,
+                )
+            except ProxyResponseError as exc:
+                return _stream_startup_error_response(
+                    request,
+                    exc,
+                    headers=rate_limit_headers,
+                )
+            compact_item = _compact_response_output_item(compact_result)
+            if compact_item is None:
+                error = openai_error(
+                    "upstream_error",
+                    "Compact response did not include a compaction output item",
+                    error_type="server_error",
+                )
+                return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+            response_id = _compact_response_id(compact_result)
+            stream = _synthetic_compaction_response_stream(
+                compact_item,
+                response_id=response_id,
+                usage=compact_result.usage,
+            )
+            return StreamingResponse(
+                stream,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                    **turn_state_headers,
+                    **rate_limit_headers,
+                },
+            )
+        finally:
+            if owns_reservation:
+                await _release_reservation(reservation)
     payload.stream = True
     if prefer_http_bridge:
         stream = context.service.stream_http_responses(
@@ -1860,6 +4122,8 @@ async def _stream_responses(
             forwarded_request=forwarded_request,
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
+            client_ip=client_ip,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
     else:
         stream = context.service.stream_responses(
@@ -1871,10 +4135,12 @@ async def _stream_responses(
             api_key=api_key,
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
+            client_ip=client_ip,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
     stream, startup_error = await _probe_stream_startup_error(
         stream,
-        convert_event_errors=bridge_active,
+        convert_event_errors=bridge_active and enforce_openai_sdk_contract,
         timeout_seconds=(
             _HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS if prefer_http_bridge else _STREAM_STARTUP_ERROR_PROBE_SECONDS
         ),
@@ -1895,13 +4161,27 @@ async def _stream_responses(
         ),
         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
     )
+    keepalive_frame = CODEX_KEEPALIVE_FRAME if not enforce_openai_sdk_contract else SSE_KEEPALIVE_FRAME
+    if not enforce_openai_sdk_contract:
+        stream = _prepend_initial_sse_heartbeat(
+            stream,
+            keepalive_frame,
+            request_id=get_request_id(),
+            route_family="responses",
+        )
     return StreamingResponse(
         inject_sse_keepalives(
             stream,
             get_settings().sse_keepalive_interval_seconds,
+            keepalive_frame=keepalive_frame,
         ),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", **turn_state_headers, **rate_limit_headers},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            **turn_state_headers,
+            **rate_limit_headers,
+        },
     )
 
 
@@ -1922,19 +4202,24 @@ async def _collect_responses(
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
+    if admission_denial is not None:
+        return admission_denial
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
         request_service_tier=payload.service_tier,
+        request_usage_budget=estimate_api_key_request_usage(payload),
     )
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
     downstream_turn_state = (
-        proxy_service_module.ensure_http_downstream_turn_state(request.headers) if bridge_active else None
+        proxy_affinity_module.ensure_http_downstream_turn_state(request.headers) if bridge_active else None
     )
+    client_ip = resolve_request_client_host(request)
     turn_state_headers = (
-        proxy_service_module.build_downstream_turn_state_response_headers(downstream_turn_state)
+        proxy_affinity_module.build_downstream_turn_state_response_headers(downstream_turn_state)
         if downstream_turn_state is not None
         else {}
     )
@@ -1950,6 +4235,7 @@ async def _collect_responses(
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
             downstream_turn_state=downstream_turn_state,
+            client_ip=client_ip,
         )
     else:
         stream = context.service.stream_responses(
@@ -1961,6 +4247,7 @@ async def _collect_responses(
             api_key=api_key,
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
+            client_ip=client_ip,
         )
     try:
         response_payload = await _collect_responses_payload(stream)
@@ -2044,13 +4331,28 @@ async def _compact_responses(
 ) -> JSONResponse:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    try:
+        request_usage_budget = estimate_api_key_request_usage(payload)
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _logged_error_json_response(request, 400, error)
+    admission_denial = await _opportunistic_admission_denial(
+        request,
+        context,
+        api_key,
+        model=payload.model,
+        lease_kind="response_create",
+    )
+    if admission_denial is not None:
+        return admission_denial
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
         request_service_tier=_compact_request_service_tier(payload),
+        request_usage_budget=request_usage_budget,
     )
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     try:
         result = await context.service.compact_responses(
             payload,
@@ -2059,6 +4361,7 @@ async def _compact_responses(
             openai_cache_affinity=openai_cache_affinity,
             api_key=api_key,
             api_key_reservation=reservation,
+            client_ip=resolve_request_client_host(request),
         )
     except NotImplementedError:
         error = OpenAIErrorEnvelopeModel(
@@ -2085,10 +4388,107 @@ async def _compact_responses(
         )
     finally:
         await _release_reservation(reservation)
+    result_payload = result.model_dump(mode="json", exclude_none=True)
+    if codex_session_affinity:
+        result_payload = _normalize_codex_remote_compaction_v2_result(result, result_payload)
     return JSONResponse(
-        content=result.model_dump(mode="json", exclude_none=True),
+        content=result_payload,
         headers=rate_limit_headers,
     )
+
+
+def _normalize_codex_remote_compaction_v2_result(
+    payload: CompactResponsePayload,
+    result_payload: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    compaction_item = _compact_response_output_item(payload)
+    if compaction_item is None:
+        return result_payload
+    normalized = dict(result_payload)
+    normalized["output"] = [compaction_item]
+    return normalized
+
+
+def _compact_response_output_item(payload: CompactResponsePayload) -> dict[str, JsonValue] | None:
+    extra = payload.model_extra or {}
+    output = getattr(payload, "output", None)
+    if output is None:
+        output = extra.get("output")
+    if isinstance(output, list):
+        for raw_item in output:
+            item = _json_mapping_from_model_or_mapping(raw_item)
+            if item is None:
+                continue
+            item_type = item.get("type")
+            encrypted_content = item.get("encrypted_content")
+            if isinstance(item_type, str) and item_type in {"compaction", "compaction_summary"}:
+                if isinstance(encrypted_content, str):
+                    return {
+                        "type": "compaction",
+                        "encrypted_content": encrypted_content,
+                    }
+    summary = getattr(payload, "compaction_summary", None)
+    if summary is None:
+        summary = extra.get("compaction_summary")
+    summary_mapping = _json_mapping_from_model_or_mapping(summary)
+    if summary_mapping is not None:
+        encrypted_content = summary_mapping.get("encrypted_content")
+        if isinstance(encrypted_content, str):
+            return {
+                "type": "compaction",
+                "encrypted_content": encrypted_content,
+            }
+    return None
+
+
+def _json_mapping_from_model_or_mapping(value: object) -> Mapping[str, JsonValue] | None:
+    if is_json_mapping(value):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = cast(Any, value).model_dump(mode="json", exclude_none=True)
+        if is_json_mapping(dumped):
+            return dumped
+    return None
+
+
+def _compact_response_id(payload: CompactResponsePayload) -> str:
+    if payload.id:
+        return payload.id
+    request_id = get_request_id()
+    if request_id:
+        return f"resp_{request_id}"
+    return f"resp_{uuid4().hex}"
+
+
+async def _synthetic_compaction_response_stream(
+    compact_item: Mapping[str, JsonValue],
+    *,
+    response_id: str,
+    usage: object | None,
+) -> AsyncIterator[str]:
+    completed_response: dict[str, JsonValue] = {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": [dict(compact_item)],
+    }
+    usage_mapping = _json_mapping_from_model_or_mapping(usage)
+    if usage_mapping is not None:
+        completed_response["usage"] = dict(usage_mapping)
+    yield format_sse_event(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": dict(compact_item),
+        }
+    )
+    yield format_sse_event(
+        {
+            "type": "response.completed",
+            "response": completed_response,
+        }
+    )
+    yield "data: [DONE]\n\n"
 
 
 async def _transcribe_request(
@@ -2105,7 +4505,7 @@ async def _transcribe_request(
         request_model=_TRANSCRIPTION_MODEL,
         request_service_tier=None,
     )
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     try:
         audio_bytes = await file.read()
         result = await context.service.transcribe(
@@ -2132,15 +4532,114 @@ async def _transcribe_request(
 @usage_router.get("/api/codex/usage", response_model=RateLimitStatusPayload)
 @usage_router.get("/api/codex/usage/", response_model=RateLimitStatusPayload, include_in_schema=False)
 async def codex_usage(
+    request: Request,
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Depends(validate_codex_usage_identity),
 ) -> RateLimitStatusPayload:
     payload = (
         await _build_codex_usage_payload_for_api_key(api_key)
         if api_key is not None
-        else await context.service.get_rate_limit_payload()
+        else _attach_codex_usage_reset_credits(await context.service.get_rate_limit_payload(), request)
     )
     return RateLimitStatusPayload.from_data(payload)
+
+
+@usage_router.post(
+    "/api/codex/rate-limit-reset-credits/consume",
+    response_model=ConsumeRateLimitResetCreditResponse,
+)
+@usage_router.post(
+    "/api/codex/rate-limit-reset-credits/consume/",
+    response_model=ConsumeRateLimitResetCreditResponse,
+    include_in_schema=False,
+)
+async def codex_consume_rate_limit_reset_credit(
+    request: Request,
+    payload: ConsumeRateLimitResetCreditRequest = Body(...),
+    api_key: ApiKeyData | None = Depends(validate_codex_usage_identity),
+) -> ConsumeRateLimitResetCreditResponse | JSONResponse:
+    if api_key is not None:
+        raise ProxyAuthError("ChatGPT authentication required for usage limit reset credits")
+    redeem_request_id = payload.redeem_request_id.strip()
+    if not redeem_request_id:
+        return _logged_error_json_response(
+            request,
+            400,
+            openai_error(
+                "invalid_request_error",
+                "redeem_request_id must not be empty",
+                error_type="invalid_request_error",
+            ),
+        )
+
+    upstream_response = await _consume_rate_limit_reset_credit_for_request(
+        request,
+        redeem_request_id=redeem_request_id,
+    )
+    account_id = _request_state_str(request, "codex_usage_identity_account_id")
+    if account_id is not None:
+        await get_rate_limit_reset_credits_store().invalidate(account_id)
+    if upstream_response.code in {"reset", "already_redeemed"}:
+        await _force_refresh_codex_usage_identity_account(request)
+    return ConsumeRateLimitResetCreditResponse.model_validate(upstream_response.model_dump())
+
+
+async def _consume_rate_limit_reset_credit_for_request(
+    request: Request,
+    *,
+    redeem_request_id: str,
+) -> UpstreamConsumeRateLimitResetCreditResponse:
+    access_token = _request_state_str(request, "codex_usage_identity_access_token")
+    chatgpt_account_id = _request_state_str(request, "codex_usage_identity_chatgpt_account_id")
+    if access_token is None or chatgpt_account_id is None:
+        raise ProxyAuthError("ChatGPT authentication required for usage limit reset credits")
+    route = getattr(request.state, "codex_usage_identity_route", None)
+    try:
+        return await consume_rate_limit_reset_credit(
+            access_token=access_token,
+            account_id=chatgpt_account_id,
+            redeem_request_id=redeem_request_id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
+    except UsageFetchError as exc:
+        if exc.status_code == 429:
+            raise ProxyRateLimitError(exc.message) from exc
+        if exc.status_code in (401, 403):
+            raise ProxyAuthError("Invalid ChatGPT token or chatgpt-account-id") from exc
+        raise ProxyUpstreamError("Unable to consume ChatGPT usage reset at this time") from exc
+
+
+async def _force_refresh_codex_usage_identity_account(request: Request) -> None:
+    account_id = _request_state_str(request, "codex_usage_identity_account_id")
+    if account_id is None:
+        return
+    access_token = _request_state_str(request, "codex_usage_identity_access_token")
+    async with get_background_session() as session:
+        accounts_repo = AccountsRepository(session)
+        account = await accounts_repo.get_by_id(account_id)
+        if account is None:
+            return
+        updater = UsageUpdater(
+            UsageRepository(session),
+            accounts_repo,
+            AdditionalUsageRepository(session),
+        )
+        usage_written = await updater.force_refresh(
+            account,
+            ignore_refresh_disabled=True,
+            access_token_override=access_token,
+        )
+        if usage_written:
+            get_account_selection_cache().invalidate()
+
+
+def _request_state_str(request: Request, name: str) -> str | None:
+    value = getattr(request.state, name, None)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 async def _prepend_first(first: str | None, stream: AsyncIterator[str]) -> AsyncIterator[str]:
@@ -2150,20 +4649,54 @@ async def _prepend_first(first: str | None, stream: AsyncIterator[str]) -> Async
         yield line
 
 
+async def _read_first_stream_item(stream: AsyncIterator[str]) -> str:
+    return await anext(stream)
+
+
+def _retrieve_first_stream_task_exception(task: asyncio.Task[str]) -> None:
+    # Retrieve a finished probe task's exception so an abandoned task does not
+    # surface asyncio's "exception was never retrieved" warning. Consumers that
+    # await the task still re-raise it.
+    if not task.cancelled():
+        task.exception()
+
+
+def _create_first_stream_probe_task(stream: AsyncIterator[str]) -> asyncio.Task[str]:
+    """Create the first-stream-item probe task.
+
+    ``_probe_stream_startup_error`` / ``_probe_chat_stream_startup_error`` race
+    this task against a timeout. On timeout the task keeps running and is handed
+    to the streamed response for consumption. If the wrapping stream is dropped
+    before the task is awaited -- for example the request is torn down while the
+    upstream is still blocked on the response-create admission gate -- the task
+    would otherwise finish with an unretrieved ``ProxyResponseError`` and asyncio
+    would log it. The done-callback retrieves the result in that abandoned case
+    without hiding the error from consumers that do await the task.
+    """
+    task = asyncio.create_task(_read_first_stream_item(stream))
+    task.add_done_callback(_retrieve_first_stream_task_exception)
+    return task
+
+
 async def _probe_stream_startup_error(
     stream: AsyncIterator[str],
     *,
     convert_event_errors: bool = False,
-    timeout_seconds: float = _STREAM_STARTUP_ERROR_PROBE_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> tuple[AsyncIterator[str], ProxyResponseError | OpenAIErrorEnvelopeModel | None]:
-    first_task = asyncio.create_task(anext(stream))
-    try:
-        first = await asyncio.wait_for(
-            asyncio.shield(first_task),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
+    if timeout_seconds is None:
+        timeout_seconds = _STREAM_STARTUP_ERROR_PROBE_SECONDS
+    first_task = _create_first_stream_probe_task(stream)
+    done, _pending = await asyncio.wait({first_task}, timeout=timeout_seconds)
+    if not done:
+        # Probe window elapsed before the first item arrived. Hand the still-
+        # running task off to be consumed by the streamed response. asyncio.wait
+        # (rather than wait_for + shield) never cancels the task on timeout,
+        # avoiding the Python 3.14 "exception in shielded future" log when the
+        # upstream later returns an error such as a 429 from the admission gate.
         return _prepend_first_task(first_task, stream), None
+    try:
+        first = first_task.result()
     except StopAsyncIteration:
         return _prepend_first(None, stream), None
     except ProxyResponseError as exc:
@@ -2178,11 +4711,359 @@ async def _probe_stream_startup_error(
     return _prepend_first(first, stream), None
 
 
+_CHAT_COMPLETIONS_STARTUP_EVENT_TYPES: Final[set[str]] = {
+    "response.created",
+    "response.in_progress",
+}
+
+
+def _is_cursor_compat_client(request: Request, api_key: ApiKeyData | None) -> bool:
+    if api_key is not None and api_key.name.strip().lower() == "cursor":
+        return True
+    user_agent = request.headers.get("user-agent", "")
+    return "cursor" in user_agent.lower()
+
+
+def _is_context_length_startup_error(error: ProxyResponseError | OpenAIErrorEnvelopeModel) -> bool:
+    code, message = _startup_error_details(error)
+    if code == "context_length_exceeded":
+        return True
+    if message is None:
+        return False
+    normalized = message.lower()
+    return (
+        "context window" in normalized
+        or "input token limit exceeded" in normalized
+        or "token limit exceeded" in normalized
+    )
+
+
+def _startup_error_details(error: ProxyResponseError | OpenAIErrorEnvelopeModel) -> tuple[str | None, str | None]:
+    if isinstance(error, ProxyResponseError):
+        return _error_details_from_content(error.payload)
+    return _error_details_from_content(error)
+
+
+def _cursor_context_limit_usage_stream(
+    payload: ChatCompletionsRequest,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> StreamingResponse:
+    """Return a successful empty stream with over-limit usage so Cursor can compact.
+
+    Cursor's custom-provider path wraps provider errors before the agent loop can
+    classify them as its internal InputTokenLimitError. For Cursor only, preserve
+    the original request history and report token usage beyond the advertised
+    model window instead of returning an OpenAI error.
+    """
+    response_id = f"chatcmpl_{time.time_ns()}"
+    created = int(time.time())
+    model = payload.model
+    usage_tokens = _CURSOR_CONTEXT_LIMIT_SYNTHETIC_USAGE_TOKENS
+
+    def sse_data(data: dict[str, JsonValue] | str) -> str:
+        if data == "[DONE]":
+            return "data: [DONE]\n\n"
+        return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+    async def body() -> AsyncIterator[str]:
+        yield sse_data(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        yield sse_data(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+        yield sse_data(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": usage_tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": usage_tokens,
+                },
+            }
+        )
+        yield sse_data("[DONE]")
+
+    return StreamingResponse(body(), media_type="text/event-stream", headers=headers)
+
+
+def _cursor_context_limit_usage_completion(
+    payload: ChatCompletionsRequest,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
+    response_id = f"chatcmpl_{time.time_ns()}"
+    created = int(time.time())
+    model = payload.model
+    usage_tokens = _CURSOR_CONTEXT_LIMIT_SYNTHETIC_USAGE_TOKENS
+    return JSONResponse(
+        content={
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": usage_tokens,
+                "completion_tokens": 0,
+                "total_tokens": usage_tokens,
+            },
+        },
+        status_code=200,
+        headers=headers,
+    )
+
+
+async def _stream_with_cursor_usage_fallback(
+    stream: AsyncIterator[str],
+    payload: ChatCompletionsRequest,
+) -> AsyncIterator[str]:
+    prompt_tokens = _estimate_cursor_prompt_tokens(payload)
+    completion_chars = 0
+    async for line in stream:
+        parsed = _parse_chat_completion_sse(line)
+        if parsed is None:
+            yield line
+            continue
+        completion_chars += _chat_completion_delta_chars(parsed)
+        if _is_chat_completion_usage_chunk(parsed) and _needs_cursor_usage_fallback(parsed.get("usage")):
+            completion_tokens = max(1, _estimate_tokens_from_chars(completion_chars))
+            parsed["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+            logger.info(
+                "cursor_usage_fallback source=stream model=%s prompt_tokens=%s completion_tokens=%s",
+                payload.model,
+                prompt_tokens,
+                completion_tokens,
+            )
+            yield f"data: {json.dumps(parsed, separators=(',', ':'))}\n\n"
+            continue
+        yield line
+
+
+def _is_chat_completion_usage_chunk(payload: dict[str, JsonValue]) -> bool:
+    return payload.get("choices") == []
+
+
+def _parse_chat_completion_sse(line: str) -> dict[str, JsonValue] | None:
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return None
+    data = stripped.removeprefix("data:").strip()
+    if data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _needs_cursor_usage_fallback(usage: JsonValue) -> bool:
+    if not isinstance(usage, dict):
+        return True
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    return not isinstance(prompt_tokens, int) or prompt_tokens <= 0 or not isinstance(completion_tokens, int)
+
+
+def _apply_cursor_usage_fallback(
+    result: ChatCompletion,
+    payload: ChatCompletionsRequest,
+    *,
+    source: str,
+) -> None:
+    usage = result.usage.model_dump(mode="json", exclude_none=True) if result.usage is not None else None
+    if not _needs_cursor_usage_fallback(usage):
+        return
+    prompt_tokens = _estimate_cursor_prompt_tokens(payload)
+    completion_tokens = max(1, _estimate_tokens_from_chars(_chat_completion_result_chars(result)))
+    result.usage = ChatCompletionUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+    logger.info(
+        "cursor_usage_fallback source=%s model=%s prompt_tokens=%s completion_tokens=%s",
+        source,
+        payload.model,
+        prompt_tokens,
+        completion_tokens,
+    )
+
+
+def _estimate_cursor_prompt_tokens(payload: ChatCompletionsRequest) -> int:
+    data = payload.model_dump(mode="json", exclude_none=True)
+    counted: dict[str, JsonValue] = {}
+    for key in ("messages", "input", "instructions", "tools", "tool_choice", "response_format"):
+        value = data.get(key)
+        if value is not None:
+            counted[key] = value
+    message_count = len(data.get("messages", [])) if isinstance(data.get("messages"), list) else 0
+    return max(1, _estimate_tokens_from_chars(_json_text_chars(counted)) + message_count * 4)
+
+
+def _estimate_tokens_from_chars(chars: int) -> int:
+    return (max(0, chars) + 3) // 4
+
+
+def _json_text_chars(value: JsonValue) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_json_text_chars(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_json_text_chars(item) for item in value.values())
+    return 0
+
+
+def _chat_completion_delta_chars(payload: dict[str, JsonValue]) -> int:
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return 0
+    total = 0
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for key in ("content", "refusal"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                total += len(value)
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            total += _json_text_chars(tool_calls)
+    return total
+
+
+def _chat_completion_result_chars(result: ChatCompletion) -> int:
+    total = 0
+    for choice in result.choices:
+        message = choice.message
+        if isinstance(message.content, str):
+            total += len(message.content)
+        if isinstance(message.refusal, str):
+            total += len(message.refusal)
+        if message.tool_calls:
+            total += _json_text_chars(
+                [tool_call.model_dump(mode="json", exclude_none=True) for tool_call in message.tool_calls]
+            )
+    return total
+
+
+async def _probe_chat_stream_startup_error(
+    stream: AsyncIterator[str],
+    *,
+    timeout_seconds: float = _CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS,
+    max_startup_events: int = 8,
+) -> tuple[AsyncIterator[str], ProxyResponseError | OpenAIErrorEnvelopeModel | None]:
+    buffered: list[str] = []
+    for _ in range(max_startup_events):
+        first_task = _create_first_stream_probe_task(stream)
+        done, _pending = await asyncio.wait({first_task}, timeout=timeout_seconds)
+        if not done:
+            return _prepend_items(buffered, _prepend_first_task(first_task, stream)), None
+        try:
+            first = first_task.result()
+        except StopAsyncIteration:
+            return _prepend_items(buffered, _prepend_first(None, stream)), None
+        except ProxyResponseError as exc:
+            return _prepend_items(buffered, _prepend_first(None, stream)), exc
+
+        first_error = _stream_event_error_envelope(first)
+        if first_error is not None:
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                await aclose()
+            return _prepend_first(None, stream), first_error
+
+        payload = _parse_sse_payload(first)
+        event_type = payload.get("type") if payload else None
+        buffered.append(first)
+        if event_type in _CHAT_COMPLETIONS_STARTUP_EVENT_TYPES:
+            continue
+        return _prepend_items(buffered, stream), None
+    return _prepend_items(buffered, stream), None
+
+
+async def _prepend_items(items: list[str], stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    for item in items:
+        yield item
+    async for line in stream:
+        yield line
+
+
 async def _prepend_first_task(first_task: asyncio.Task[str], stream: AsyncIterator[str]) -> AsyncIterator[str]:
     try:
-        yield await first_task
+        first = await first_task
     except StopAsyncIteration:
         return
+    finally:
+        # If the wrapping stream is closed before the first item is consumed
+        # (client disconnect, request teardown), cancel the still-running probe
+        # task so it does not hold the upstream connection open.
+        if not first_task.done():
+            first_task.cancel()
+    yield first
+    async for line in stream:
+        yield line
+
+
+async def _prepend_initial_sse_heartbeat(
+    stream: AsyncIterator[str],
+    keepalive_frame: str,
+    *,
+    request_id: str | None = None,
+    route_family: str = "responses",
+) -> AsyncIterator[str]:
+    logger.info(
+        "responses_stream_heartbeat request_id=%s route_family=%s stage=initial elapsed_seconds=0.000",
+        request_id,
+        route_family,
+    )
+    yield keepalive_frame
     async for line in stream:
         yield line
 
@@ -2279,7 +5160,13 @@ def _logged_error_json_response(
     *,
     headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
-    code, message = _error_details_from_content(content)
+    if isinstance(content, OpenAIErrorEnvelopeModel):
+        public_content: Mapping[str, JsonValue] | OpenAIErrorEnvelope = content.model_dump(
+            mode="json", exclude_none=True
+        )
+    else:
+        public_content = content
+    code, message = _error_details_from_content(public_content)
     effective_headers = dict(headers or {})
     if status_code == 429 and is_local_overload_error_code(code):
         effective_headers = merge_retry_after_headers(effective_headers)
@@ -2291,7 +5178,11 @@ def _logged_error_json_response(
         message,
         category="proxy_error_response",
     )
-    return JSONResponse(status_code=status_code, content=content, headers=effective_headers or None)
+    # codeql[py/stack-trace-exposure] This is an OpenAI-compatible proxy boundary:
+    # upstream/provider error envelopes intentionally preserve diagnostics for
+    # clients, while internal exception handlers construct generic error
+    # envelopes before reaching this response helper.
+    return JSONResponse(status_code=status_code, content=public_content, headers=effective_headers or None)
 
 
 def _error_details_from_content(
@@ -2305,12 +5196,33 @@ def _error_details_from_content(
     if not isinstance(content, Mapping):
         return None, None
     error = content.get("error")
+    if isinstance(error, str):
+        details = content.get("details")
+        message = details.get("detail") if is_json_mapping(details) else None
+        return error, message if isinstance(message, str) else None
     if not is_json_mapping(error):
         return None, None
     error_mapping = error
     code = error_mapping.get("code")
     message = error_mapping.get("message")
     return code if isinstance(code, str) else None, message if isinstance(message, str) else None
+
+
+async def _validate_proxy_api_key_authorization_for_connection(
+    authorization: str | None,
+    connection: Request | WebSocket,
+) -> ApiKeyData | None:
+    try:
+        return await validate_proxy_api_key_authorization(authorization, request=connection)
+    except TypeError as exc:
+        if not _is_legacy_proxy_auth_override_type_error(exc):
+            raise
+    return await validate_proxy_api_key_authorization(authorization)
+
+
+def _is_legacy_proxy_auth_override_type_error(exc: TypeError) -> bool:
+    message = str(exc)
+    return "unexpected keyword argument 'request'" in message
 
 
 async def _validate_proxy_websocket_request(
@@ -2320,13 +5232,10 @@ async def _validate_proxy_websocket_request(
     if denial is not None:
         return None, denial
     try:
-        if "request" in inspect.signature(validate_proxy_api_key_authorization).parameters:
-            api_key = await validate_proxy_api_key_authorization(
-                websocket.headers.get("authorization"),
-                request=websocket,
-            )
-        else:
-            api_key = await validate_proxy_api_key_authorization(websocket.headers.get("authorization"))
+        api_key = await _validate_proxy_api_key_authorization_for_connection(
+            websocket.headers.get("authorization"),
+            websocket,
+        )
     except ProxyAuthError as exc:
         return None, JSONResponse(
             status_code=exc.status_code,
@@ -2342,9 +5251,9 @@ async def _validate_internal_bridge_api_key(
     if not dashboard_settings.api_key_auth_enabled:
         return None, None
     try:
-        api_key = await validate_proxy_api_key_authorization(
+        api_key = await _validate_proxy_api_key_authorization_for_connection(
             request.headers.get("authorization"),
-            request=request,
+            request,
         )
     except ProxyAuthError as exc:
         return None, JSONResponse(
@@ -2378,6 +5287,7 @@ async def _enforce_request_limits(
     *,
     request_model: str | None,
     request_service_tier: str | None,
+    request_usage_budget: ApiKeyRequestUsageBudget | None = None,
 ) -> ApiKeyUsageReservationData | None:
     if api_key is None:
         return None
@@ -2389,12 +5299,41 @@ async def _enforce_request_limits(
                 api_key.id,
                 request_model=request_model,
                 request_service_tier=request_service_tier,
+                request_usage_budget=request_usage_budget,
             )
         except ApiKeyRateLimitExceededError as exc:
             message = f"{exc}. Usage resets at {exc.reset_at.isoformat()}Z."
             raise ProxyRateLimitError(message) from exc
         except ApiKeyInvalidError as exc:
             raise ProxyAuthError(str(exc)) from exc
+
+
+async def _opportunistic_admission_denial(
+    request: Request,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+    *,
+    model: str | None,
+    lease_kind: Literal["response_create", "stream"] | None = "stream",
+) -> JSONResponse | None:
+    if api_key is None or api_key.traffic_class != TRAFFIC_CLASS_OPPORTUNISTIC:
+        return None
+    selection = await context.service.check_opportunistic_admission(
+        api_key=api_key,
+        model=_effective_optional_model_for_api_key(api_key, model),
+        lease_kind=lease_kind,
+    )
+    if selection.account is not None:
+        return None
+    message = selection.error_message or "opportunistic burn window closed"
+    if not message.startswith("opportunistic burn window closed"):
+        message = f"opportunistic burn window closed: {message}"
+    return _logged_error_json_response(
+        request,
+        429,
+        openai_error("rate_limit_exceeded", message, error_type="rate_limit_error"),
+        headers={"Retry-After": str(_OPPORTUNISTIC_RETRY_AFTER_SECONDS)},
+    )
 
 
 async def _release_reservation(reservation: ApiKeyUsageReservationData | None) -> None:
@@ -2456,7 +5395,154 @@ async def _finalize_image_reservation(
         )
 
 
+async def _settle_source_reservation(
+    reservation: ApiKeyUsageReservationData | None,
+    *,
+    source: ModelSource,
+    model: str,
+    usage: SourceUsage | None,
+    cost_usd_override: float | None = None,
+) -> bool:
+    if reservation is None:
+        return True
+    try:
+        if usage is None:
+            await _release_reservation(reservation)
+            return True
+        cost_usd = cost_usd_override if cost_usd_override is not None else _source_usage_cost_usd(source, model, usage)
+        async with get_background_session() as session:
+            service = ApiKeysService(ApiKeysRepository(session))
+            await service.finalize_usage_reservation(
+                reservation.reservation_id,
+                model=model,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                service_tier=None,
+                cost_microdollars=int(cost_usd * 1_000_000) if cost_usd is not None else None,
+            )
+        return True
+    except Exception:
+        logger.warning(
+            "failed to settle source reservation reservation_id=%s model=%s",
+            reservation.reservation_id,
+            model,
+            exc_info=True,
+        )
+        try:
+            await _release_reservation(reservation)
+        except Exception:
+            logger.warning(
+                "failed to release source reservation after settlement failure reservation_id=%s",
+                reservation.reservation_id,
+                exc_info=True,
+            )
+        return False
+
+
+def _source_usage_cost_usd(source: ModelSource, model: str, usage: SourceUsage | None) -> float | None:
+    if usage is None:
+        return None
+    cost_usd = source_model_cost_usd(
+        source,
+        model,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+    )
+    return 0.0 if cost_usd is None else cost_usd
+
+
+async def _log_source_chat_completion(
+    request: Request,
+    *,
+    source: ModelSource,
+    api_key: ApiKeyData | None,
+    model: str,
+    status: str,
+    usage: SourceUsage | None = None,
+    cost_usd_override: float | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    upstream_status_code: int | None = None,
+) -> None:
+    try:
+        async with get_background_session() as session:
+            await RequestLogsRepository(session).add_log(
+                account_id=None,
+                model_source_id=source.id,
+                model_source_kind=source.kind,
+                api_key_id=api_key.id if api_key is not None else None,
+                request_id=ensure_request_id(),
+                model=model,
+                input_tokens=usage.input_tokens if usage is not None else None,
+                output_tokens=usage.output_tokens if usage is not None else None,
+                cached_input_tokens=usage.cached_input_tokens if usage is not None else None,
+                cost_usd=(
+                    cost_usd_override if cost_usd_override is not None else _source_usage_cost_usd(source, model, usage)
+                ),
+                latency_ms=None,
+                status=status,
+                error_code=error_code,
+                error_message=error_message,
+                upstream_status_code=upstream_status_code,
+                transport="http",
+                upstream_transport="openai_compatible_http",
+                source="model_source",
+                useragent=request.headers.get("user-agent"),
+                client_ip=resolve_request_client_host(request),
+            )
+    except Exception:
+        logger.warning(
+            "failed to write source request log source_id=%s model=%s status=%s",
+            source.id,
+            model,
+            status,
+            exc_info=True,
+        )
+
+
+async def _aclose_stream(stream: AsyncIterator[bytes]) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+def _reservation_requires_usage(reservation: ApiKeyUsageReservationData | None) -> bool:
+    return bool(reservation and reservation.has_applicable_limits)
+
+
+def _source_usage_settlement_failed_error() -> OpenAIErrorEnvelope:
+    return openai_error(
+        "usage_settlement_failed",
+        "OpenAI-compatible model source usage could not be settled",
+        error_type="server_error",
+    )
+
+
+def _source_error_code(payload: Mapping[str, JsonValue]) -> str | None:
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) else None
+
+
+def _source_error_message(payload: Mapping[str, JsonValue]) -> str | None:
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    message = error.get("message")
+    return message if isinstance(message, str) else None
+
+
 def _effective_model_for_api_key(api_key: ApiKeyData | None, requested_model: str) -> str:
+    if api_key is None or api_key.enforced_model is None:
+        return requested_model
+    return api_key.enforced_model
+
+
+def _effective_optional_model_for_api_key(api_key: ApiKeyData | None, requested_model: str | None) -> str | None:
     if api_key is None or api_key.enforced_model is None:
         return requested_model
     return api_key.enforced_model
@@ -2582,6 +5668,7 @@ async def _normalize_public_responses_stream(
             relies on the upstream's native event shape.
     """
     terminal_seen = False
+    done_seen = False
     contract_violation_kind: str | None = None
     seen_text_delta_keys: set[tuple[str | None, int | None]] = set()
     # Collect output items from streamed ``response.output_item.added`` /
@@ -2603,17 +5690,49 @@ async def _normalize_public_responses_stream(
     # we synthesize a ``response.created`` snapshot from the terminal event's
     # ``response`` envelope so the SDK parser can complete the stream.
     created_emitted = False
+    # Anonymous pre-created events cannot be made SDK-safe until a response
+    # envelope arrives: the public OpenAI SDK requires response.created first.
+    # Buffer them temporarily. Once an envelope arrives, replay only lightweight
+    # visible content events (text/content-part deltas) after the created event;
+    # drop unowned output_item lifecycle events so cancelled-request orphans are
+    # not attached to the later response.
+    pre_created_buffer: list[dict[str, JsonValue]] = []
+
+    def formatted_payloads_with_synthetic_deltas(payload: dict[str, JsonValue]) -> list[str]:
+        return [
+            *[
+                format_sse_event(synthetic_payload)
+                for synthetic_payload in _synthetic_text_delta_events(payload, seen_text_delta_keys)
+            ],
+            format_sse_event(payload),
+        ]
+
+    def buffered_pre_created_payloads_to_replay(response_id: str | None) -> list[str]:
+        try:
+            if _pre_created_buffer_has_indexed_lifecycle(pre_created_buffer):
+                return []
+            return _format_legacy_pre_created_payloads(
+                pre_created_buffer,
+                response_id=response_id,
+                seen_text_delta_keys=seen_text_delta_keys,
+            )
+        finally:
+            pre_created_buffer.clear()
+
     async for event_block in stream:
         if event_block.strip() == "data: [DONE]":
+            done_seen = True
             if terminal_seen:
                 yield event_block
+            continue
+        if _looks_like_sse_comment_block(event_block):
+            yield event_block
             continue
         payload = _parse_sse_payload(event_block)
         if payload is None:
             if _looks_like_sse_data_block(event_block):
                 contract_violation_kind = contract_violation_kind or "invalid_json"
             continue
-        _collect_output_item_event(payload, output_items)
         raw_event_type = payload.get("type")
         if (
             enforce_openai_sdk_contract
@@ -2641,46 +5760,314 @@ async def _normalize_public_responses_stream(
         if normalized_payload is None:
             continue
         event_type = normalized_payload.get("type")
-        if event_type == "response.output_text.delta":
-            seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
-        # Ensure the public stream always starts with ``response.created``.
-        # When the upstream stream jumps straight to a non-created event
-        # (terminal failure, or any other ordering quirk), synthesize a
-        # ``response.created`` envelope from whatever ``response`` envelope is
-        # available on the current event so the OpenAI SDK parser can begin.
-        # Only enforced on the OpenAI SDK contract path; the Codex CLI route
-        # forwards the upstream sequence verbatim.
-        if (
-            enforce_openai_sdk_contract
-            and not created_emitted
-            and isinstance(event_type, str)
-            and event_type != "response.created"
+        if not enforce_openai_sdk_contract and (
+            event_type == "error" or is_json_mapping(normalized_payload.get("error"))
         ):
+            terminal_seen = True
+            yield event_block
+            continue
+
+        if enforce_openai_sdk_contract and not created_emitted and isinstance(event_type, str):
+            if event_type == "response.created":
+                created_emitted = True
+                yield format_sse_event(normalized_payload)
+                response_id = _response_id_from_event_payload(normalized_payload)
+                for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
+                    yield formatted_payload
+                continue
+
             synthetic_created = _synthetic_response_created_envelope(normalized_payload)
             if synthetic_created is not None:
                 yield format_sse_event(synthetic_created)
                 created_emitted = True
-        if event_type == "response.created":
-            created_emitted = True
-        for synthetic_payload in _synthetic_text_delta_events(normalized_payload, seen_text_delta_keys):
-            yield format_sse_event(synthetic_payload)
-        if isinstance(event_type, str) and event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-            "error",
-        }:
+                response_id = _response_id_from_event_payload(synthetic_created)
+                for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
+                    yield formatted_payload
+            elif _should_buffer_public_pre_created_event(event_type):
+                if len(pre_created_buffer) >= _PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT:
+                    error_kind = contract_violation_kind or "upstream_stream_truncated"
+                    for formatted_payload in _public_response_failed_event_blocks(error_kind, include_created=True):
+                        yield formatted_payload
+                    return
+                pre_created_buffer.append(normalized_payload)
+                continue
+            elif event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
+                if event_type == "error":
+                    for formatted_payload in _public_response_failed_event_blocks_from_error(
+                        normalized_payload,
+                        include_created=True,
+                    ):
+                        yield formatted_payload
+                    return
+                error_kind = contract_violation_kind or "upstream_stream_truncated"
+                for formatted_payload in _public_response_failed_event_blocks(error_kind, include_created=True):
+                    yield formatted_payload
+                return
+
+        if enforce_openai_sdk_contract and event_type == "error":
+            for formatted_payload in _public_response_failed_event_blocks_from_error(
+                normalized_payload,
+                include_created=not created_emitted,
+            ):
+                yield formatted_payload
+            return
+
+        _collect_output_item_event(normalized_payload, output_items)
+        if event_type == "response.output_text.delta":
+            seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
+        for formatted_payload in formatted_payloads_with_synthetic_deltas(normalized_payload):
+            yield formatted_payload
+        if isinstance(event_type, str) and event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
             terminal_seen = True
-        yield format_sse_event(normalized_payload)
     if terminal_seen:
+        if not done_seen and not enforce_openai_sdk_contract:
+            yield "data: [DONE]\n\n"
         return
-    error_kind = contract_violation_kind or "upstream_stream_truncated"
-    yield format_sse_event(
+    error_kind = contract_violation_kind or (
+        "upstream_stream_truncated" if enforce_openai_sdk_contract else "stream_incomplete"
+    )
+    include_created = enforce_openai_sdk_contract and not created_emitted
+    for formatted_payload in _public_response_failed_event_blocks(error_kind, include_created=include_created):
+        yield formatted_payload
+
+
+def _should_buffer_public_pre_created_event(event_type: str) -> bool:
+    return (
+        event_type.startswith("response.")
+        and event_type != "response.created"
+        and event_type not in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES
+    )
+
+
+def _public_response_failed_event_blocks(error_kind: str, *, include_created: bool) -> list[str]:
+    failed_payload = cast(
+        dict[str, JsonValue],
         response_failed_event(
             error_kind,
             _public_contract_error_message(error_kind),
-        )
+            response_id=f"resp_{error_kind}",
+        ),
     )
+    blocks: list[str] = []
+    if include_created:
+        synthetic_created = _synthetic_response_created_envelope(failed_payload)
+        if synthetic_created is not None:
+            blocks.append(format_sse_event(synthetic_created))
+    blocks.append(format_sse_event(failed_payload))
+    return blocks
+
+
+def _public_response_failed_event_blocks_from_error(
+    payload: dict[str, JsonValue],
+    *,
+    include_created: bool,
+) -> list[str]:
+    envelope = _parse_event_error_envelope(payload)
+    error = envelope.error
+    if error is None:
+        error = _default_error_envelope().error
+    assert error is not None
+    message = error.message
+    raw_message = payload.get("message")
+    if isinstance(raw_message, str) and raw_message.strip():
+        if not message or message == "Upstream error":
+            message = raw_message.strip()
+    error_type = error.type
+    if not error_type:
+        raw_error_type = payload.get("error_type")
+        if isinstance(raw_error_type, str) and raw_error_type.strip():
+            error_type = raw_error_type.strip()
+    failed_payload = cast(
+        dict[str, JsonValue],
+        response_failed_event(
+            error.code or "upstream_error",
+            message or "Upstream error",
+            error_type or "server_error",
+            response_id=f"resp_{error.code or 'upstream_error'}",
+            error_param=error.param,
+        ),
+    )
+    blocks: list[str] = []
+    if include_created:
+        synthetic_created = _synthetic_response_created_envelope(failed_payload)
+        if synthetic_created is not None:
+            blocks.append(format_sse_event(synthetic_created))
+    blocks.append(format_sse_event(failed_payload))
+    return blocks
+
+
+_REPLAYABLE_PUBLIC_PRE_CREATED_EVENT_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.refusal.delta",
+        "response.refusal.done",
+    }
+)
+
+
+_INDEXED_PRE_CREATED_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+    }
+)
+
+
+def _pre_created_buffer_has_indexed_lifecycle(payloads: list[dict[str, JsonValue]]) -> bool:
+    for payload in payloads:
+        event_type = payload.get("type")
+        if isinstance(event_type, str) and event_type in _INDEXED_PRE_CREATED_LIFECYCLE_EVENT_TYPES:
+            return True
+        if isinstance(payload.get("output_index"), int) or isinstance(payload.get("item_id"), str):
+            return True
+    return False
+
+
+def _format_legacy_pre_created_payloads(
+    payloads: list[dict[str, JsonValue]],
+    *,
+    response_id: str | None,
+    seen_text_delta_keys: set[tuple[str | None, int | None]],
+) -> list[str]:
+    formatted: list[str] = []
+    if not payloads:
+        return formatted
+
+    item_id = _synthetic_pre_created_item_id(response_id)
+    output_index = 0
+    content_index = 0
+    text_item_opened = False
+    text_parts: list[str] = []
+    final_text: str | None = None
+
+    def open_text_item(sequence_number: int) -> None:
+        nonlocal text_item_opened
+        if text_item_opened:
+            return
+        output_item_added = cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.output_item.added",
+                "sequence_number": sequence_number,
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+        )
+        formatted.append(format_sse_event(output_item_added))
+        content_part_added = cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.content_part.added",
+                "sequence_number": sequence_number,
+                "output_index": output_index,
+                "content_index": content_index,
+                "item_id": item_id,
+                "part": {"type": "output_text", "text": ""},
+            },
+        )
+        formatted.append(format_sse_event(content_part_added))
+        text_item_opened = True
+
+    sequence_number = 0
+    for payload in payloads:
+        event_type = payload.get("type")
+        if not isinstance(event_type, str) or event_type not in _REPLAYABLE_PUBLIC_PRE_CREATED_EVENT_TYPES:
+            continue
+        sequence_number = _payload_sequence_number(payload, sequence_number + 1)
+        if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+            delta = payload.get("delta")
+            if not isinstance(delta, str):
+                continue
+            open_text_item(sequence_number)
+            text_parts.append(delta)
+            normalized = dict(payload)
+            normalized["sequence_number"] = sequence_number
+            normalized["output_index"] = output_index
+            normalized["content_index"] = content_index
+            normalized["item_id"] = item_id
+            normalized.setdefault("logprobs", [])
+            formatted.append(format_sse_event(normalized))
+            seen_text_delta_keys.add((item_id, output_index))
+            continue
+        if event_type in {"response.output_text.done", "response.refusal.done"}:
+            text = payload.get("text")
+            if not isinstance(text, str):
+                text = "".join(text_parts)
+            open_text_item(sequence_number)
+            final_text = text
+            normalized = dict(payload)
+            normalized["sequence_number"] = sequence_number
+            normalized["output_index"] = output_index
+            normalized["content_index"] = content_index
+            normalized["item_id"] = item_id
+            normalized.setdefault("logprobs", [])
+            formatted.append(format_sse_event(normalized))
+            continue
+        part = payload.get("part")
+        if is_json_mapping(part) and part.get("type") in _PUBLIC_RESPONSE_TEXT_PART_TYPES:
+            text = part.get("text")
+            if isinstance(text, str):
+                final_text = text
+            open_text_item(sequence_number)
+            normalized = dict(payload)
+            normalized["sequence_number"] = sequence_number
+            normalized["output_index"] = output_index
+            normalized["content_index"] = content_index
+            normalized["item_id"] = item_id
+            formatted.append(format_sse_event(normalized))
+        else:
+            # Preserve legacy unindexed non-text content_part.done events for
+            # raw SSE clients. They are not used to assemble SDK output.
+            formatted.append(format_sse_event(payload))
+
+    if text_item_opened:
+        seen_text_delta_keys.add((None, output_index))
+        text = final_text if final_text is not None else "".join(text_parts)
+        output_item_done = cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.output_item.done",
+                "sequence_number": sequence_number + 1,
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text}],
+                },
+            },
+        )
+        formatted.append(format_sse_event(output_item_done))
+    return formatted
+
+
+def _payload_sequence_number(payload: Mapping[str, JsonValue], fallback: int) -> int:
+    sequence_number = payload.get("sequence_number")
+    return sequence_number if isinstance(sequence_number, int) else fallback
+
+
+def _response_id_from_event_payload(payload: Mapping[str, JsonValue]) -> str | None:
+    response = payload.get("response")
+    if not is_json_mapping(response):
+        return None
+    response_id = response.get("id")
+    return response_id if isinstance(response_id, str) and response_id else None
+
+
+def _synthetic_pre_created_item_id(response_id: str | None) -> str:
+    if response_id:
+        return f"msg_{response_id}_precreated"
+    return "msg_precreated"
 
 
 def _normalize_public_stream_payload(
@@ -2708,7 +6095,7 @@ def _normalize_public_stream_payload(
                     dict[str, JsonValue],
                     response_failed_event(
                         "stream_incomplete",
-                        "Upstream websocket closed before response.completed",
+                        PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
                     ),
                 ),
                 None,
@@ -2975,6 +6362,12 @@ def _looks_like_sse_data_block(event_block: str) -> bool:
     return "data:" in event_block
 
 
+def _looks_like_sse_comment_block(event_block: str) -> bool:
+    return bool(event_block.strip()) and all(
+        not line.strip() or line.lstrip().startswith(":") for line in event_block.splitlines()
+    )
+
+
 def _public_contract_error_message(kind: str) -> str:
     if kind == "invalid_json":
         return "Responses stream produced an invalid JSON payload"
@@ -2982,6 +6375,8 @@ def _public_contract_error_message(kind: str) -> str:
         return "Responses stream produced unsupported output items"
     if kind == "upstream_stream_truncated":
         return "Responses stream ended before a terminal event"
+    if kind == "stream_incomplete":
+        return "Upstream stream ended before response.completed"
     return "Responses stream violated the public contract"
 
 
@@ -3036,7 +6431,11 @@ def _parse_error_envelope(payload: JsonValue | OpenAIErrorEnvelope) -> OpenAIErr
 def _openai_invalid_transcription_model_error(model: str) -> OpenAIErrorEnvelope:
     error = openai_error(
         "invalid_request_error",
-        f"Unsupported transcription model '{model}'. Only '{_TRANSCRIPTION_MODEL}' is supported.",
+        (
+            f"Unsupported transcription model '{model}'. Use '{_TRANSCRIPTION_MODEL}' for the subscription-backed "
+            "transcription route, or configure an enabled OpenAI-compatible model source with Audio Transcriptions "
+            "support for this model."
+        ),
         error_type="invalid_request_error",
     )
     error["error"]["param"] = "model"
@@ -3052,15 +6451,10 @@ def _error_envelope_from_response(error_value: OpenAIError | None) -> OpenAIErro
 def _is_previous_response_not_found_public_error(error_value: OpenAIError | None) -> bool:
     if error_value is None:
         return False
-    if error_value.code == "previous_response_not_found":
-        return True
-    message = error_value.message or ""
-    normalized_message = " ".join(message.lower().split())
-    return (
-        error_value.code == "invalid_request_error"
-        and error_value.param == "previous_response_id"
-        and "previous response" in normalized_message
-        and "not found" in normalized_message
+    return is_previous_response_not_found_error(
+        code=error_value.code,
+        param=error_value.param,
+        message=error_value.message,
     )
 
 
@@ -3075,7 +6469,7 @@ def _mask_previous_response_not_found_error(
         502,
         OpenAIErrorEnvelopeModel(
             error=OpenAIError(
-                message="Upstream websocket closed before response.completed",
+                message=PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
                 type="server_error",
                 code="stream_incomplete",
             )
@@ -3090,7 +6484,7 @@ def _status_for_error(error_value: OpenAIError | None) -> int:
         return 503
     if error_value and error_value.code in {"rate_limit_exceeded", "usage_limit_reached", "insufficient_quota"}:
         return 429
-    if error_value and error_value.code in {"invalid_api_key", "invalid_authentication"}:
+    if error_value and error_value.code in {"invalid_api_key", "invalid_authentication", "token_invalidated"}:
         return 401
     if error_value and error_value.code == "invalid_request_error":
         return 400

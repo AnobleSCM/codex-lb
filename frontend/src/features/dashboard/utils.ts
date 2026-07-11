@@ -1,14 +1,15 @@
-import { Activity, AlertTriangle, Coins, DollarSign, type LucideIcon } from "lucide-react";
+import { Activity, AlertTriangle, Coins, DollarSign, Flame, type LucideIcon } from "lucide-react";
 
 import type {
   AccountSummary,
   DashboardOverview,
+  DashboardProjections,
   Depletion,
   RequestLog,
   TrendPoint,
   UsageWindow,
 } from "@/features/dashboard/schemas";
-import { buildDuplicateAccountIdSet, formatCompactAccountId } from "@/utils/account-identifiers";
+import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { buildDonutPalette } from "@/utils/colors";
 import {
   formatCachedTokensMeta,
@@ -34,9 +35,15 @@ export type DashboardStat = {
   label: string;
   value: string;
   meta?: string;
+  comparison?: DashboardStatComparison;
   icon: LucideIcon;
   trend: { value: number }[];
   trendColor: string;
+};
+
+export type DashboardStatComparison = {
+  text: string;
+  tone: "positive" | "negative" | "neutral";
 };
 
 export interface SafeLineView {
@@ -53,7 +60,13 @@ export type WeeklyCreditPace = {
   actualUsedPercent: number;
   scheduledUsedPercent: number;
   deltaPercent: number;
+  scheduleGapCredits: number;
+  smoothedDeltaPercent?: number;
+  smoothedScheduleGapCredits?: number;
+  paceGapSmoothingMinutes?: number;
+  /** Legacy alias for scheduleGapCredits while older components migrate. */
   overPlanCredits: number;
+  projectedShortfallCredits: number;
   pauseForBreakEvenHours: number | null;
   paceMultiplier: number | null;
   throttleToPercent: number | null;
@@ -62,8 +75,13 @@ export type WeeklyCreditPace = {
   proAccountsToCoverOverPlan: number | null;
   projectedDepletionHours: number | null;
   projectedMinimumRemainingCredits: number | null;
+  forecastBurnRateCreditsPerHour: number | null;
+  scheduledBurnRateCreditsPerHour: number;
   status: WeeklyCreditPaceStatus;
   accountCount: number;
+  staleAccountCount: number;
+  inactiveAccountCount: number;
+  confidence: "high" | "medium" | "low";
 };
 
 export type DashboardView = {
@@ -79,6 +97,24 @@ export type DashboardView = {
   safeLineSecondary: SafeLineView | null;
   weeklyCreditPace: WeeklyCreditPace | null;
 };
+
+type DashboardViewOptions = {
+  isDark?: boolean;
+  showAccountBurnrate?: boolean;
+};
+
+function resolveDashboardViewOptions(optionsOrIsDark: DashboardViewOptions | boolean): Required<DashboardViewOptions> {
+  if (typeof optionsOrIsDark === "boolean") {
+    return {
+      isDark: optionsOrIsDark,
+      showAccountBurnrate: true,
+    };
+  }
+  return {
+    isDark: optionsOrIsDark.isDark ?? false,
+    showAccountBurnrate: optionsOrIsDark.showAccountBurnrate ?? true,
+  };
+}
 
 export function buildDepletionView(depletion: Depletion | null | undefined): SafeLineView | null {
   if (!depletion || depletion.riskLevel === "safe") return null;
@@ -98,6 +134,14 @@ function buildWindowIndex(window: UsageWindow | null): Map<string, number> {
 
 function isWeeklyOnlyAccount(account: AccountSummary): boolean {
   return account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
+}
+
+function isMonthlyOnlyAccount(account: AccountSummary): boolean {
+  return (
+    account.windowMinutesMonthly != null &&
+    account.windowMinutesPrimary == null &&
+    account.windowMinutesSecondary == null
+  );
 }
 
 function accountRemainingPercent(account: AccountSummary, windowKey: "primary" | "secondary"): number | null {
@@ -152,17 +196,18 @@ export function buildRemainingItems(
 ): RemainingItem[] {
   const usageIndex = buildWindowIndex(window);
   const palette = buildDonutPalette(accounts.length, isDark);
-  const duplicateAccountIds = buildDuplicateAccountIdSet(accounts);
-
   return accounts
     .map((account, index) => {
+      if (isMonthlyOnlyAccount(account)) {
+        return null;
+      }
       if (windowKey === "primary" && isWeeklyOnlyAccount(account)) {
         return null;
       }
       const remaining = usageIndex.get(account.accountId) ?? 0;
       const rawLabel = account.displayName || account.email || account.accountId;
       const labelIsEmail = !!account.email && rawLabel === account.email;
-      const labelSuffix = duplicateAccountIds.has(account.accountId)
+      const labelSuffix = account.isEmailDuplicate === true
         ? ` (${formatCompactAccountId(account.accountId, 5, 4)})`
         : "";
       return {
@@ -185,7 +230,183 @@ function avgPerUnit(total: number, units: number): number {
   return total / units;
 }
 
-const TREND_COLORS = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b"];
+function isFiniteNumber(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}
+
+function buildStatComparison(
+  current: number | null | undefined,
+  previous: number,
+  canCompare: boolean,
+): DashboardStatComparison | undefined {
+  if (!canCompare || !isFiniteNumber(current) || previous <= 0) {
+    return undefined;
+  }
+
+  const deltaPercent = ((current - previous) / previous) * 100;
+  const roundedPercent = Math.round(Math.abs(deltaPercent));
+  if (roundedPercent === 0) {
+    return undefined;
+  }
+  if (deltaPercent > 0) {
+    return { text: `▲ ${roundedPercent}%`, tone: "positive" };
+  }
+  if (deltaPercent < 0) {
+    return { text: `▼ ${roundedPercent}%`, tone: "negative" };
+  }
+  return undefined;
+}
+
+function windowUsedAccountEquivalents(
+  overview: DashboardOverview,
+  windowKey: "primary" | "secondary",
+): number | null {
+  let usedEquivalent = 0;
+  let includedAccounts = 0;
+
+  for (const account of overview.accounts) {
+    const windowMinutes = windowKey === "primary" ? account.windowMinutesPrimary : account.windowMinutesSecondary;
+    const remainingPercent =
+      windowKey === "primary" ? account.usage?.primaryRemainingPercent : account.usage?.secondaryRemainingPercent;
+
+    if (windowMinutes == null || !isFiniteNumber(remainingPercent)) {
+      continue;
+    }
+
+    let accountEquivalent = (100 - clampPercent(remainingPercent)) / 100;
+    if (windowKey === "secondary" && account.status === "quota_exceeded") {
+      accountEquivalent = Math.max(accountEquivalent, 1);
+    }
+
+    usedEquivalent += accountEquivalent;
+    includedAccounts += 1;
+  }
+
+  return includedAccounts > 0 ? usedEquivalent : null;
+}
+
+function windowProjectedAccountEquivalents(
+  overview: DashboardOverview,
+  windowKey: "primary" | "secondary",
+): number | null {
+  let projectedEquivalent = 0;
+  let includedAccounts = 0;
+  const nowMs = Date.now();
+
+  for (const account of overview.accounts) {
+    const windowMinutes = windowKey === "primary" ? account.windowMinutesPrimary : account.windowMinutesSecondary;
+    const remainingPercent =
+      windowKey === "primary" ? account.usage?.primaryRemainingPercent : account.usage?.secondaryRemainingPercent;
+    const resetAt = windowKey === "primary" ? account.resetAtPrimary : account.resetAtSecondary;
+
+    if (windowMinutes == null || !isFiniteNumber(remainingPercent) || windowMinutes <= 0) {
+      continue;
+    }
+
+    const usedEquivalent = (100 - clampPercent(remainingPercent)) / 100;
+    let projected = usedEquivalent;
+
+    if (resetAt) {
+      const resetAtMs = Date.parse(resetAt);
+      if (Number.isFinite(resetAtMs)) {
+        const windowMs = windowMinutes * 60_000;
+        const secondsUntilReset = Math.max(0, (resetAtMs - nowMs) / 1000);
+        const elapsedSeconds = Math.max(0, windowMs / 1000 - secondsUntilReset);
+        if (elapsedSeconds > 0) {
+          projected = usedEquivalent * ((windowMs / 1000) / elapsedSeconds);
+        }
+      }
+    }
+
+    if (windowKey === "secondary" && account.status === "quota_exceeded") {
+      projected = Math.max(projected, 1);
+    }
+
+    projectedEquivalent += projected;
+    includedAccounts += 1;
+  }
+
+  return includedAccounts > 0 ? projectedEquivalent : null;
+}
+
+function windowIncludedAccountCount(
+  overview: DashboardOverview,
+  windowKey: "primary" | "secondary",
+): number {
+  let includedAccounts = 0;
+
+  for (const account of overview.accounts) {
+    const windowMinutes = windowKey === "primary" ? account.windowMinutesPrimary : account.windowMinutesSecondary;
+    const remainingPercent =
+      windowKey === "primary" ? account.usage?.primaryRemainingPercent : account.usage?.secondaryRemainingPercent;
+
+    if (windowMinutes == null || !isFiniteNumber(remainingPercent)) {
+      continue;
+    }
+
+    includedAccounts += 1;
+  }
+
+  return includedAccounts;
+}
+
+function clampBurnEquivalent(value: number | null, maxEquivalent: number): number | null {
+  if (!isFiniteNumber(value)) {
+    return null;
+  }
+
+  const clamped = Math.max(0, value);
+  if (maxEquivalent <= 0) {
+    return clamped;
+  }
+  return Math.min(clamped, maxEquivalent);
+}
+
+function plusAccountsBurnEquivalent(
+  overview: DashboardOverview,
+  windowKey: "primary" | "secondary",
+): number | null {
+  const maxEquivalent = windowIncludedAccountCount(overview, windowKey);
+  const projectedEquivalent = clampBurnEquivalent(windowProjectedAccountEquivalents(overview, windowKey), maxEquivalent);
+  const usedEquivalent = clampBurnEquivalent(windowUsedAccountEquivalents(overview, windowKey), maxEquivalent);
+
+  return projectedEquivalent ?? usedEquivalent;
+}
+
+function formatBurnEquivalent(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "--";
+  }
+  return value.toFixed(1);
+}
+
+function buildBurnTrend(points: TrendPoint[], currentValue: number | null): { value: number }[] {
+  if (currentValue === null || !Number.isFinite(currentValue) || currentValue <= 0 || points.length === 0) {
+    return [];
+  }
+
+  const lastPoint = points[points.length - 1]?.v ?? 0;
+  if (!Number.isFinite(lastPoint) || lastPoint <= 0) {
+    return points.map(() => ({ value: currentValue }));
+  }
+
+  const scale = currentValue / lastPoint;
+  return points.map((point) => ({ value: Math.max(0, point.v * scale) }));
+}
+
+function formatBurnWindowLabel(windowKey: "primary" | "secondary", windowMinutes: number | null | undefined): string {
+  const formatted = formatWindowMinutes(windowMinutes ?? null);
+  if (formatted !== "--") {
+    return formatted;
+  }
+  return windowKey === "primary" ? "5h" : "7d";
+}
+
+const TREND_COLORS = ["#3b82f6", "#8b5cf6", "#10b981", "#ef4444", "#f59e0b"];
 const PRO_WEEKLY_CAPACITY_CREDITS = 50_400;
 
 function trendPointsToValues(points: TrendPoint[]): { value: number }[] {
@@ -248,7 +469,7 @@ function totalWeeklyBalanceCredits(accounts: WeeklyPoolSimulationAccount[]): num
 
 function consumeWeeklyBalanceCredits(accounts: WeeklyPoolSimulationAccount[], amountCredits: number): void {
   let remainingToConsume = amountCredits;
-  const spendOrder = [...accounts].sort((a, b) => a.resetAtMs - b.resetAtMs);
+  const spendOrder = accounts.toSorted((a, b) => a.resetAtMs - b.resetAtMs);
 
   for (const account of spendOrder) {
     if (remainingToConsume <= 0) {
@@ -267,11 +488,15 @@ function buildEmptyWeeklyPoolProjection(
   nowMs: number,
 ): WeeklyPoolProjection {
   const resetEvents = accounts
-    .filter((account) => account.resetAtMs > nowMs)
-    .map((account) => ({
-      fullCredits: account.fullCredits,
-      resetAtMs: account.resetAtMs,
-    }))
+    .reduce<Array<Pick<WeeklyResetEvent, "fullCredits" | "resetAtMs">>>((events, account) => {
+      if (account.resetAtMs > nowMs) {
+        events.push({
+          fullCredits: account.fullCredits,
+          resetAtMs: account.resetAtMs,
+        });
+      }
+      return events;
+    }, [])
     .sort((a, b) => a.resetAtMs - b.resetAtMs);
 
   if (resetEvents.length === 0) {
@@ -456,17 +681,25 @@ export function buildWeeklyCreditPace(
   const actualUsedPercent = (100 * (totalFullCredits - totalActualRemainingCredits)) / totalFullCredits;
   const scheduledUsedPercent = (100 * (totalFullCredits - totalExpectedRemainingCredits)) / totalFullCredits;
   const deltaPercent = actualUsedPercent - scheduledUsedPercent;
+  const scheduleGapCredits = Math.max(0, totalExpectedRemainingCredits - totalActualRemainingCredits);
+  const scheduledBurnRateCreditsPerHour = weeklyAccounts.reduce(
+    (sum, account) => sum + (account.fullCredits / account.windowMs) * 3_600_000,
+    0,
+  );
   const projection = buildWeeklyPoolProjection(weeklyAccounts, nowMs);
-  const overPlanCredits = projection?.projectedShortfallCredits ?? 0;
+  const projectedShortfallCredits = projection?.projectedShortfallCredits ?? 0;
   const pauseForBreakEvenHours =
-    projection && overPlanCredits > 0 && projection.burnRateCreditsPerMs > 0
-      ? overPlanCredits / projection.burnRateCreditsPerMs / 3_600_000
+    projection && projectedShortfallCredits > 0 && projection.burnRateCreditsPerMs > 0
+      ? projectedShortfallCredits / projection.burnRateCreditsPerMs / 3_600_000
       : null;
-  const paceMultiplier = overPlanCredits > 0 && scheduledUsedPercent > 0 ? actualUsedPercent / scheduledUsedPercent : null;
+  const paceMultiplier =
+    projection && projectedShortfallCredits > 0 && projection.burnRateCreditsPerMs > 0 && scheduledBurnRateCreditsPerHour > 0
+      ? (projection.burnRateCreditsPerMs * 3_600_000) / scheduledBurnRateCreditsPerHour
+      : null;
   const throttleToPercent =
-    projection && overPlanCredits > 0 && projection.firstReplenishmentWaitMs && projection.burnRateCreditsPerMs > 0
+    projection && projectedShortfallCredits > 0 && projection.firstReplenishmentWaitMs && projection.burnRateCreditsPerMs > 0
       ? clamp(
-          ((projection.firstReplenishmentWaitMs * projection.burnRateCreditsPerMs - overPlanCredits) /
+          ((projection.firstReplenishmentWaitMs * projection.burnRateCreditsPerMs - projectedShortfallCredits) /
             (projection.firstReplenishmentWaitMs * projection.burnRateCreditsPerMs)) *
             100,
           0,
@@ -475,9 +708,9 @@ export function buildWeeklyCreditPace(
       : null;
   const reduceByPercent = throttleToPercent != null ? 100 - throttleToPercent : null;
   const proAccountEquivalentToCoverOverPlan =
-    overPlanCredits > 0 ? overPlanCredits / PRO_WEEKLY_CAPACITY_CREDITS : null;
+    projectedShortfallCredits > 0 ? projectedShortfallCredits / PRO_WEEKLY_CAPACITY_CREDITS : null;
   const proAccountsToCoverOverPlan =
-    overPlanCredits > 0 ? Math.ceil(overPlanCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null;
+    projectedShortfallCredits > 0 ? Math.ceil(projectedShortfallCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null;
 
   return {
     totalFullCredits,
@@ -486,7 +719,12 @@ export function buildWeeklyCreditPace(
     actualUsedPercent,
     scheduledUsedPercent,
     deltaPercent,
-    overPlanCredits,
+    scheduleGapCredits,
+    smoothedDeltaPercent: deltaPercent,
+    smoothedScheduleGapCredits: scheduleGapCredits,
+    paceGapSmoothingMinutes: 0,
+    overPlanCredits: scheduleGapCredits,
+    projectedShortfallCredits,
     pauseForBreakEvenHours,
     paceMultiplier,
     throttleToPercent,
@@ -495,16 +733,23 @@ export function buildWeeklyCreditPace(
     proAccountsToCoverOverPlan,
     projectedDepletionHours: projection?.projectedDepletionHours ?? null,
     projectedMinimumRemainingCredits: projection?.projectedMinimumRemainingCredits ?? null,
-    status: weeklyCreditPaceStatus(deltaPercent, overPlanCredits),
+    forecastBurnRateCreditsPerHour: projection ? projection.burnRateCreditsPerMs * 3_600_000 : null,
+    scheduledBurnRateCreditsPerHour,
+    status: weeklyCreditPaceStatus(deltaPercent, projectedShortfallCredits),
     accountCount,
+    staleAccountCount: 0,
+    inactiveAccountCount: 0,
+    confidence: "low",
   };
 }
 
 export function buildDashboardView(
   overview: DashboardOverview,
   requestLogs: RequestLog[],
-  isDark = false,
+  optionsOrIsDark: DashboardViewOptions | boolean = false,
+  projections?: DashboardProjections,
 ): DashboardView {
+  const { isDark, showAccountBurnrate } = resolveDashboardViewOptions(optionsOrIsDark);
   const primaryWindow = overview.windows.primary;
   const secondaryWindow = overview.windows.secondary;
   const metrics = overview.summary.metrics;
@@ -523,17 +768,25 @@ export function buildDashboardView(
     timeframeHours <= 24
       ? `Avg/hr ${formatCurrency(avgPerUnit(cost, timeframeHours))}`
       : `Avg/day ${formatCurrency(avgPerUnit(cost, timeframeDays))}`;
-  const costMeta =
-    metrics?.cachedInputTokens && metrics.cachedInputTokens > 0
-      ? `${costAverage} · API estimate, ${formatCompactNumber(metrics.cachedInputTokens)} cached`
-      : `${costAverage} · API estimate`;
+  const costMeta = costAverage;
   const trends = overview.trends;
+  const primaryBurnLabel = formatBurnWindowLabel("primary", overview.summary.primaryWindow.windowMinutes);
+  const secondaryBurnLabel = formatBurnWindowLabel("secondary", overview.summary.secondaryWindow?.windowMinutes);
+  const primaryBurnEquivalent = plusAccountsBurnEquivalent(overview, "primary");
+  const secondaryBurnEquivalent = plusAccountsBurnEquivalent(overview, "secondary");
+  const combinedBurnEquivalent =
+    (primaryBurnEquivalent ?? 0) + (secondaryBurnEquivalent ?? 0) > 0
+      ? (primaryBurnEquivalent ?? 0) + (secondaryBurnEquivalent ?? 0)
+      : null;
+  const comparison = overview.summary.comparison;
+  const canCompare = comparison?.canCompare ?? false;
 
   const stats: DashboardStat[] = [
     {
       label: `Requests (${timeframeLabel})`,
       value: formatCompactNumber(metrics?.requests ?? 0),
       meta: requestMeta,
+      comparison: buildStatComparison(metrics?.requests, comparison?.previous.requests ?? 0, canCompare),
       icon: Activity,
       trend: trendPointsToValues(trends.requests),
       trendColor: TREND_COLORS[0],
@@ -542,6 +795,7 @@ export function buildDashboardView(
       label: `Tokens (${timeframeLabel})`,
       value: formatCompactNumber(metrics?.tokens ?? 0),
       meta: formatCachedTokensMeta(metrics?.tokens, metrics?.cachedInputTokens),
+      comparison: buildStatComparison(metrics?.tokens, comparison?.previous.tokens ?? 0, canCompare),
       icon: Coins,
       trend: trendPointsToValues(trends.tokens),
       trendColor: TREND_COLORS[1],
@@ -550,21 +804,34 @@ export function buildDashboardView(
       label: `Est. API Cost (${timeframeLabel})`,
       value: formatCurrency(cost),
       meta: costMeta,
+      comparison: buildStatComparison(cost, comparison?.previous.costUsd ?? 0, canCompare),
       icon: DollarSign,
       trend: trendPointsToValues(trends.cost),
       trendColor: TREND_COLORS[2],
     },
-    {
-      label: `Error rate (${timeframeLabel})`,
-      value: formatRate(metrics?.errorRate ?? null),
-      meta: metrics?.topError
-        ? `Top: ${metrics.topError}`
-        : `~${formatCompactNumber(metrics?.errorCount ?? Math.round((metrics?.errorRate ?? 0) * (metrics?.requests ?? 0)))} errors in ${timeframeLabel}`,
-      icon: AlertTriangle,
-      trend: trendPointsToValues(trends.errorRate),
-      trendColor: TREND_COLORS[3],
-    },
   ];
+
+  if (showAccountBurnrate) {
+    stats.push({
+      label: `Account burn projection (${primaryBurnLabel}/${secondaryBurnLabel})`,
+      value: `${formatBurnEquivalent(primaryBurnEquivalent)} / ${formatBurnEquivalent(secondaryBurnEquivalent)}`,
+      meta: `Projected account-equivalents: ${formatBurnEquivalent(primaryBurnEquivalent)}/${primaryBurnLabel} · ${formatBurnEquivalent(secondaryBurnEquivalent)}/${secondaryBurnLabel}`,
+      icon: Flame,
+      trend: buildBurnTrend(trends.tokens, combinedBurnEquivalent),
+      trendColor: TREND_COLORS[3],
+    });
+  }
+
+  stats.push({
+    label: `Error rate (${timeframeLabel})`,
+    value: formatRate(metrics?.errorRate ?? null),
+    meta: metrics?.topError
+      ? `Top: ${metrics.topError}`
+      : `~${formatCompactNumber(metrics?.errorCount ?? Math.round((metrics?.errorRate ?? 0) * (metrics?.requests ?? 0)))} errors in ${timeframeLabel}`,
+    icon: AlertTriangle,
+    trend: trendPointsToValues(trends.errorRate),
+    trendColor: TREND_COLORS[4],
+  });
 
   const rawPrimaryItems = buildRemainingItems(overview.accounts, primaryWindow, "primary", isDark);
   const secondaryUsageItems = buildRemainingItems(overview.accounts, secondaryWindow, "secondary", isDark);
@@ -579,8 +846,13 @@ export function buildDashboardView(
     primaryTotal: sumRemaining(primaryUsageItems),
     secondaryTotal: sumRemaining(secondaryUsageItems),
     requestLogs,
-    safeLinePrimary: buildDepletionView(overview.depletionPrimary),
-    safeLineSecondary: buildDepletionView(overview.depletionSecondary),
-    weeklyCreditPace: buildWeeklyCreditPace(overview.accounts),
+    safeLinePrimary: buildDepletionView(projections?.depletionPrimary ?? overview.depletionPrimary),
+    safeLineSecondary: buildDepletionView(projections?.depletionSecondary ?? overview.depletionSecondary),
+    weeklyCreditPace:
+      projections?.weeklyCreditPace !== undefined
+        ? projections.weeklyCreditPace
+        : overview.weeklyCreditPace !== undefined
+          ? overview.weeklyCreditPace
+          : buildWeeklyCreditPace(overview.accounts),
   };
 }

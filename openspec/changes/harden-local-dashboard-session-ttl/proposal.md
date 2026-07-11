@@ -6,11 +6,11 @@ Local operators who keep the dashboard bound to loopback should not have to re-a
 
 - Change the persisted dashboard session lifetime default from 12 hours to 1 year.
 - Migrate existing dashboard settings rows that still carry the old 12-hour default to the new 1-year default, while preserving customized values.
-- Resolve the effective session TTL at issuance time: configured lifetimes above 30 days apply only to socket-level loopback requests in standard dashboard auth mode with no forwarded-client headers. The explicit loopback-host-header override cannot make a non-loopback socket peer eligible for a long session. Remote, bridge, proxy-aware, or trusted-header requests fall back to 12 hours.
+- Resolve the effective session TTL at issuance time: configured lifetimes above 30 days apply only to direct loopback requests in standard dashboard auth mode, or to loopback dashboard URLs when the explicit loopback-host-header override is enabled for localhost-published deployments. Remote/proxy/trusted-header requests fall back to 12 hours.
 - Keep shorter configured lifetimes intact, including on remote requests.
 
 ## Impact
 
 - Affected backend modules: dashboard auth session issuance, dashboard settings defaults, and the dashboard settings migration chain.
 - Existing localhost-only deployments that never customized the setting move to annual dashboard sessions after migration.
-- Non-local, bridge, or proxy-authenticated dashboard sessions do not silently receive the long TTL.
+- Non-local or proxy-authenticated dashboard sessions do not silently receive the long TTL.

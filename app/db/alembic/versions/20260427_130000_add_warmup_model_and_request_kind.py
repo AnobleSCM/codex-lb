@@ -48,14 +48,6 @@ def upgrade() -> None:
                 )
             with op.batch_alter_table("request_logs") as batch_op:
                 batch_op.alter_column("request_kind", existing_type=sa.String(), nullable=False)
-        request_log_indexes = {index["name"] for index in inspector.get_indexes("request_logs")}
-        if "idx_logs_request_kind_time" not in request_log_indexes:
-            op.create_index(
-                "idx_logs_request_kind_time",
-                "request_logs",
-                ["request_kind", sa.text("requested_at DESC"), sa.text("id DESC")],
-                unique=False,
-            )
 
     if inspector.has_table("dashboard_settings"):
         dashboard_columns = {column["name"] for column in inspector.get_columns("dashboard_settings")}
@@ -72,9 +64,6 @@ def downgrade() -> None:
 
     if inspector.has_table("request_logs"):
         request_log_columns = {column["name"] for column in inspector.get_columns("request_logs")}
-        request_log_indexes = {index["name"] for index in inspector.get_indexes("request_logs")}
-        if "idx_logs_request_kind_time" in request_log_indexes:
-            op.drop_index("idx_logs_request_kind_time", table_name="request_logs")
         if "request_kind" in request_log_columns:
             with op.batch_alter_table("request_logs") as batch_op:
                 batch_op.drop_column("request_kind")

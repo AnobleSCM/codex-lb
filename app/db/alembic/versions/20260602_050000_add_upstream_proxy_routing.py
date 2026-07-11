@@ -33,16 +33,6 @@ def _indexes(connection: Connection, table_name: str) -> set[str]:
     return {name for index in sa.inspect(connection).get_indexes(table_name) if (name := index["name"]) is not None}
 
 
-def _foreign_keys(connection: Connection, table_name: str) -> set[str]:
-    if not _has_table(connection, table_name):
-        return set()
-    return {
-        str(name)
-        for constraint in sa.inspect(connection).get_foreign_keys(table_name)
-        if (name := constraint.get("name")) is not None
-    }
-
-
 def upgrade() -> None:
     bind = op.get_bind()
     if not _has_table(bind, "proxy_endpoints"):
@@ -143,31 +133,20 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     request_log_columns = _columns(bind, "request_logs")
-    request_log_columns_to_drop = [
-        column_name
-        for column_name in (
-            "upstream_proxy_fail_closed_reason",
-            "upstream_proxy_fallback_used",
-            "upstream_proxy_endpoint_id",
-            "upstream_proxy_pool_id",
-            "upstream_proxy_route_mode",
-        )
-        if column_name in request_log_columns
-    ]
-    if request_log_columns_to_drop:
-        with op.batch_alter_table("request_logs") as batch_op:
-            for column_name in request_log_columns_to_drop:
-                batch_op.drop_column(column_name)
+    for column_name in (
+        "upstream_proxy_fail_closed_reason",
+        "upstream_proxy_fallback_used",
+        "upstream_proxy_endpoint_id",
+        "upstream_proxy_pool_id",
+        "upstream_proxy_route_mode",
+    ):
+        if column_name in request_log_columns:
+            op.drop_column("request_logs", column_name)
     dashboard_columns = _columns(bind, "dashboard_settings")
     if "upstream_proxy_default_pool_id" in dashboard_columns or "upstream_proxy_routing_enabled" in dashboard_columns:
-        dashboard_foreign_keys = _foreign_keys(bind, "dashboard_settings")
         with op.batch_alter_table("dashboard_settings") as batch_op:
             if "upstream_proxy_default_pool_id" in dashboard_columns:
-                if (
-                    bind.dialect.name != "sqlite"
-                    and "fk_dashboard_settings_upstream_proxy_default_pool" in dashboard_foreign_keys
-                ):
-                    batch_op.drop_constraint("fk_dashboard_settings_upstream_proxy_default_pool", type_="foreignkey")
+                batch_op.drop_constraint("fk_dashboard_settings_upstream_proxy_default_pool", type_="foreignkey")
                 batch_op.drop_column("upstream_proxy_default_pool_id")
             if "upstream_proxy_routing_enabled" in dashboard_columns:
                 batch_op.drop_column("upstream_proxy_routing_enabled")

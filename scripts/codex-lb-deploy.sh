@@ -80,7 +80,13 @@ try:
     checks = payload.get('checks', {})
     if not isinstance(checks, dict):
         raise TypeError('checks is not an object')
-    print(checks.get(sys.argv[1], ''))
+    value = checks.get(sys.argv[1], '')
+    # The shell caller matches lowercase true|false; Python bools print as
+    # True/False, which made every real JSON drain response unparseable.
+    if isinstance(value, bool):
+        print('true' if value else 'false')
+    else:
+        print(value)
 except Exception as exc:
     raise SystemExit(f'failed to parse drain status: {exc}')
 " "$key"
@@ -158,17 +164,23 @@ wait_for_drain_zero() {
 
   local deadline=$((SECONDS + DEPLOY_DRAIN_TIMEOUT_SECONDS))
   while true; do
-    local status_json in_flight
+    local status_json in_flight draining bridge_drain_active
     status_json="$(read_drain_status)" || fatal "unable to read live drain status at $DRAIN_STATUS_URL"
     in_flight="$(extract_in_flight "$status_json")" || fatal "unable to parse live drain status"
-    if [ "$in_flight" -eq 0 ]; then
-      echo "    drain complete: in_flight=0"
+    draining="$(extract_drain_boolean "$status_json" "draining")" || fatal "unable to parse live drain status"
+    bridge_drain_active="$(extract_drain_boolean "$status_json" "bridge_drain_active")" || fatal "unable to parse live drain status"
+    # in_flight=0 alone is racy: until the drain flags latch, the proxy is
+    # still admitting new work, and a request accepted between this poll and
+    # the recreate would be killed. Require the SAME status read to show the
+    # drain latched AND zero in-flight before declaring the drain complete.
+    if [ "$in_flight" -eq 0 ] && [ "$draining" = "true" ] && [ "$bridge_drain_active" = "true" ]; then
+      echo "    drain complete: draining=true bridge_drain_active=true in_flight=0"
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-      fatal "live proxy still has $in_flight in-flight request(s) after ${DEPLOY_DRAIN_TIMEOUT_SECONDS}s; not recreating"
+      fatal "live proxy not drained after ${DEPLOY_DRAIN_TIMEOUT_SECONDS}s (draining=$draining bridge_drain_active=$bridge_drain_active in_flight=$in_flight); not recreating"
     fi
-    echo "    waiting for in-flight requests to drain: in_flight=$in_flight"
+    echo "    waiting for drain: draining=$draining bridge_drain_active=$bridge_drain_active in_flight=$in_flight"
     sleep "$DEPLOY_DRAIN_POLL_SECONDS"
   done
 }

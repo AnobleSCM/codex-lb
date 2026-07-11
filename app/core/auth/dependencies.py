@@ -9,14 +9,25 @@ from fastapi import Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.requests import HTTPConnection
 
+from app.core.auth import generate_unique_account_id
 from app.core.auth.api_key_cache import get_api_key_cache
+from app.core.auth.dashboard_access import (
+    DashboardPermission,
+    DashboardPrincipal,
+    DashboardRole,
+    admin_principal,
+    guest_principal,
+)
 from app.core.auth.dashboard_mode import DashboardAuthMode, get_dashboard_request_auth
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
-from app.core.exceptions import DashboardAuthError, ProxyAuthError, ProxyUpstreamError
+from app.core.crypto import TokenEncryptor
+from app.core.exceptions import DashboardAuthError, DashboardPermissionError, ProxyAuthError, ProxyUpstreamError
 from app.core.request_locality import is_local_request
+from app.core.upstream_proxy import UpstreamProxyRouteError, resolve_upstream_route
 from app.core.utils.time import utcnow
+from app.db.models import AccountStatus
 from app.db.session import get_background_session
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -26,6 +37,11 @@ from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_das
 logger = logging.getLogger(__name__)
 
 _bearer = HTTPBearer(description="API key (e.g. sk-clb-…)", auto_error=False)
+_CODEX_USAGE_IDENTITY_INACTIVE_WORKSPACE_STATUSES = {
+    AccountStatus.PAUSED,
+    AccountStatus.REAUTH_REQUIRED,
+    AccountStatus.DEACTIVATED,
+}
 
 
 # --- Error format markers ---
@@ -112,50 +128,82 @@ async def validate_usage_api_key(
     return await _validate_api_key_token(token)
 
 
-# --- Fleet summary read auth (always requires valid key) ---
-
-
-async def validate_fleet_api_key(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
-) -> ApiKeyData:
-    """Validate API key for the fleet summary read endpoint.
-
-    Like ``validate_usage_api_key`` and unlike ``validate_proxy_api_key``, this
-    dependency ALWAYS requires a valid Bearer API key, independent of the
-    global ``api_key_auth_enabled`` setting. The fleet summary exposes account
-    emails and capacity state and the service binds to a non-loopback interface
-    (see ``deployment-networking``), so this route must never inherit the
-    proxy's unauthenticated pass-through. Raises ProxyAuthError (HTTP 401) when
-    the key is missing or invalid.
-    """
-    token = _extract_bearer_token(None if credentials is None else f"Bearer {credentials.credentials}")
-    if not token:
-        raise ProxyAuthError("Missing API key in Authorization header")
-
-    return await _validate_api_key_token(token)
-
-
 # --- Dashboard session auth ---
 
 
-async def validate_dashboard_session(request: Request) -> None:
+def _set_dashboard_principal(request: Request, principal: DashboardPrincipal) -> DashboardPrincipal:
+    request.state.dashboard_principal = principal
+    return principal
+
+
+def _get_cached_dashboard_principal(request: Request) -> DashboardPrincipal | None:
+    principal = getattr(request.state, "dashboard_principal", None)
+    return principal if isinstance(principal, DashboardPrincipal) else None
+
+
+async def validate_dashboard_session(request: Request) -> DashboardPrincipal:
+    cached = _get_cached_dashboard_principal(request)
+    if cached is not None:
+        return cached
+
     request_auth = get_dashboard_request_auth(request)
     if request_auth is not None:
-        return
+        return _set_dashboard_principal(
+            request,
+            admin_principal(auth_mode=request_auth.mode, actor=request_auth.actor),
+        )
 
     settings = await get_settings_cache().get()
     password_required = bool(settings.password_hash)
     requires_auth = password_required or settings.totp_required_on_login
-    if get_dashboard_request_auth_mode() == DashboardAuthMode.TRUSTED_HEADER and not requires_auth:
+    guest_access_enabled = settings.guest_access_enabled
+    guest_password_required = guest_access_enabled and settings.guest_password_hash is not None
+    passwordless_guest_fallback_allowed = not (
+        get_dashboard_request_auth_mode() == DashboardAuthMode.TRUSTED_HEADER
+        and requires_auth
+        and guest_access_enabled
+        and not guest_password_required
+    )
+    session_id = request.cookies.get(DASHBOARD_SESSION_COOKIE)
+    state = get_dashboard_session_store().get(session_id)
+
+    has_admin_fallback_session = (
+        state is not None and state.role == DashboardRole.ADMIN and password_required and state.password_verified
+    )
+    if get_dashboard_request_auth_mode() == DashboardAuthMode.TRUSTED_HEADER and not has_admin_fallback_session:
         raise DashboardAuthError("Reverse proxy authentication is required", code="proxy_auth_required")
+    if (
+        state is not None
+        and state.role == DashboardRole.GUEST
+        and guest_access_enabled
+        and ((not guest_password_required and passwordless_guest_fallback_allowed) or state.guest_verified)
+    ):
+        return _set_dashboard_principal(request, guest_principal())
+    if state is not None and state.role == DashboardRole.ADMIN and password_required and state.password_verified:
+        if settings.totp_required_on_login and not state.totp_verified:
+            raise DashboardAuthError("TOTP verification is required for dashboard access", code="totp_required")
+        return _set_dashboard_principal(
+            request,
+            admin_principal(auth_mode=DashboardAuthMode.STANDARD),
+        )
+
     if not requires_auth:
         if not is_local_request(request):
+            if guest_access_enabled:
+                if not guest_password_required:
+                    return _set_dashboard_principal(request, guest_principal())
+                raise DashboardAuthError("Authentication is required")
             raise DashboardAuthError(
                 "Remote bootstrap is required before dashboard access is allowed",
                 code="bootstrap_required",
             )
-        return
+        return _set_dashboard_principal(
+            request,
+            admin_principal(auth_mode=DashboardAuthMode.STANDARD),
+        )
+
+    if guest_access_enabled and not guest_password_required and passwordless_guest_fallback_allowed:
+        return _set_dashboard_principal(request, guest_principal())
 
     if not password_required and settings.totp_required_on_login:
         logger.warning(
@@ -163,14 +211,28 @@ async def validate_dashboard_session(request: Request) -> None:
             " while totp_required_on_login=true metric=dashboard_auth_migration_inconsistency"
         )
 
-    session_id = request.cookies.get(DASHBOARD_SESSION_COOKIE)
-    state = get_dashboard_session_store().get(session_id)
     if state is None:
+        raise DashboardAuthError("Authentication is required")
+    if state.role != DashboardRole.ADMIN:
         raise DashboardAuthError("Authentication is required")
     if password_required and not state.password_verified:
         raise DashboardAuthError("Authentication is required")
     if settings.totp_required_on_login and not state.totp_verified:
         raise DashboardAuthError("TOTP verification is required for dashboard access", code="totp_required")
+    return _set_dashboard_principal(
+        request,
+        admin_principal(auth_mode=DashboardAuthMode.STANDARD),
+    )
+
+
+async def require_dashboard_write_access(request: Request) -> DashboardPrincipal:
+    principal = await validate_dashboard_session(request)
+    if not principal.can(DashboardPermission.WRITE):
+        raise DashboardPermissionError(
+            "Read-only dashboard access cannot modify dashboard state",
+            code="read_only_access",
+        )
+    return principal
 
 
 def get_dashboard_request_auth_mode() -> DashboardAuthMode:
@@ -210,12 +272,29 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
 
     async with get_background_session() as session:
         accounts_repo = AccountsRepository(session)
-        is_authorized = await accounts_repo.exists_active_chatgpt_account_id(account_id)
-    if not is_authorized:
-        raise ProxyAuthError("Unknown or inactive chatgpt-account-id")
+        account = await accounts_repo.get_active_by_chatgpt_account_id(account_id)
+        if account is None:
+            raise ProxyAuthError("Unknown or inactive chatgpt-account-id")
+        local_account_id = account.id
+        local_account_email = account.email
+        try:
+            route = await resolve_upstream_route(
+                session,
+                account_id=local_account_id,
+                operation="usage_identity",
+                scope="account",
+                encryptor=TokenEncryptor(),
+            )
+        except UpstreamProxyRouteError as exc:
+            raise ProxyUpstreamError("Unable to resolve upstream proxy route for ChatGPT credentials") from exc
 
     try:
-        await fetch_usage(access_token=token, account_id=account_id)
+        usage_payload = await fetch_usage(
+            access_token=token,
+            account_id=account_id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
     except UsageFetchError as exc:
         if exc.status_code == 429:
             from app.core.exceptions import ProxyRateLimitError
@@ -224,6 +303,35 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
         if exc.status_code in (401, 403):
             raise ProxyAuthError("Invalid ChatGPT token or chatgpt-account-id") from exc
         raise ProxyUpstreamError("Unable to validate ChatGPT credentials at this time") from exc
+    if usage_payload is not None and (usage_payload.workspace_id or usage_payload.workspace_label):
+        expected_account_id = generate_unique_account_id(
+            account_id,
+            local_account_email,
+            usage_payload.workspace_id,
+            usage_payload.workspace_label,
+        )
+        async with get_background_session() as session:
+            accounts_repo = AccountsRepository(session)
+            workspace_account = await accounts_repo.get_by_id(expected_account_id)
+            if workspace_account is not None and workspace_account.chatgpt_account_id == account_id:
+                if workspace_account.status in _CODEX_USAGE_IDENTITY_INACTIVE_WORKSPACE_STATUSES:
+                    raise ProxyAuthError("Unknown or inactive chatgpt-account-id")
+                local_account_id = workspace_account.id
+                try:
+                    route = await resolve_upstream_route(
+                        session,
+                        account_id=local_account_id,
+                        operation="usage_identity",
+                        scope="account",
+                        encryptor=TokenEncryptor(),
+                    )
+                except UpstreamProxyRouteError as exc:
+                    raise ProxyUpstreamError("Unable to resolve upstream proxy route for ChatGPT credentials") from exc
+    request.state.codex_usage_identity_access_token = token
+    request.state.codex_usage_identity_chatgpt_account_id = account_id
+    request.state.codex_usage_identity_account_id = local_account_id
+    request.state.codex_usage_identity_route = route
+    request.state.codex_usage_identity_payload = usage_payload
     return None
 
 

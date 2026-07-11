@@ -34,7 +34,18 @@ _TEST_SYNC_TIMEOUT_SECONDS = 5.0
 async def _cleanup_http_bridge_sessions(app_instance):
     yield
     service = get_proxy_service_for_app(app_instance)
-    await service.close_all_http_bridge_sessions()
+    async with service._http_bridge_lock:
+        sessions = list(service._http_bridge_sessions.values())
+        inflight_sessions = list(service._http_bridge_inflight_sessions.values())
+        service._http_bridge_sessions.clear()
+        service._http_bridge_inflight_sessions.clear()
+        service._http_bridge_turn_state_index.clear()
+        service._http_bridge_previous_response_index.clear()
+    for session in sessions:
+        await service._close_http_bridge_session(session)
+    for inflight_future in inflight_sessions:
+        if not inflight_future.done():
+            inflight_future.cancel()
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -69,7 +80,12 @@ async def _collect_sse_events(
     async with async_client.stream("POST", path, json=json_body, headers=headers) as response:
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
-    return [json.loads(line[6:]) for line in lines]
+    return [
+        event
+        for line in lines
+        if line[6:] != "[DONE]"
+        if (event := json.loads(line[6:])).get("type") != "codex.keepalive"
+    ]
 
 
 async def _collect_sse_events_with_headers(
@@ -83,7 +99,12 @@ async def _collect_sse_events_with_headers(
         assert response.status_code == 200
         response_headers = dict(response.headers)
         lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
-    return [json.loads(line[6:]) for line in lines], response_headers
+    return [
+        event
+        for line in lines
+        if line[6:] != "[DONE]"
+        if (event := json.loads(line[6:])).get("type") != "codex.keepalive"
+    ], response_headers
 
 
 def _assert_created_text_delta_completed(events: list[dict]) -> None:
@@ -325,6 +346,78 @@ class _FakeBridgeUpstreamWebSocket:
     def response_header(self, name: str) -> str | None:
         del name
         return None
+
+
+class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """First response completes with an unresolved ``custom_tool_call``."""
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = f"resp_bridge_custom_{len(self.sent_text)}"
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        if len(self.sent_text) == 1:
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.output_item.done",
+                            "response_id": response_id,
+                            "item": {
+                                "id": "ctc_shell",
+                                "type": "custom_tool_call",
+                                "status": "completed",
+                                "call_id": "call_custom_shell",
+                                "name": "shell",
+                                "input": "pwd",
+                            },
+                            "output_index": 0,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "OK"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
 
 
 class _ClosingBridgeUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -1387,6 +1480,7 @@ async def test_v1_responses_http_bridge_codex_session_uses_extended_idle_ttl(asy
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -1397,12 +1491,15 @@ async def test_v1_responses_http_bridge_codex_session_uses_extended_idle_ttl(asy
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -1470,12 +1567,12 @@ async def test_v1_responses_http_bridge_codex_session_uses_extended_idle_ttl(asy
 
     session.last_used_at = time.monotonic() - 300.0
     async with service._http_bridge_lock:
-        await service._prune_http_bridge_sessions_locked()
+        service._prune_http_bridge_sessions_locked()
         assert key in service._http_bridge_sessions
 
     session.last_used_at = time.monotonic() - 601.0
     async with service._http_bridge_lock:
-        await service._prune_http_bridge_sessions_locked()
+        service._prune_http_bridge_sessions_locked()
         assert key not in service._http_bridge_sessions
 
 
@@ -1490,7 +1587,7 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
     account = await _get_account(account_id)
     service = get_proxy_service_for_app(app_instance)
     fake_upstream = _FakeBridgeUpstreamWebSocket()
-    select_calls: list[bool] = []
+    select_calls: list[tuple[bool, str | None]] = []
 
     async def fake_select_account_with_budget(
         self,
@@ -1498,22 +1595,27 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
         sticky_max_age_seconds,
         prefer_earlier_reset_accounts,
+        service_tier=None,
         routing_strategy,
         model,
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -1523,7 +1625,7 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
             exclude_account_ids,
             additional_limit_name,
         )
-        select_calls.append(prefer_earlier_reset_accounts)
+        select_calls.append((prefer_earlier_reset_accounts, service_tier))
         return AccountSelection(account=account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
@@ -1548,6 +1650,7 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
             "instructions": "",
             "input": "hello",
             "prompt_cache_key": "bridge_prefer_earlier_reset",
+            "service_tier": "priority",
         }
     )
     affinity = proxy_module._sticky_key_for_responses_request(
@@ -1572,12 +1675,13 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
         affinity=affinity,
         api_key=None,
         request_model=payload.model,
+        request_service_tier=payload.service_tier,
         idle_ttl_seconds=120.0,
         max_sessions=8,
         gateway_safe_mode=True,
     )
 
-    assert select_calls == [True]
+    assert select_calls == [(True, "priority")]
     await service._close_http_bridge_session(session)
 
 
@@ -1599,6 +1703,7 @@ async def test_v1_responses_http_bridge_codex_session_prewarms_first_request(asy
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -1609,12 +1714,15 @@ async def test_v1_responses_http_bridge_codex_session_prewarms_first_request(asy
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -1676,6 +1784,7 @@ async def test_v1_responses_http_bridge_codex_session_does_not_prewarm_by_defaul
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -1686,12 +1795,15 @@ async def test_v1_responses_http_bridge_codex_session_does_not_prewarm_by_defaul
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -1766,6 +1878,7 @@ async def test_v1_responses_http_bridge_non_owner_instance_falls_back_to_local_s
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -1776,12 +1889,15 @@ async def test_v1_responses_http_bridge_non_owner_instance_falls_back_to_local_s
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -1890,6 +2006,7 @@ async def test_v1_responses_http_bridge_non_owner_prompt_cache_rebinds_locally_w
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -1898,14 +2015,17 @@ async def test_v1_responses_http_bridge_non_owner_prompt_cache_rebinds_locally_w
         routing_strategy,
         model,
         api_key=None,
+        preferred_account_id=None,
         exclude_account_ids=None,
         additional_limit_name=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2041,6 +2161,7 @@ async def test_v1_responses_http_bridge_replayed_turn_state_alias_preserves_owne
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2051,12 +2172,15 @@ async def test_v1_responses_http_bridge_replayed_turn_state_alias_preserves_owne
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2248,6 +2372,7 @@ async def test_v1_responses_http_bridge_generated_turn_state_fails_closed_withou
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2258,12 +2383,15 @@ async def test_v1_responses_http_bridge_generated_turn_state_fails_closed_withou
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2319,6 +2447,7 @@ async def test_v1_responses_http_bridge_turn_state_alias_respects_api_key_isolat
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2329,12 +2458,15 @@ async def test_v1_responses_http_bridge_turn_state_alias_respects_api_key_isolat
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2505,6 +2637,7 @@ async def test_v1_responses_http_bridge_preserves_prior_turn_state_aliases(
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2515,12 +2648,15 @@ async def test_v1_responses_http_bridge_preserves_prior_turn_state_aliases(
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2627,6 +2763,7 @@ async def test_v1_responses_http_bridge_close_waits_for_turn_state_index_lock(
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2637,12 +2774,15 @@ async def test_v1_responses_http_bridge_close_waits_for_turn_state_index_lock(
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2730,6 +2870,7 @@ async def test_v1_responses_http_bridge_allows_unstable_request_key_even_on_non_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2740,12 +2881,15 @@ async def test_v1_responses_http_bridge_allows_unstable_request_key_even_on_non_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2837,6 +2981,7 @@ async def test_v1_responses_http_bridge_reconnect_uses_last_upstream_turn_state(
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2847,12 +2992,15 @@ async def test_v1_responses_http_bridge_reconnect_uses_last_upstream_turn_state(
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -2959,6 +3107,7 @@ async def test_v1_responses_http_bridge_session_id_reconnect_keeps_upstream_turn
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -2969,12 +3118,15 @@ async def test_v1_responses_http_bridge_session_id_reconnect_keeps_upstream_turn
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3085,6 +3237,7 @@ async def test_v1_responses_http_bridge_reconnect_uses_refreshed_api_key_assignm
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3095,12 +3248,15 @@ async def test_v1_responses_http_bridge_reconnect_uses_refreshed_api_key_assignm
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3218,6 +3374,7 @@ async def test_v1_responses_http_bridge_reconnect_fails_when_reader_cancel_times
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3228,12 +3385,15 @@ async def test_v1_responses_http_bridge_reconnect_fails_when_reader_cancel_times
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3357,6 +3517,7 @@ async def test_v1_responses_http_bridge_prefers_evicting_prompt_cache_session_be
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3367,12 +3528,15 @@ async def test_v1_responses_http_bridge_prefers_evicting_prompt_cache_session_be
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3570,6 +3734,7 @@ async def test_get_or_create_http_bridge_session_honors_passed_prompt_cache_idle
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3580,12 +3745,15 @@ async def test_get_or_create_http_bridge_session_honors_passed_prompt_cache_idle
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3650,6 +3818,7 @@ async def test_v1_responses_http_bridge_reuses_upstream_websocket_and_preserves_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3660,12 +3829,15 @@ async def test_v1_responses_http_bridge_reuses_upstream_websocket_and_preserves_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3707,6 +3879,10 @@ async def test_v1_responses_http_bridge_reuses_upstream_websocket_and_preserves_
         "instructions": "Return exactly OK.",
         "input": "hello",
         "prompt_cache_key": "http-bridge-thread-1",
+        "client_metadata": {
+            "keep": "yes",
+            "x-codex-installation-id": "client-spoofed-installation-id",
+        },
     }
     first = await async_client.post("/v1/responses", json=payload)
     assert first.status_code == 200
@@ -3723,7 +3899,522 @@ async def test_v1_responses_http_bridge_reuses_upstream_websocket_and_preserves_
     assert second_body["id"] == "resp_bridge_2"
     assert connect_calls == [(account_id, account.chatgpt_account_id)]
     assert len(fake_upstream.sent_text) == 2
+    first_upstream_payload = json.loads(fake_upstream.sent_text[0])
+    assert first_upstream_payload["client_metadata"]["keep"] == "yes"
+    assert first_upstream_payload["client_metadata"]["x-codex-installation-id"] == account.codex_installation_id
+    assert first_upstream_payload["client_metadata"]["x-codex-installation-id"] != "client-spoofed-installation-id"
     assert json.loads(fake_upstream.sent_text[1])["previous_response_id"] == "resp_bridge_1"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_injects_interrupted_custom_tool_output_on_followup(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_custom_interrupt",
+        "http-bridge-custom-interrupt@example.com",
+    )
+    account = await _get_account(account_id)
+    fake_upstream = _InterruptedCustomToolUpstreamWebSocket()
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    interrupted_user_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+            }
+        ],
+    }
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "run the shell tool"}]}],
+            "prompt_cache_key": "http-bridge-custom-interrupt-1",
+        },
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["id"] == "resp_bridge_custom_1"
+
+    second = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "previous_response_id": first_body["id"],
+            "input": [interrupted_user_message],
+            "prompt_cache_key": "http-bridge-custom-interrupt-1",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == "resp_bridge_custom_2"
+
+    assert len(fake_upstream.sent_text) == 2
+    second_upstream_payload = json.loads(fake_upstream.sent_text[1])
+    assert second_upstream_payload["previous_response_id"] == "resp_bridge_custom_1"
+    interrupted_tool_output = (
+        "Tool call was not executed because the previous turn was interrupted before tool output was available."
+    )
+    assert second_upstream_payload["input"][0] == {
+        "type": "custom_tool_call_output",
+        "call_id": "call_custom_shell",
+        "output": interrupted_tool_output,
+    }
+    assert second_upstream_payload["input"][1] == interrupted_user_message
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_size_guard_covers_injected_interrupted_tool_outputs(
+    async_client,
+    monkeypatch,
+    tmp_path,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 10_000_000)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 10_000_000)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_custom_interrupt_size",
+        "http-bridge-custom-interrupt-size@example.com",
+    )
+    account = await _get_account(account_id)
+    # Blank installation id makes the submit-time account-installation rewrite
+    # a no-op, so no later serialization step would re-run the size guard;
+    # the injection path itself must keep the request within the limit.
+    account.codex_installation_id = ""
+    fake_upstream = _InterruptedCustomToolUpstreamWebSocket()
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    original_prepare = proxy_module.ProxyService._prepare_http_bridge_request
+    followup_cap_armed = False
+
+    def capping_prepare(self, payload, headers, **kwargs):
+        nonlocal followup_cap_armed
+        request_state, text_data = original_prepare(self, payload, headers, **kwargs)
+        if not followup_cap_armed and '"previous_response_id":"resp_bridge_custom_1"' in text_data:
+            # The anchored follow-up fits the limit as sent by the client;
+            # prepending synthetic interrupted outputs pushes it over.
+            followup_cap_armed = True
+            proxy_module._UPSTREAM_RESPONSE_CREATE_MAX_BYTES = len(text_data.encode("utf-8")) + 100
+        return request_state, text_data
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_prepare_http_bridge_request", capping_prepare)
+
+    interrupted_user_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+            }
+        ],
+    }
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "run the shell tool"}]}],
+            "prompt_cache_key": "http-bridge-custom-interrupt-size-1",
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["id"] == "resp_bridge_custom_1"
+
+    second = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "previous_response_id": "resp_bridge_custom_1",
+            "input": [interrupted_user_message],
+            "prompt_cache_key": "http-bridge-custom-interrupt-size-1",
+        },
+    )
+
+    assert followup_cap_armed is True
+    assert second.status_code == 413
+    error = second.json()["error"]
+    assert error["code"] == "payload_too_large"
+    assert error["type"] == "invalid_request_error"
+    # The over-limit injected request must never be forwarded upstream.
+    assert len(fake_upstream.sent_text) == 1
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_injected_interrupted_outputs_update_stored_input_context(
+    async_client,
+    monkeypatch,
+    app_instance,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_custom_interrupt_ctx",
+        "http-bridge-custom-interrupt-ctx@example.com",
+    )
+    account = await _get_account(account_id)
+    fake_upstream = _InterruptedCustomToolUpstreamWebSocket()
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    interrupted_user_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+            }
+        ],
+    }
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "run the shell tool"}]}],
+            "prompt_cache_key": "http-bridge-custom-interrupt-ctx-1",
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["id"] == "resp_bridge_custom_1"
+
+    second = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Use the shell tool.",
+            "previous_response_id": "resp_bridge_custom_1",
+            "input": [interrupted_user_message],
+            "prompt_cache_key": "http-bridge-custom-interrupt-ctx-1",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == "resp_bridge_custom_2"
+
+    assert len(fake_upstream.sent_text) == 2
+    second_upstream_input = json.loads(fake_upstream.sent_text[1])["input"]
+    assert len(second_upstream_input) == 2
+    assert second_upstream_input[0]["type"] == "custom_tool_call_output"
+    assert second_upstream_input[1]["role"] == "user"
+
+    service = get_proxy_service_for_app(app_instance)
+    session = None
+    for _ in range(100):
+        session = next(
+            (
+                candidate
+                for candidate in service._http_bridge_sessions.values()
+                if candidate.last_completed_response_id == "resp_bridge_custom_2"
+            ),
+            None,
+        )
+        if session is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert session is not None
+    # The stored context for the completed response must describe the
+    # upstream-shaped input (synthetic output + follow-up message), not the
+    # client-only input, so later full-resend/anchor comparisons on this
+    # bridge session match what upstream actually stored.
+    assert session.last_completed_input_count == len(second_upstream_input) == 2
+    assert session.last_completed_input_prefix_fingerprint == proxy_module._fingerprint_input_items(
+        second_upstream_input
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_trims_replayed_apply_patch_previous_response_prefix(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_apply_patch_trim",
+        "http-bridge-apply-patch-trim@example.com",
+    )
+    account = await _get_account(account_id)
+    fake_upstream = _FakeBridgeUpstreamWebSocket()
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Apply the patch.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "apply the patch"}]}],
+            "prompt_cache_key": "http-bridge-apply-patch-trim-1",
+        },
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["id"] == "resp_bridge_1"
+
+    replayed_apply_patch_call = {
+        "id": "apc_replay",
+        "type": "apply_patch_call",
+        "status": "completed",
+        "call_id": "call_patch_1",
+    }
+    replayed_apply_patch_output = {
+        "type": "apply_patch_call_output",
+        "call_id": "call_patch_1",
+        "status": "completed",
+        "output": "patched",
+    }
+    next_user_message = {"role": "user", "content": [{"type": "input_text", "text": "now run the tests"}]}
+    second = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Apply the patch.",
+            "previous_response_id": first_body["id"],
+            "input": [replayed_apply_patch_call, replayed_apply_patch_output, next_user_message],
+            "prompt_cache_key": "http-bridge-apply-patch-trim-1",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == "resp_bridge_2"
+
+    assert len(fake_upstream.sent_text) == 2
+    second_upstream_payload = json.loads(fake_upstream.sent_text[1])
+    assert second_upstream_payload["previous_response_id"] == "resp_bridge_1"
+    # The replayed apply_patch_call prefix is already covered by the
+    # previous_response_id anchor and must be trimmed like the WebSocket
+    # route trims it; the output item and the new user turn are forwarded.
+    assert second_upstream_payload["input"] == [replayed_apply_patch_output, next_user_message]
 
 
 @pytest.mark.asyncio
@@ -3747,6 +4438,7 @@ async def test_backend_responses_http_bridge_reuses_upstream_websocket_and_prese
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3757,12 +4449,15 @@ async def test_backend_responses_http_bridge_reuses_upstream_websocket_and_prese
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -3846,6 +4541,7 @@ async def test_backend_responses_http_bridge_prefers_codex_session_header_over_p
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3856,7 +4552,9 @@ async def test_backend_responses_http_bridge_prefers_codex_session_header_over_p
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
@@ -3950,6 +4648,7 @@ async def test_backend_responses_http_emits_turn_state_header_and_reuses_when_re
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -3960,7 +4659,9 @@ async def test_backend_responses_http_emits_turn_state_header_and_reuses_when_re
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
@@ -4051,6 +4752,7 @@ async def test_v1_responses_http_bridge_reuses_session_across_model_change_for_p
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4061,12 +4763,15 @@ async def test_v1_responses_http_bridge_reuses_session_across_model_change_for_p
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4148,6 +4853,7 @@ async def test_v1_responses_http_bridge_recovers_previous_response_id_across_key
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4158,12 +4864,15 @@ async def test_v1_responses_http_bridge_recovers_previous_response_id_across_key
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4243,6 +4952,7 @@ async def test_v1_responses_http_emits_turn_state_header_and_reuses_when_replaye
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4253,7 +4963,9 @@ async def test_v1_responses_http_emits_turn_state_header_and_reuses_when_replaye
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
@@ -4333,6 +5045,7 @@ async def test_v1_responses_http_bridge_streaming_path_uses_persistent_upstream_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4343,12 +5056,15 @@ async def test_v1_responses_http_bridge_streaming_path_uses_persistent_upstream_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4397,7 +5113,7 @@ async def test_v1_responses_http_bridge_streaming_path_uses_persistent_upstream_
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
 
-    events = [json.loads(line[6:]) for line in lines]
+    events = [json.loads(line[6:]) for line in lines if line[6:] != "[DONE]"]
     _assert_created_text_delta_completed(events)
     assert connect_count == 1
 
@@ -4534,6 +5250,7 @@ async def test_backend_responses_http_bridge_refresh_failure_returns_proxy_error
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4544,12 +5261,15 @@ async def test_backend_responses_http_bridge_refresh_failure_returns_proxy_error
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4600,6 +5320,7 @@ async def test_v1_responses_http_bridge_refresh_failure_returns_proxy_error(asyn
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4610,12 +5331,15 @@ async def test_v1_responses_http_bridge_refresh_failure_returns_proxy_error(asyn
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4665,6 +5389,7 @@ async def test_v1_responses_http_bridge_transient_refresh_failure_returns_upstre
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4675,12 +5400,15 @@ async def test_v1_responses_http_bridge_transient_refresh_failure_returns_upstre
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4736,6 +5464,7 @@ async def test_v1_responses_http_bridge_does_not_register_turn_state_alias_befor
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4746,12 +5475,15 @@ async def test_v1_responses_http_bridge_does_not_register_turn_state_alias_befor
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4845,6 +5577,7 @@ async def test_v1_responses_http_bridge_reconnects_after_clean_upstream_close(as
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4855,12 +5588,15 @@ async def test_v1_responses_http_bridge_reconnects_after_clean_upstream_close(as
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -4937,6 +5673,7 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -4947,12 +5684,15 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5035,6 +5775,7 @@ async def test_v1_responses_http_bridge_reuses_derived_prompt_cache_key_when_cli
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5045,12 +5786,15 @@ async def test_v1_responses_http_bridge_reuses_derived_prompt_cache_key_when_cli
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5119,6 +5863,7 @@ async def test_v1_responses_http_bridge_prefers_session_header_for_isolation(asy
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5129,12 +5874,15 @@ async def test_v1_responses_http_bridge_prefers_session_header_for_isolation(asy
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5199,6 +5947,7 @@ async def test_v1_responses_http_bridge_retries_once_when_upstream_closes_before
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5209,12 +5958,15 @@ async def test_v1_responses_http_bridge_retries_once_when_upstream_closes_before
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5327,6 +6079,7 @@ async def test_v1_responses_http_bridge_slims_historical_inline_artifacts_and_su
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5337,12 +6090,15 @@ async def test_v1_responses_http_bridge_slims_historical_inline_artifacts_and_su
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5419,6 +6175,7 @@ async def test_v1_responses_http_bridge_does_not_evict_active_session_when_pool_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5429,12 +6186,15 @@ async def test_v1_responses_http_bridge_does_not_evict_active_session_when_pool_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5550,12 +6310,20 @@ async def test_v1_responses_http_bridge_does_not_evict_active_session_when_pool_
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_is_full(
+async def test_v1_responses_http_bridge_times_out_queued_request_on_bounded_startup_gate_wait(
     async_client,
     app_instance,
     monkeypatch,
 ):
-    _install_bridge_settings_with_limits(monkeypatch, enabled=True, max_sessions=1)
+    _install_bridge_settings_with_limits(
+        monkeypatch,
+        enabled=True,
+        max_sessions=1,
+        # Queued HTTP bridge requests have already claimed the bridge queue slot,
+        # so we still wait for the per-session response-create gate, but only
+        # until the bounded startup timeout.
+        admission_wait_timeout_seconds=0.01,
+    )
     account_id = await _import_account(
         async_client,
         "acc_http_bridge_queued_capacity",
@@ -5571,6 +6339,7 @@ async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5581,12 +6350,15 @@ async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5667,52 +6439,19 @@ async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_
         )
     )
     await asyncio.sleep(0)
-
-    assert await service._http_bridge_pending_count(first_session) == 1
-    async with first_session.pending_lock:
-        assert list(first_session.pending_requests) == []
-        assert first_session.queued_request_count == 1
-
-    second_payload = proxy_module.ResponsesRequest(
-        model="gpt-5.1",
-        instructions="Return exactly OK.",
-        input="new-session",
-        prompt_cache_key="queued-session-b",
-    )
-    second_affinity = proxy_module._sticky_key_for_responses_request(
-        second_payload,
-        {},
-        codex_session_affinity=False,
-        openai_cache_affinity=True,
-        openai_cache_affinity_max_age_seconds=300,
-        sticky_threads_enabled=False,
-        api_key=None,
-    )
-    second_key = proxy_module._make_http_bridge_session_key(
-        second_payload,
-        headers={},
-        affinity=second_affinity,
-        api_key=None,
-        request_id="req_queue_b",
-    )
+    await asyncio.sleep(0.05)
     with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
-        await service._get_or_create_http_bridge_session(
-            second_key,
-            headers={},
-            affinity=second_affinity,
-            api_key=None,
-            request_model="gpt-5.1",
-            idle_ttl_seconds=120.0,
-            max_sessions=1,
-        )
-
+        await asyncio.wait_for(submit_task, timeout=0.2)
     exc = exc_info.value
     assert exc.status_code == 429
-    assert hanging_upstream.closed is False
+    assert exc.payload["error"]["code"] == "response_create_gate_timeout"
+    assert exc.payload["error"]["type"] == "rate_limit_error"
 
-    submit_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await submit_task
+    assert await service._http_bridge_pending_count(first_session) == 0
+    async with first_session.pending_lock:
+        assert list(first_session.pending_requests) == []
+        assert first_session.queued_request_count == 0
+
     first_session.response_create_gate.release()
     await service._close_http_bridge_session(first_session)
 
@@ -5735,6 +6474,7 @@ async def test_v1_responses_http_bridge_enforces_queue_limit_atomically_for_same
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -5745,12 +6485,15 @@ async def test_v1_responses_http_bridge_enforces_queue_limit_atomically_for_same
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -5871,8 +6614,22 @@ async def test_v1_responses_http_bridge_creates_different_session_keys_in_parall
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.append(key.affinity_key)
         create_started_events[key.affinity_key].set()
         await _wait_for_event(release_create)
@@ -5937,6 +6694,7 @@ async def test_v1_responses_http_bridge_singleflights_same_session_key_during_cr
         app_settings=_make_app_settings(
             enabled=True,
             max_sessions=8,
+            admission_wait_timeout_seconds=1.0,
             codex_idle_ttl_seconds=120.0,
             instance_id="instance-a",
             instance_ring=[],
@@ -5957,8 +6715,22 @@ async def test_v1_responses_http_bridge_singleflights_same_session_key_during_cr
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.append(key.affinity_key)
         create_started_event.set()
         await _wait_for_event(release_create)
@@ -6045,8 +6817,22 @@ async def test_v1_responses_http_bridge_waits_for_inflight_capacity_before_rate_
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_attempts.append(key.affinity_key)
         if key.affinity_key == "bridge-capacity-a":
             first_create_started.set()
@@ -6110,6 +6896,7 @@ async def test_v1_responses_http_bridge_singleflight_follower_refreshes_session_
         app_settings=_make_app_settings(
             enabled=True,
             max_sessions=8,
+            admission_wait_timeout_seconds=1.0,
             codex_idle_ttl_seconds=120.0,
             instance_id="instance-a",
             instance_ring=[],
@@ -6129,8 +6916,22 @@ async def test_v1_responses_http_bridge_singleflight_follower_refreshes_session_
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.set()
         await _wait_for_event(release_create)
         session = _make_dummy_bridge_session(key)
@@ -6196,6 +6997,7 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
         app_settings=_make_app_settings(
             enabled=True,
             max_sessions=8,
+            admission_wait_timeout_seconds=1.0,
             codex_idle_ttl_seconds=120.0,
             instance_id="instance-a",
             instance_ring=[],
@@ -6206,6 +7008,7 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
     create_started = asyncio.Event()
     release_create = asyncio.Event()
     create_calls: list[list[str]] = []
+    durable_claims: list[tuple[str, bool]] = []
     stale_account_id = await _import_account(
         async_client,
         "acc_http_bridge_stale",
@@ -6226,14 +7029,30 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_calls.append(list(api_key.assigned_account_ids if api_key is not None else []))
         if len(create_calls) == 1:
             create_started.set()
             await _wait_for_event(release_create)
             session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(key))
             cast(Any, session).account = SimpleNamespace(id=stale_account_id, status=AccountStatus.ACTIVE)
+            session.queued_request_count = 1
+            session.upstream_control.retire_after_drain = True
             return session
         session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(key))
         cast(Any, session).account = SimpleNamespace(id=fresh_account_id, status=AccountStatus.ACTIVE)
@@ -6241,7 +7060,26 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
 
     monkeypatch.setattr(proxy_module.ProxyService, "_create_http_bridge_session", fake_create_http_bridge_session)
 
-    key = proxy_module._HTTPBridgeSessionKey("session_header", "shared-session", "key-assignments")
+    async def fake_claim_durable_http_bridge_session(
+        self,
+        session,
+        *,
+        allow_takeover,
+        force_owner_epoch_advance=False,
+    ):
+        del self, allow_takeover
+        durable_claims.append((session.account.id, force_owner_epoch_advance))
+        session.durable_session_id = "durable-session"
+        session.durable_owner_epoch = 2 if force_owner_epoch_advance else 1
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_claim_durable_http_bridge_session",
+        fake_claim_durable_http_bridge_session,
+    )
+
+    session_header = f"shared-session-{stale_account_id}"
+    key = proxy_module._HTTPBridgeSessionKey("session_header", session_header, "key-assignments")
     stale_api_key = _make_api_key_data(key_id="key-assignments", assigned_account_ids=[stale_account_id])
     refreshed_api_key = _make_api_key_data(key_id="key-assignments", assigned_account_ids=[fresh_account_id])
 
@@ -6249,9 +7087,9 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
         creator = asyncio.create_task(
             service._get_or_create_http_bridge_session(
                 key,
-                headers={"session_id": "shared-session"},
+                headers={"session_id": session_header},
                 affinity=proxy_module._AffinityPolicy(
-                    key="shared-session",
+                    key=session_header,
                     kind=proxy_module.StickySessionKind.CODEX_SESSION,
                 ),
                 api_key=stale_api_key,
@@ -6264,9 +7102,9 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
         follower = asyncio.create_task(
             service._get_or_create_http_bridge_session(
                 key,
-                headers={"session_id": "shared-session"},
+                headers={"session_id": session_header},
                 affinity=proxy_module._AffinityPolicy(
-                    key="shared-session",
+                    key=session_header,
                     kind=proxy_module.StickySessionKind.CODEX_SESSION,
                 ),
                 api_key=refreshed_api_key,
@@ -6283,6 +7121,7 @@ async def test_v1_responses_http_bridge_singleflight_follower_replaces_session_w
         assert follower_session.account.id == fresh_account_id
         assert service._http_bridge_sessions[key] is follower_session
         assert create_calls == [[stale_account_id], [fresh_account_id]]
+        assert durable_claims == [(stale_account_id, False), (fresh_account_id, True)]
     finally:
         service._http_bridge_sessions.clear()
         service._http_bridge_inflight_sessions.clear()
@@ -6301,6 +7140,7 @@ async def test_v1_responses_http_bridge_singleflights_stale_session_replacement(
         app_settings=_make_app_settings(
             enabled=True,
             max_sessions=8,
+            admission_wait_timeout_seconds=1.0,
             codex_idle_ttl_seconds=120.0,
             instance_id="instance-a",
             instance_ring=[],
@@ -6319,8 +7159,22 @@ async def test_v1_responses_http_bridge_singleflights_stale_session_replacement(
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.append(key.affinity_key)
         await asyncio.sleep(0.2)
         return _make_dummy_bridge_session(key)
@@ -6397,8 +7251,22 @@ async def test_v1_responses_http_bridge_cleans_up_cancelled_singleflight_creator
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         nonlocal create_attempts
         create_attempts += 1
         if create_attempts == 1:
@@ -6478,8 +7346,22 @@ async def test_v1_responses_http_bridge_cleans_up_cancelled_singleflight_creator
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         nonlocal create_attempts
         create_attempts += 1
         if create_attempts == 1:
@@ -6559,8 +7441,22 @@ async def test_v1_responses_http_bridge_waits_for_inflight_session_before_contin
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.set()
         await _wait_for_event(release_create)
         return _make_dummy_bridge_session(key)
@@ -6642,8 +7538,22 @@ async def test_v1_responses_http_bridge_prunes_idle_session_before_reuse(app_ins
         api_key,
         request_model,
         idle_ttl_seconds,
+        request_stage="first_turn",
+        preferred_account_id=None,
+        require_preferred_account=False,
+        fallback_on_preferred_account_unavailable=True,
     ):
-        del self, headers, affinity, request_model, idle_ttl_seconds
+        del (
+            self,
+            headers,
+            affinity,
+            request_model,
+            idle_ttl_seconds,
+            request_stage,
+            preferred_account_id,
+            require_preferred_account,
+            fallback_on_preferred_account_unavailable,
+        )
         create_started.append(key.affinity_key)
         return _make_dummy_bridge_session(key)
 
@@ -6692,6 +7602,7 @@ async def test_v1_responses_http_bridge_stream_failure_remains_valid_sse(async_c
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -6702,12 +7613,15 @@ async def test_v1_responses_http_bridge_stream_failure_remains_valid_sse(async_c
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -6753,8 +7667,9 @@ async def test_v1_responses_http_bridge_stream_failure_remains_valid_sse(async_c
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
 
-    events = [json.loads(line[6:]) for line in lines]
+    events = [json.loads(line[6:]) for line in lines if line[6:] != "[DONE]"]
     assert [event["type"] for event in events] == ["response.created", "response.failed"]
+    assert events[0]["response"]["id"] == events[-1]["response"]["id"]
     assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
 
 
@@ -6775,6 +7690,7 @@ async def test_v1_responses_http_bridge_surfaces_upstream_error_event_as_http_40
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -6785,12 +7701,15 @@ async def test_v1_responses_http_bridge_surfaces_upstream_error_event_as_http_40
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -6860,6 +7779,7 @@ async def test_v1_responses_http_bridge_preserves_rate_limit_metadata_in_429(asy
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -6870,7 +7790,9 @@ async def test_v1_responses_http_bridge_preserves_rate_limit_metadata_in_429(asy
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         return AccountSelection(account=account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
@@ -6923,6 +7845,7 @@ async def test_v1_responses_http_bridge_cancellation_releases_queued_slot(async_
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -6933,12 +7856,15 @@ async def test_v1_responses_http_bridge_cancellation_releases_queued_slot(async_
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7043,6 +7969,7 @@ async def test_v1_responses_http_bridge_send_retry_restarts_reader(async_client,
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7053,12 +7980,15 @@ async def test_v1_responses_http_bridge_send_retry_restarts_reader(async_client,
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7285,6 +8215,7 @@ async def test_v1_responses_http_bridge_send_failure_returns_upstream_unavailabl
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7295,12 +8226,15 @@ async def test_v1_responses_http_bridge_send_failure_returns_upstream_unavailabl
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7391,6 +8325,7 @@ async def test_v1_responses_http_bridge_precreated_disconnect_returns_upstream_u
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7401,12 +8336,15 @@ async def test_v1_responses_http_bridge_precreated_disconnect_returns_upstream_u
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7501,6 +8439,7 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7511,12 +8450,15 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7613,6 +8555,7 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_invalid_request_p
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7623,12 +8566,15 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_invalid_request_p
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7717,6 +8663,7 @@ async def test_v1_responses_http_bridge_masks_anonymous_previous_response_not_fo
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7727,12 +8674,15 @@ async def test_v1_responses_http_bridge_masks_anonymous_previous_response_not_fo
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7841,6 +8791,7 @@ async def test_v1_responses_http_bridge_keeps_session_alive_after_foreign_previo
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7851,12 +8802,15 @@ async def test_v1_responses_http_bridge_keeps_session_alive_after_foreign_previo
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -7955,6 +8909,7 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_foreign
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -7965,12 +8920,15 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_foreign
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8068,6 +9026,7 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_anonymo
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -8078,12 +9037,15 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_anonymo
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8205,6 +9167,7 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -8215,12 +9178,15 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8370,6 +9336,7 @@ async def test_v1_responses_http_bridge_stream_masks_anonymous_previous_response
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -8380,12 +9347,15 @@ async def test_v1_responses_http_bridge_stream_masks_anonymous_previous_response
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8530,6 +9500,7 @@ async def test_v1_responses_http_bridge_send_retry_keeps_session_open_for_follow
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -8540,12 +9511,15 @@ async def test_v1_responses_http_bridge_send_retry_keeps_session_open_for_follow
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8644,7 +9618,7 @@ async def test_v1_responses_http_bridge_send_retry_keeps_session_open_for_follow
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_stream_cancel_detaches_pending_request(
+async def test_v1_responses_http_bridge_stream_cancel_retires_session(
     async_client,
     app_instance,
     monkeypatch,
@@ -8665,6 +9639,7 @@ async def test_v1_responses_http_bridge_stream_cancel_detaches_pending_request(
         *,
         request_id,
         kind,
+        request_stage="first_turn",
         sticky_key,
         sticky_kind,
         reallocate_sticky,
@@ -8675,12 +9650,15 @@ async def test_v1_responses_http_bridge_stream_cancel_detaches_pending_request(
         exclude_account_ids=None,
         additional_limit_name=None,
         api_key=None,
+        preferred_account_id=None,
     ):
+        del preferred_account_id
         del (
             self,
             deadline,
             request_id,
             kind,
+            request_stage,
             sticky_key,
             sticky_kind,
             reallocate_sticky,
@@ -8746,8 +9724,11 @@ async def test_v1_responses_http_bridge_stream_cancel_detaches_pending_request(
     async with service._http_bridge_lock:
         session = service._http_bridge_sessions[session_key]
     async with session.pending_lock:
-        assert list(session.pending_requests) == []
+        assert not session.pending_requests
         assert session.queued_request_count == 0
+    assert session.closed is True
+    assert session.upstream_control.retire_after_drain is True
+    assert fake_upstream.closed is True
 
 
 @pytest.mark.asyncio

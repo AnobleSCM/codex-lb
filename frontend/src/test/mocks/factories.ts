@@ -25,10 +25,13 @@ import {
 	ApiKeyTrendsResponseSchema,
 	ApiKeyUsage7DayResponseSchema,
 } from "@/features/apis/schemas";
+import type { ModelSource } from "@/features/model-sources/schemas";
+import { ModelSourceSchema } from "@/features/model-sources/schemas";
 import type { AuthSession } from "@/features/auth/schemas";
 import { AuthSessionSchema } from "@/features/auth/schemas";
 import type {
 	DashboardOverview,
+	DashboardProjections,
 	RequestLog,
 	RequestLogFilterOptions,
 	RequestLogsResponse,
@@ -37,31 +40,48 @@ import type {
 import {
 	DEFAULT_OVERVIEW_TIMEFRAME,
 	DashboardOverviewSchema,
+	DashboardProjectionsSchema,
 	RequestLogFilterOptionsSchema,
 	RequestLogSchema,
 	RequestLogsResponseSchema,
 } from "@/features/dashboard/schemas";
-import type { DashboardSettings } from "@/features/settings/schemas";
-import { DashboardSettingsSchema } from "@/features/settings/schemas";
+import type { DashboardSettings, UpstreamProxyAdmin } from "@/features/settings/schemas";
+import { DashboardSettingsSchema, UpstreamProxyAdminSchema } from "@/features/settings/schemas";
+import type {
+	QuotaPlannerDecision,
+	QuotaPlannerForecast,
+	QuotaPlannerSettings,
+} from "@/features/quota-planner/schemas";
+import {
+	QuotaPlannerDecisionSchema,
+	QuotaPlannerForecastSchema,
+	QuotaPlannerSettingsSchema,
+	QuotaPlannerWarmupActionResponseSchema,
+} from "@/features/quota-planner/schemas";
 
 // Backward-compatible type aliases
 export type RequestLogEntry = RequestLog;
 export type DashboardAuthSession = AuthSession;
+export type { QuotaPlannerDecision, QuotaPlannerForecast, QuotaPlannerSettings };
+export type QuotaPlannerWarmupActionResponse = z.infer<typeof QuotaPlannerWarmupActionResponseSchema>;
 export type OauthCompleteResponse = z.infer<typeof OauthCompleteResponseSchema>;
 
 export type {
 	AccountSummary,
 	AccountTrendsResponse,
 	DashboardOverview,
+	DashboardProjections,
 	RequestLogsResponse,
 	RequestLogFilterOptions,
 	DashboardSettings,
+	UpstreamProxyAdmin,
 	OauthStartResponse,
 	OauthStatusResponse,
 	ApiKey,
 	ApiKeyCreateResponse,
 	ApiKeyTrendsResponse,
 	ApiKeyUsage7DayResponse,
+	ModelSource,
 };
 
 const BASE_TIME = new Date("2026-01-01T12:00:00Z");
@@ -75,25 +95,41 @@ export function createAccountSummary(
 ): AccountSummary {
 	return AccountSummarySchema.parse({
 		accountId: "acc_primary",
+		chatgptAccountId: "chatgpt_acc_primary",
 		email: "primary@example.com",
+		alias: null,
 		displayName: "primary@example.com",
 		planType: "plus",
+		routingPolicy: "normal",
 		status: "active",
+		securityWorkAuthorized: false,
 		usage: {
 			primaryRemainingPercent: 82,
 			secondaryRemainingPercent: 67,
+			monthlyRemainingPercent: null,
 		},
 		resetAtPrimary: offsetIso(60),
 		resetAtSecondary: offsetIso(24 * 60),
+		resetAtMonthly: null,
 		windowMinutesPrimary: 300,
 		windowMinutesSecondary: 10_080,
+		windowMinutesMonthly: null,
+		capacityCreditsPrimary: 225,
+		remainingCreditsPrimary: 184.5,
 		capacityCreditsSecondary: 7_560,
 		remainingCreditsSecondary: 5_065.2,
+		capacityCreditsMonthly: null,
+		remainingCreditsMonthly: null,
+		creditsHas: true,
+		creditsUnlimited: false,
+		creditsBalance: 932,
 		auth: {
 			access: { expiresAt: offsetIso(30), state: null },
 			refresh: { state: "stored" },
 			idToken: { state: "parsed" },
 		},
+		limitWarmupEnabled: false,
+		limitWarmup: null,
 		...overrides,
 	});
 }
@@ -112,6 +148,52 @@ export function createDefaultAccounts(): AccountSummary[] {
 			},
 		}),
 	];
+}
+
+export function createModelSource(
+	overrides: Partial<ModelSource> = {},
+): ModelSource {
+	return ModelSourceSchema.parse({
+		id: "src_vllm",
+		name: "vLLM",
+		kind: "openai_compatible",
+		baseUrl: "http://localhost:8000/v1",
+		isEnabled: true,
+		healthStatus: "unknown",
+		supportsChatCompletions: true,
+		supportsResponses: false,
+		supportsAudioTranscriptions: false,
+		timeoutSeconds: null,
+		maxConcurrency: null,
+		createdAt: offsetIso(-30),
+		updatedAt: offsetIso(-5),
+		models: [
+			{
+				id: 1,
+				sourceId: "src_vllm",
+				model: "local-coder",
+				displayName: "local-coder",
+				contextWindow: 8192,
+				maxOutputTokens: 1024,
+				supportsStreaming: true,
+				supportsTools: true,
+				supportsVision: false,
+				inputPer1M: null,
+				cachedInputPer1M: null,
+				outputPer1M: null,
+				audioPerMinute: null,
+				rawMetadataJson: null,
+				isEnabled: true,
+				createdAt: offsetIso(-30),
+				updatedAt: offsetIso(-5),
+			},
+		],
+		...overrides,
+	});
+}
+
+export function createDefaultModelSources(): ModelSource[] {
+	return [createModelSource()];
 }
 
 function createTrendPoints(
@@ -244,6 +326,31 @@ export function createDashboardOverview(
 	return DashboardOverviewSchema.parse(response);
 }
 
+export function createDashboardProjections(
+	overrides: Partial<DashboardProjections> = {},
+): DashboardProjections {
+	return DashboardProjectionsSchema.parse({
+		depletionPrimary: {
+			risk: 0.55,
+			riskLevel: "warning" as const,
+			burnRate: 1.1,
+			safeUsagePercent: 72.0,
+			projectedExhaustionAt: null,
+			secondsUntilExhaustion: null,
+		},
+		depletionSecondary: {
+			risk: 0.65,
+			riskLevel: "warning" as const,
+			burnRate: 1.4,
+			safeUsagePercent: 58.0,
+			projectedExhaustionAt: null,
+			secondsUntilExhaustion: null,
+		},
+		weeklyCreditPace: null,
+		...overrides,
+	});
+}
+
 export function createRequestLogEntry(
 	overrides: Partial<RequestLogEntry> = {},
 ): RequestLogEntry {
@@ -253,8 +360,13 @@ export function createRequestLogEntry(
 		apiKeyId: "key_1",
 		apiKeyName: "Primary Key",
 		requestId: "req_1",
+		requestKind: "normal",
 		model: "gpt-5.1",
+		source: null,
 		transport: "http",
+		useragent: null,
+		useragentGroup: null,
+		clientIp: null,
 		serviceTier: null,
 		requestedServiceTier: null,
 		actualServiceTier: null,
@@ -262,9 +374,17 @@ export function createRequestLogEntry(
 		errorCode: null,
 		errorMessage: null,
 		tokens: 1800,
+		inputTokens: 1200,
+		outputTokens: 600,
 		cachedInputTokens: 320,
 		reasoningEffort: null,
 		costUsd: 0.0132,
+		costBreakdown: {
+			inputUsd: 0.0054,
+			cachedInputUsd: 0.0012,
+			outputUsd: 0.0066,
+			totalUsd: 0.0132,
+		},
 		latencyMs: 920,
 		...overrides,
 	});
@@ -339,8 +459,15 @@ export function createDashboardAuthSession(
 		passwordRequired: true,
 		totpRequiredOnLogin: false,
 		totpConfigured: true,
+		bootstrapRequired: false,
+		bootstrapTokenConfigured: false,
 		authMode: "standard",
 		passwordManagementEnabled: true,
+		passwordSessionActive: false,
+		role: "admin",
+		permissions: ["read", "write"],
+		guestAccessEnabled: false,
+		guestPasswordRequired: false,
 		...overrides,
 	});
 }
@@ -349,16 +476,148 @@ export function createDashboardSettings(
 	overrides: Partial<DashboardSettings> = {},
 ): DashboardSettings {
 	return DashboardSettingsSchema.parse({
-		stickyThreadsEnabled: true,
-		upstreamStreamTransport: "default",
+			stickyThreadsEnabled: true,
+			upstreamStreamTransport: "default",
+			httpDownstreamTransportPolicy: "smart",
+			upstreamProxyRoutingEnabled: false,
+		upstreamProxyDefaultPoolId: null,
 		preferEarlierResetAccounts: false,
+		preferEarlierResetWindow: "secondary",
 		routingStrategy: "usage_weighted",
+		relativeAvailabilityPower: 2,
+		relativeAvailabilityTopK: 5,
+		singleAccountId: null,
+		weeklyPaceWorkingDays: "0,1,2,3,4,5,6",
+		weeklyPaceSmoothingMinutes: 30,
 		openaiCacheAffinityMaxAgeSeconds: 300,
 		dashboardSessionTtlSeconds: 31536000,
+		stickyReallocationBudgetThresholdPct: 95,
+		stickyReallocationPrimaryBudgetThresholdPct: 95,
+		stickyReallocationSecondaryBudgetThresholdPct: 100,
+		warmupModel: "gpt-5.4-mini",
 		importWithoutOverwrite: false,
 		totpRequiredOnLogin: false,
 		totpConfigured: true,
 		apiKeyAuthEnabled: true,
+		hideUpstreamQuotaFromApiKeys: false,
+		limitWarmupEnabled: false,
+		limitWarmupWindows: "both",
+		limitWarmupModel: "auto",
+		limitWarmupPrompt: "Say OK.",
+		limitWarmupCooldownSeconds: 3600,
+		limitWarmupExhaustedThresholdPercent: 99,
+		limitWarmupMinAvailablePercent: 100,
+		guestAccessEnabled: false,
+		guestPasswordConfigured: false,
+		limitWarmupStaggeredIdleEnabled: false,
+		...overrides,
+	});
+}
+
+export function createQuotaPlannerSettings(
+	overrides: Partial<QuotaPlannerSettings> = {},
+): QuotaPlannerSettings {
+	return QuotaPlannerSettingsSchema.parse({
+		mode: "shadow",
+		timezone: "UTC",
+		workingDays: [0, 1, 2, 3, 4],
+		workingHoursStart: "09:00",
+		workingHoursEnd: "18:00",
+		prewarmEnabled: true,
+		prewarmLeadMinutes: 300,
+		maxWarmupsPerDay: 3,
+		maxWarmupCreditsPerDay: 0,
+		minExpectedGain: 1,
+		forecastQuantile: "p75",
+		allowSyntheticTraffic: false,
+		warmupModelPreference: null,
+		dryRun: true,
+		...overrides,
+	});
+}
+
+export function createQuotaPlannerDecision(
+	overrides: Partial<QuotaPlannerDecision> = {},
+): QuotaPlannerDecision {
+	return QuotaPlannerDecisionSchema.parse({
+		id: "decision_1",
+		createdAt: new Date().toISOString(),
+		mode: "shadow",
+		accountId: "acc_primary",
+		action: "reserve",
+		scheduledAt: new Date().toISOString(),
+		executedAt: null,
+		score: 12.5,
+		reason: "forecast_phase_alignment",
+		status: "skipped",
+		idempotencyKey: "mock-decision-1",
+		...overrides,
+	});
+}
+
+export function createQuotaPlannerForecast(
+	overrides: Partial<QuotaPlannerForecast> = {},
+): QuotaPlannerForecast {
+	return QuotaPlannerForecastSchema.parse({
+		generatedAt: new Date().toISOString(),
+		horizonHours: 36,
+		slotSeconds: 900,
+		totalDemandUnits: 48,
+		peakSlotStart: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+		peakDemandUnits: 8,
+		simulation: {
+			loss: 4,
+			unmetDemand: 3,
+			wastedCapacity: 1,
+			coldStartPenalty: 0,
+			synchronizationPenalty: 0,
+			forecastUnits: 48,
+			servedUnits: 45,
+		},
+		slots: [],
+		...overrides,
+	});
+}
+
+export function createQuotaPlannerWarmupActionResponse(
+	overrides: Partial<QuotaPlannerWarmupActionResponse> = {},
+): QuotaPlannerWarmupActionResponse {
+	return QuotaPlannerWarmupActionResponseSchema.parse({
+		decisionId: "decision_1",
+		status: "skipped",
+		reason: "synthetic_traffic_disabled",
+		requestId: null,
+		executedAt: null,
+		...overrides,
+	});
+}
+
+export function createUpstreamProxyAdmin(
+	overrides: Partial<UpstreamProxyAdmin> = {},
+): UpstreamProxyAdmin {
+	return UpstreamProxyAdminSchema.parse({
+		routingEnabled: false,
+		defaultPoolId: null,
+		endpoints: [
+			{
+				id: "ep_primary",
+				name: "Primary proxy",
+				scheme: "http",
+				host: "proxy-primary.test",
+				port: 8080,
+				username: "operator",
+				isActive: true,
+			},
+		],
+		pools: [
+			{
+				id: "pool_primary",
+				name: "Primary pool",
+				isActive: true,
+				endpointIds: ["ep_primary"],
+			},
+		],
+		bindings: [],
 		...overrides,
 	});
 }
@@ -404,12 +663,22 @@ export function createApiKey(overrides: Partial<ApiKey> = {}): ApiKey {
 		name: "Default key",
 		keyPrefix: "sk-test",
 		allowedModels: ["gpt-5.1"],
-		expiresAt: offsetIso(30 * 24 * 60),
+		applyToCodexModel: false,
+		transportPolicyOverride: null,
+		expiresAt: null,
 		isActive: true,
 		accountAssignmentScopeEnabled: false,
+		sourceAssignmentScopeEnabled: false,
 		assignedAccountIds: [],
+		assignedSourceIds: [],
 		createdAt: offsetIso(-60),
 		lastUsedAt: offsetIso(-5),
+		usageSummary: {
+			requestCount: 150,
+			totalTokens: 50_000,
+			cachedInputTokens: 10_000,
+			totalCostUsd: 1.23,
+		},
 		limits: [
 			{
 				id: 1,
@@ -446,6 +715,12 @@ export function createDefaultApiKeys(): ApiKey[] {
 			isActive: false,
 			expiresAt: null,
 			lastUsedAt: null,
+			usageSummary: {
+				requestCount: 42,
+				totalTokens: 12_500,
+				cachedInputTokens: 2_200,
+				totalCostUsd: 0.42,
+			},
 			limits: [],
 		}),
 	];

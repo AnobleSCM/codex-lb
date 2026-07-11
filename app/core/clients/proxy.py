@@ -9,12 +9,14 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
+    Any,
     AsyncContextManager,
     AsyncIterator,
     Awaitable,
@@ -35,7 +37,15 @@ from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
-from app.core.clients.http import get_http_client
+from app.core.clients.codex import (
+    CodexClient,
+    CodexTransportError,
+    codex_transport_error_message,
+    create_codex_session,
+    require_route_or_direct_egress_opt_in,
+)
+from app.core.clients.codex_version import get_codex_version_cache
+from app.core.clients.http import acquire_http_client, lease_http_session
 from app.core.config.settings import Settings, get_settings
 from app.core.conversation_archive import archive_json, archive_text
 from app.core.errors import (
@@ -45,6 +55,7 @@ from app.core.errors import (
     openai_error,
     response_failed_event,
 )
+from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIError
 from app.core.openai.parsing import (
@@ -52,7 +63,11 @@ from app.core.openai.parsing import (
     parse_error_payload,
     parse_sse_event,
 )
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.openai.requests import (
+    ResponsesCompactRequest,
+    ResponsesRequest,
+    validate_compact_input_wire_budget,
+)
 from app.core.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -60,9 +75,14 @@ from app.core.resilience.circuit_breaker import (
     get_circuit_breaker_for_account,
 )
 from app.core.types import JsonObject, JsonValue
+from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
-from app.core.utils.sse import format_sse_event
+from app.core.utils.sse import format_sse_event, parse_sse_data_json
+
+CODEX_INSTALLATION_ID_HEADER = "x-codex-installation-id"
+CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 
 IGNORE_INBOUND_HEADERS = {
     "authorization",
@@ -71,8 +91,14 @@ IGNORE_INBOUND_HEADERS = {
     "host",
     "forwarded",
     "x-real-ip",
+    CODEX_INSTALLATION_ID_HEADER,
     "true-client-ip",
 }
+INTERNAL_OPENAI_UPSTREAM_HEADERS = frozenset(
+    {
+        CODEX_RESPONSES_LITE_HEADER,
+    }
+)
 
 _ERROR_TYPE_CODE_MAP = {
     "rate_limit_exceeded": "rate_limit_exceeded",
@@ -86,6 +112,7 @@ _SSE_EVENT_TYPE_ALIASES = {
     "response.audio.delta": "response.output_audio.delta",
     "response.audio_transcript.delta": "response.output_audio_transcript.delta",
 }
+_SSE_LINE_BOUNDARY_RE = re.compile(r"\r\n|\r|\n")
 _RESPONSE_STREAM_TERMINAL_EVENT_TYPES = frozenset(
     {
         "response.completed",
@@ -93,6 +120,13 @@ _RESPONSE_STREAM_TERMINAL_EVENT_TYPES = frozenset(
         "response.incomplete",
     }
 )
+
+
+def _is_response_stream_terminal_event_type(event_type: str, *, enforce_openai_sdk_contract: bool) -> bool:
+    if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+        return True
+    return event_type == "error" and not enforce_openai_sdk_contract
+
 
 _SSE_READ_CHUNK_SIZE = 1 * 1024
 _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
@@ -112,7 +146,9 @@ _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
         "chatgpt-account-id",
         "content-type",
         "request-id",
+        "session-id",
         "session_id",
+        "thread-id",
         "user-agent",
         "x-codex-conversation-id",
         "x-codex-session-id",
@@ -131,6 +167,7 @@ _NATIVE_CODEX_ORIGINATORS = frozenset(
         "codex_chatgpt_desktop",
         "codex_cli_rs",
         "codex_exec",
+        "codex_sdk_ts",
         "codex_vscode",
     }
 )
@@ -198,6 +235,39 @@ _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = conte
 )
 
 R = TypeVar("R")
+
+
+@dataclass(slots=True)
+class UpstreamProxyRouteTrace:
+    mode: str | None = None
+    pool_id: str | None = None
+    endpoint_id: str | None = None
+    fallback_used: bool | None = None
+
+    def record(self, *, route: ResolvedUpstreamRoute, fallback_used: bool) -> None:
+        self.mode = route.mode
+        self.pool_id = route.pool_id
+        self.endpoint_id = route.endpoint_id
+        self.fallback_used = fallback_used
+
+    def record_direct(self) -> None:
+        self.mode = "direct"
+        self.pool_id = None
+        self.endpoint_id = None
+        self.fallback_used = None
+
+
+def _codex_route_transport_error_message(
+    *,
+    route: ResolvedUpstreamRoute | None,
+    route_trace: UpstreamProxyRouteTrace | None,
+    operation: str,
+    exc: Exception,
+) -> str:
+    if route is None:
+        return str(exc) or "Request to upstream failed"
+    endpoint_id = route_trace.endpoint_id if route_trace is not None and route_trace.endpoint_id else route.endpoint_id
+    return codex_transport_error_message(operation, endpoint_id, exc)
 
 
 async def _call_with_service_circuit_breaker(
@@ -325,6 +395,32 @@ class SSEResponseProtocol(Protocol):
 SSEResponse: TypeAlias = aiohttp.ClientResponse | SSEResponseProtocol
 
 
+class _CodexSSEContent:
+    def __init__(self, response: Any) -> None:
+        self._response = response
+
+    def iter_chunked(self, size: int) -> "SSEChunkIteratorProtocol":
+        del size
+        return cast(SSEChunkIteratorProtocol, self._response.content.iter_chunked(1024))
+
+
+class _CodexSSEResponse:
+    reason: str | None = None
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self.status = _codex_response_status(response)
+        self.content = _CodexSSEContent(response)
+
+    async def json(self, *, content_type: str | None = None) -> JsonValue:
+        del content_type
+        return cast(JsonValue, await _codex_response_json(self._response))
+
+    async def text(self, *, encoding: str | None = None, errors: str = "strict") -> str:
+        del encoding, errors
+        return await _codex_response_text(self._response)
+
+
 class ProxyResponseError(Exception):
     status_code: int
     payload: OpenAIErrorEnvelope
@@ -339,6 +435,7 @@ class ProxyResponseError(Exception):
         failure_detail: str | None = None,
         failure_exception_type: str | None = None,
         upstream_status_code: int | None = None,
+        upstream_error_code: str | None = None,
     ) -> None:
         super().__init__(f"Proxy response error ({status_code})")
         self.status_code = status_code
@@ -348,6 +445,7 @@ class ProxyResponseError(Exception):
         self.failure_detail = failure_detail
         self.failure_exception_type = failure_exception_type
         self.upstream_status_code = upstream_status_code
+        self.upstream_error_code = upstream_error_code
 
 
 @dataclass(frozen=True)
@@ -361,6 +459,8 @@ def _should_drop_inbound_header(name: str) -> bool:
     normalized = name.lower()
     if normalized in IGNORE_INBOUND_HEADERS:
         return True
+    if normalized in INTERNAL_OPENAI_UPSTREAM_HEADERS:
+        return True
     if normalized.startswith("x-forwarded-"):
         return True
     if normalized.startswith("cf-"):
@@ -372,23 +472,144 @@ def filter_inbound_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if not _should_drop_inbound_header(key)}
 
 
+def apply_codex_installation_metadata(payload: dict[str, JsonValue], codex_installation_id: str | None) -> None:
+    raw_metadata = payload.get("client_metadata")
+    client_metadata: dict[str, JsonValue] = {}
+    if is_json_mapping(raw_metadata):
+        for key, value in raw_metadata.items():
+            if isinstance(key, str) and key.lower() != CODEX_INSTALLATION_ID_HEADER:
+                client_metadata[key] = value
+    if codex_installation_id:
+        client_metadata[CODEX_INSTALLATION_ID_HEADER] = codex_installation_id
+    if client_metadata:
+        payload["client_metadata"] = client_metadata
+    else:
+        payload.pop("client_metadata", None)
+
+
+_NATIVE_CODEX_USER_AGENT_PREFIXES: tuple[str, ...] = (
+    "codex_cli_rs",
+    "codex-tui",
+    "codex_exec",
+    "codex_sdk_ts",
+    "codex_vscode",
+    "codex desktop",
+    "codex ",
+)
+_SDK_FINGERPRINT_HEADER_KEYS: frozenset[str] = frozenset(
+    {
+        "x-openai-client-version",
+        "x-openai-client-os",
+        "x-openai-client-arch",
+        "x-openai-client-id",
+        "x-openai-client-user-agent",
+    }
+)
+# OpenAI SDKs (the Stainless-generated clients) attach an ``x-stainless-*``
+# header family (os, arch, runtime, runtime-version, package-version, ...) with
+# a variable suffix. The API layer treats any ``x-stainless-*`` header as an
+# OpenAI SDK signal, so they must be stripped by prefix on a normalized request
+# or upstream can still distinguish SDK traffic from the Codex CLI and apply the
+# downgrade this change is meant to avoid.
+_SDK_FINGERPRINT_HEADER_PREFIXES: tuple[str, ...] = ("x-stainless-",)
+_CODEX_CLI_ORIGINATOR = "codex_cli_rs"
+_CHATGPT_ACCOUNT_ID_HEADER = "ChatGPT-Account-Id"
+_DEFAULT_FINGERPRINT_OS = "Mac OS 26.5.0"
+_DEFAULT_FINGERPRINT_ARCH = "arm64"
+_DEFAULT_FINGERPRINT_TERMINAL = "iTerm.app/3.6.10"
+
+
+def build_codex_user_agent(version: str) -> str:
+    """Build a Codex CLI ``User-Agent`` matching ``get_codex_user_agent()`` from
+    ``openai/codex`` (``codex-rs/login/src/auth/default_client.rs``):
+    ``codex_cli_rs/<version> (<os>; <arch>) <terminal>``.
+
+    OS/arch/terminal come from operator-configurable settings; the version is
+    the live Codex client version resolved by the caller. Settings access is
+    defensive (``getattr`` with built-in defaults) so header construction can
+    never raise and fail an otherwise-valid upstream request.
+    """
+    settings = get_settings()
+    os_name = getattr(settings, "codex_fingerprint_os", _DEFAULT_FINGERPRINT_OS)
+    arch = getattr(settings, "codex_fingerprint_arch", _DEFAULT_FINGERPRINT_ARCH)
+    terminal = getattr(settings, "codex_fingerprint_terminal", _DEFAULT_FINGERPRINT_TERMINAL)
+    return f"{_CODEX_CLI_ORIGINATOR}/{version} ({os_name}; {arch}) {terminal}"
+
+
+def _is_native_codex_user_agent(user_agent: str | None) -> bool:
+    if not user_agent:
+        return False
+    lowered = user_agent.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _NATIVE_CODEX_USER_AGENT_PREFIXES)
+
+
+def _is_native_codex_request(headers: Mapping[str, str]) -> bool:
+    """A request is native when its identity headers mark it as a first-party
+    Codex client: either a native Codex ``User-Agent`` prefix, or an
+    ``originator`` header whose value is in the native Codex originator set.
+
+    Transport/continuity headers (``x-codex-turn-state`` and friends) are
+    deliberately NOT treated as native signals: an HTTP SDK client replays the
+    ``x-codex-turn-state`` token the upstream returns for continuity, so keying
+    the exemption on those headers would let a non-native SDK follow-up skip
+    normalization and reach upstream with its downgraded fingerprint intact.
+    """
+    user_agent = None
+    originator = None
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered == "user-agent":
+            user_agent = value
+        elif lowered == "originator":
+            originator = value
+    if _is_native_codex_user_agent(user_agent):
+        return True
+    return _is_native_codex_originator(originator)
+
+
+def _normalize_non_native_upstream_fingerprint(headers: dict[str, str]) -> None:
+    """Rewrite a non-native request's outbound fingerprint to the Codex CLI
+    persona in place: set ``User-Agent`` to a ``codex_cli_rs`` string, strip
+    SDK-only ``x-openai-client-*`` and ``x-stainless-*`` headers, and strip any
+    inbound ``originator`` header (the real Codex CLI omits it for the default
+    originator and lets the backend read it from the User-Agent prefix)."""
+    version = get_codex_version_cache().cached_version_or_default()
+    codex_user_agent = build_codex_user_agent(version)
+    for key in list(headers.keys()):
+        lowered = key.lower()
+        if (
+            lowered == "user-agent"
+            or lowered in _SDK_FINGERPRINT_HEADER_KEYS
+            or lowered.startswith(_SDK_FINGERPRINT_HEADER_PREFIXES)
+            or lowered == "originator"
+        ):
+            del headers[key]
+    headers["User-Agent"] = codex_user_agent
+
+
 def _build_upstream_headers(
     inbound: Mapping[str, str],
     access_token: str,
     account_id: str | None,
     accept: str = "text/event-stream",
 ) -> dict[str, str]:
-    headers = dict(inbound)
+    headers = filter_inbound_headers(inbound)
+    native = _is_native_codex_request(headers)
     lower_keys = {key.lower() for key in headers}
     if "x-request-id" not in lower_keys and "request-id" not in lower_keys:
         request_id = get_request_id()
         if request_id:
             headers["x-request-id"] = request_id
+    if not native:
+        _normalize_non_native_upstream_fingerprint(headers)
     headers["Authorization"] = f"Bearer {access_token}"
     headers["Accept"] = accept
     headers["Content-Type"] = "application/json"
     if account_id:
-        headers["chatgpt-account-id"] = account_id
+        if native:
+            headers["chatgpt-account-id"] = account_id
+        else:
+            headers[_CHATGPT_ACCOUNT_ID_HEADER] = account_id
     return headers
 
 
@@ -429,15 +650,28 @@ def _build_upstream_websocket_headers(
             token.strip().lower() for token in value.split(",") if isinstance(value, str) and token.strip()
         )
     blocked_header_names = _HOP_BY_HOP_HEADER_NAMES | connected_header_tokens
-    headers = {key: value for key, value in inbound.items() if key.lower() not in blocked_header_names}
+    filtered = filter_inbound_headers(inbound)
+    headers = {key: value for key, value in filtered.items() if key.lower() not in blocked_header_names}
+    native = _is_native_codex_request(headers)
     lower_keys = {key.lower() for key in headers}
     if "x-request-id" not in lower_keys and "request-id" not in lower_keys:
         request_id = get_request_id()
         if request_id:
             headers["x-request-id"] = request_id
+    # Normalize a non-native client's fingerprint regardless of transport. The
+    # ``auto`` transport routes a turn-state continuity follow-up onto the
+    # websocket path even for an HTTP SDK client, so this builder must apply the
+    # same codex_cli_rs persona rewrite as ``_build_upstream_headers``; otherwise
+    # the SDK fingerprint reaches upstream unchanged and the priority-downgrade
+    # mitigation is bypassed for exactly the continuity-token scenario.
+    if not native:
+        _normalize_non_native_upstream_fingerprint(headers)
     headers["Authorization"] = f"Bearer {access_token}"
     if account_id:
-        headers["chatgpt-account-id"] = account_id
+        if native:
+            headers["chatgpt-account-id"] = account_id
+        else:
+            headers[_CHATGPT_ACCOUNT_ID_HEADER] = account_id
     return headers
 
 
@@ -558,6 +792,21 @@ def _error_payload_from_websocket_handshake_error(exc: aiohttp.WSServerHandshake
     return openai_error(code, message)
 
 
+def _account_id_for_upstream_log(headers: Mapping[str, str]) -> str | None:
+    """Read the upstream account id from request headers case-insensitively.
+
+    A normalized non-native request carries the id under PascalCase
+    ``ChatGPT-Account-Id`` while native requests use lowercase
+    ``chatgpt-account-id``; a case-sensitive lookup would log ``account_id=None``
+    for normalized SDK traffic and drop the per-account diagnostics this feature
+    exists to provide.
+    """
+    for key, value in headers.items():
+        if key.lower() == "chatgpt-account-id":
+            return value
+    return None
+
+
 def _maybe_log_upstream_request_start(
     *,
     kind: str,
@@ -573,7 +822,7 @@ def _maybe_log_upstream_request_start(
 
     request_id = get_request_id()
     target = _summarize_upstream_target(url)
-    account_id = headers.get("chatgpt-account-id")
+    account_id = _account_id_for_upstream_log(headers)
     header_keys = _interesting_upstream_header_keys(headers)
 
     if settings.log_upstream_request_summary:
@@ -635,7 +884,7 @@ def _maybe_log_upstream_request_complete(
         kind,
         method,
         _summarize_upstream_target(url),
-        headers.get("chatgpt-account-id"),
+        _account_id_for_upstream_log(headers),
         status_code,
         int((time.monotonic() - started_at) * 1000),
         error_code,
@@ -709,7 +958,7 @@ def _remaining_total_timeout(timeout_seconds: float | None, started_at: float, n
 
 
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
-    separators = (b"\r\n\r\n", b"\n\n")
+    separators = (b"\r\n\r\n", b"\n\n", b"\r\r")
     positions = [(buffer.find(separator), len(separator)) for separator in separators]
     valid_positions = [position for position in positions if position[0] >= 0]
     if not valid_positions:
@@ -824,9 +1073,7 @@ def _error_event_from_response_body(
                 response_id=get_request_id(),
                 error_param=payload.get("param"),
             )
-            for key in ("plan_type", "resets_at", "resets_in_seconds"):
-                if key in payload:
-                    event["response"]["error"][key] = payload[key]
+            _copy_quota_error_metadata(event["response"]["error"], payload)
             return event
         message = _extract_upstream_message(payload_data)
         if message:
@@ -887,6 +1134,18 @@ def _openai_error_detail(error: OpenAIError) -> OpenAIErrorDetail:
     return detail
 
 
+def _copy_quota_error_metadata(target: OpenAIErrorDetail, source: Mapping[str, Any]) -> None:
+    plan_type = source.get("plan_type")
+    if isinstance(plan_type, str):
+        target["plan_type"] = plan_type
+    resets_at = source.get("resets_at")
+    if isinstance(resets_at, int | float) and not isinstance(resets_at, bool):
+        target["resets_at"] = resets_at
+    resets_in_seconds = source.get("resets_in_seconds")
+    if isinstance(resets_in_seconds, int | float) and not isinstance(resets_in_seconds, bool):
+        target["resets_in_seconds"] = resets_in_seconds
+
+
 def _extract_upstream_message(data: Mapping[str, JsonValue]) -> str | None:
     for key in ("message", "detail", "error"):
         value = data.get(key)
@@ -939,12 +1198,16 @@ def _normalize_sse_event_block(event_block: str) -> str:
         line_separator = "\n"
         terminator = "\n\n"
         body = event_block[: -len(terminator)]
+    elif event_block.endswith("\r\r"):
+        line_separator = "\r"
+        terminator = "\r\r"
+        body = event_block[: -len(terminator)]
     else:
         line_separator = "\r\n" if "\r\n" in event_block else "\n"
         terminator = ""
         body = event_block
 
-    lines = body.splitlines()
+    lines = _SSE_LINE_BOUNDARY_RE.split(body)
     if not lines:
         return event_block
 
@@ -980,28 +1243,52 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
             response_id=get_request_id(),
             error_param=detail.get("param"),
         )
-        for key in ("plan_type", "resets_at", "resets_in_seconds"):
-            if key in detail:
-                event["response"]["error"][key] = detail[key]
+        _copy_quota_error_metadata(event["response"]["error"], detail)
         return cast(dict[str, JsonValue], event)
     if event_type == "error":
         message = _extract_upstream_message(payload) or "Upstream websocket error"
         code = payload.get("code")
-        raw_error_type = payload.get("error_type")
-        error_type = raw_error_type if isinstance(raw_error_type, str) else None
+        error_type = payload.get("error_type") or payload.get("type")
+        normalized_code = _normalize_error_code(
+            code if isinstance(code, str) else None,
+            error_type if isinstance(error_type, str) else None,
+        )
+        if not isinstance(code, str) and normalized_code == "error":
+            normalized_code = "upstream_error"
         return cast(
             dict[str, JsonValue],
             response_failed_event(
-                _normalize_error_code(
-                    code if isinstance(code, str) else None,
-                    error_type,
-                ),
+                normalized_code,
                 message,
-                error_type=error_type or "server_error",
+                error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
                 response_id=get_request_id(),
             ),
         )
     return payload
+
+
+def _normalize_stream_payload_for_http_block(
+    event_block: str,
+    *,
+    enforce_openai_sdk_contract: bool = True,
+) -> tuple[str, str | None]:
+    if not enforce_openai_sdk_contract:
+        payload = parse_sse_data_json(event_block)
+        if payload is None:
+            return event_block, None
+        event_type = payload.get("type")
+        return event_block, event_type if isinstance(event_type, str) else None
+
+    payload = parse_sse_data_json(event_block)
+    if payload is None:
+        return event_block, None
+    normalized = _normalize_stream_event_payload(payload)
+    if normalized is payload:
+        event_type = normalized.get("type")
+        return event_block, event_type if isinstance(event_type, str) else None
+    normalized_type = normalized.get("type")
+    event_type = normalized_type if isinstance(normalized_type, str) else None
+    return format_sse_event(normalized), event_type
 
 
 def _to_websocket_upstream_url(url: str) -> str:
@@ -1051,6 +1338,80 @@ def _payload_uses_image_generation_tool(payload: Mapping[str, JsonValue]) -> boo
         if tool_type == "image_generation":
             return True
     return False
+
+
+def _payload_uses_responses_lite(payload: Mapping[str, JsonValue]) -> bool:
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return False
+    return any(is_json_mapping(item) and item.get("type") == "additional_tools" for item in input_value)
+
+
+def _client_metadata_uses_responses_lite(client_metadata: Mapping[str, JsonValue]) -> bool:
+    return any(
+        key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY
+        and isinstance(value, str)
+        and value.strip().lower() == "true"
+        for key, value in client_metadata.items()
+    )
+
+
+def _payload_has_responses_lite_websocket_marker(payload: Mapping[str, JsonValue]) -> bool:
+    raw_metadata = payload.get("client_metadata")
+    return is_json_mapping(raw_metadata) and _client_metadata_uses_responses_lite(raw_metadata)
+
+
+def _normalize_responses_lite_websocket_client_metadata(
+    payload: Mapping[str, JsonValue],
+    client_metadata: Mapping[str, JsonValue],
+    *,
+    preserve_existing: bool = False,
+) -> dict[str, JsonValue]:
+    normalized = dict(client_metadata)
+    existing_marker = _client_metadata_uses_responses_lite(normalized)
+    for key in tuple(normalized):
+        if key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY:
+            del normalized[key]
+    if _payload_uses_responses_lite(payload) or (preserve_existing and existing_marker):
+        normalized[CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY] = "true"
+    return normalized
+
+
+def _strip_responses_lite_websocket_client_metadata(
+    payload: dict[str, JsonValue],
+) -> None:
+    raw_metadata = payload.get("client_metadata")
+    client_metadata = dict(raw_metadata) if is_json_mapping(raw_metadata) else {}
+    for key in tuple(client_metadata):
+        if key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY:
+            del client_metadata[key]
+    if client_metadata:
+        payload["client_metadata"] = client_metadata
+    else:
+        payload.pop("client_metadata", None)
+
+
+def _set_responses_lite_websocket_client_metadata(
+    payload: dict[str, JsonValue],
+) -> None:
+    raw_metadata = payload.get("client_metadata")
+    client_metadata = dict(raw_metadata) if is_json_mapping(raw_metadata) else {}
+    normalized = _normalize_responses_lite_websocket_client_metadata(
+        payload,
+        client_metadata,
+    )
+    if normalized:
+        payload["client_metadata"] = normalized
+    else:
+        payload.pop("client_metadata", None)
+
+
+def _apply_responses_lite_http_header(
+    headers: dict[str, str],
+    payload: Mapping[str, JsonValue],
+) -> None:
+    if _payload_uses_responses_lite(payload):
+        headers[CODEX_RESPONSES_LITE_HEADER] = "true"
 
 
 def _ws_transport_payload_budget_bytes(settings: Settings | object) -> int:
@@ -1105,7 +1466,11 @@ def _should_fallback_to_http_after_websocket_handshake_error(
     transport_mode: str,
     exc: aiohttp.WSServerHandshakeError,
 ) -> bool:
-    return transport_mode == "auto" and exc.status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES
+    return _should_fallback_to_http_after_websocket_status(transport_mode, exc.status)
+
+
+def _should_fallback_to_http_after_websocket_status(transport_mode: str, status: int | None) -> bool:
+    return transport_mode == "auto" and status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES
 
 
 async def _open_upstream_websocket(
@@ -1253,6 +1618,7 @@ async def _stream_websocket_events(
     idle_timeout_seconds: float,
     total_timeout_seconds: float | None,
     max_event_bytes: int,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
@@ -1295,11 +1661,84 @@ async def _stream_websocket_events(
             continue
         if not isinstance(payload, dict):
             continue
-        normalized = _normalize_stream_event_payload(payload)
+        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
         event_type = normalized.get("type")
         yield format_sse_event(normalized)
-        if isinstance(event_type, str) and event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+            event_type,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
             break
+
+
+async def _stream_codex_websocket_events(
+    websocket: Any,
+    *,
+    idle_timeout_seconds: float,
+    total_timeout_seconds: float | None,
+    max_event_bytes: int,
+    enforce_openai_sdk_contract: bool = True,
+) -> AsyncIterator[str]:
+    deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
+
+    while True:
+        timeout_seconds = idle_timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            timeout_seconds = min(timeout_seconds, remaining)
+
+        try:
+            msg = await asyncio.wait_for(websocket.receive(), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                raise
+            raise StreamIdleTimeoutError() from exc
+
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+            break
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            exc = websocket.exception()
+            if exc is None and isinstance(msg.data, BaseException):
+                exc = msg.data
+            exc = exc or aiohttp.ClientError("Upstream websocket error")
+            raise CodexTransportError(codex_transport_error_message("websocket stream", None, exc)) from exc
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            text = msg.data if isinstance(msg.data, str) else str(msg.data)
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            text = msg.data.decode("utf-8", errors="replace") if isinstance(msg.data, bytes) else str(msg.data)
+        else:
+            text = str(msg.data) if msg.data is not None else ""
+        text_bytes = text.encode("utf-8")
+        if len(text_bytes) > max_event_bytes:
+            raise StreamEventTooLargeError(len(text_bytes), max_event_bytes)
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
+        event_type = normalized.get("type")
+        yield format_sse_event(normalized)
+        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+            event_type,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
+            break
+
+
+async def _close_unmanaged_websocket(websocket: Any | None) -> None:
+    if websocket is None:
+        return
+    close = getattr(websocket, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
 
 
 async def _stream_responses_via_websocket(
@@ -1314,6 +1753,11 @@ async def _stream_responses_via_websocket(
     max_event_bytes: int,
     raise_for_status: bool,
     account_id: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
@@ -1346,15 +1790,58 @@ async def _stream_responses_via_websocket(
         _remaining_total_timeout(effective_total_timeout, request_started_at, time.monotonic())
         or effective_connect_timeout,
     )
-    websocket_cm, websocket = await _open_upstream_websocket(
-        session=client_session,
-        url=websocket_url,
-        headers=headers,
-        connect_timeout_seconds=connect_timeout_seconds,
-        max_msg_size=max_event_bytes,
-        account_id=account_id,
-        hold_half_open_probe=True,
-    )
+    owns_codex_client = False
+    websocket_context: Any | None = None
+    active_codex_client: CodexClient | None = None
+    if route is not None:
+        owns_codex_client = codex_client is None
+        active_codex_client = codex_client or CodexClient(create_codex_session())
+        try:
+            opener = getattr(active_codex_client, "open_ws_with_route_metadata", None)
+            if callable(opener):
+                result = await opener(
+                    websocket_url,
+                    route=route,
+                    headers=headers,
+                    timeout=connect_timeout_seconds,
+                    max_msg_size=max_event_bytes,
+                )
+                websocket = result.websocket
+                websocket_context = result.context
+                if route_trace is not None:
+                    route_trace.record(route=result.route, fallback_used=result.fallback_used)
+            else:
+                websocket_context = await active_codex_client.ws_connect(
+                    websocket_url,
+                    route=route,
+                    headers=headers,
+                    timeout=connect_timeout_seconds,
+                    max_msg_size=max_event_bytes,
+                )
+                websocket = (
+                    await websocket_context.__aenter__()
+                    if hasattr(websocket_context, "__aenter__")
+                    else websocket_context
+                )
+                if route_trace is not None:
+                    route_trace.record(route=route, fallback_used=False)
+                if not hasattr(websocket_context, "__aenter__"):
+                    websocket_context = None
+        except Exception as exc:
+            await _record_lifecycle_failure(exc)
+            if owns_codex_client:
+                await active_codex_client.close()
+            raise
+    else:
+        websocket_cm, websocket = await _open_upstream_websocket(
+            session=client_session,
+            url=websocket_url,
+            headers=headers,
+            connect_timeout_seconds=connect_timeout_seconds,
+            max_msg_size=max_event_bytes,
+            account_id=account_id,
+            hold_half_open_probe=True,
+        )
 
     try:
         send_json = getattr(websocket, "send_json", None)
@@ -1379,6 +1866,18 @@ async def _stream_responses_via_websocket(
                 cast(Callable[[JsonObject], Awaitable[None]], send_json)(request_payload),
                 timeout=remaining_total_timeout,
             )
+        elif route is not None:
+            payload_text = json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))
+            send_str = getattr(websocket, "send_str", None)
+            if callable(send_str):
+                send_result = send_str(payload_text)
+                if asyncio.iscoroutine(send_result):
+                    await asyncio.wait_for(send_result, timeout=remaining_total_timeout)
+            else:
+                send_bytes = getattr(websocket, "send_bytes")
+                send_result = send_bytes(payload_text.encode())
+                if asyncio.iscoroutine(send_result):
+                    await asyncio.wait_for(send_result, timeout=remaining_total_timeout)
         else:
             await asyncio.wait_for(
                 websocket.send_str(json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))),
@@ -1389,12 +1888,24 @@ async def _stream_responses_via_websocket(
             request_started_at,
             time.monotonic(),
         )
-        async for event in _stream_websocket_events(
-            websocket,
-            idle_timeout_seconds=effective_idle_timeout,
-            total_timeout_seconds=remaining_total_timeout,
-            max_event_bytes=max_event_bytes,
-        ):
+        event_iter = (
+            _stream_codex_websocket_events(
+                websocket,
+                idle_timeout_seconds=effective_idle_timeout,
+                total_timeout_seconds=remaining_total_timeout,
+                max_event_bytes=max_event_bytes,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+            )
+            if route is not None
+            else _stream_websocket_events(
+                websocket,
+                idle_timeout_seconds=effective_idle_timeout,
+                total_timeout_seconds=remaining_total_timeout,
+                max_event_bytes=max_event_bytes,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+            )
+        )
+        async for event in event_iter:
             archive_text(
                 direction="server_to_codex",
                 kind="responses",
@@ -1407,7 +1918,10 @@ async def _stream_responses_via_websocket(
                 extra={"event_format": "sse"},
             )
             parsed_event = parse_sse_event(event)
-            if parsed_event and parsed_event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+            if parsed_event and _is_response_stream_terminal_event_type(
+                parsed_event.type,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+            ):
                 seen_terminal = True
                 await _record_lifecycle_success()
             yield event
@@ -1418,9 +1932,15 @@ async def _stream_responses_via_websocket(
         raise
     finally:
         try:
-            if websocket_cm is not None:
+            if websocket_context is not None:
+                await websocket_context.__aexit__(None, None, None)
+            elif websocket_cm is not None:
                 await websocket_cm.__aexit__(None, None, None)
+            else:
+                await _close_unmanaged_websocket(websocket)
         finally:
+            if owns_codex_client and active_codex_client is not None:
+                await active_codex_client.close()
             await _release_bound_half_open_probe(websocket)
 
 
@@ -1634,6 +2154,11 @@ async def _inline_input_image_urls(
         if not isinstance(item, dict):
             updated_input.append(item)
             continue
+        if item.get("type") == "input_image":
+            updated_item, item_changed = await _inline_content_images(item, session, connect_timeout)
+            updated_input.append(updated_item)
+            changed = changed or item_changed
+            continue
         content = item.get("content")
         updated_content, content_changed = await _inline_content_images(content, session, connect_timeout)
         if content_changed:
@@ -1834,6 +2359,8 @@ async def _resolve_global_ips(host: str, *, timeout_seconds: float) -> list[str]
         if not sockaddr:
             return None
         addr = sockaddr[0]
+        if not isinstance(addr, str):
+            return None
         ip = _parse_ip_literal(addr)
         if ip is None:
             return None
@@ -1893,16 +2420,71 @@ async def stream_responses(
     raise_for_status: bool = False,
     session: aiohttp.ClientSession | None = None,
     upstream_stream_transport_override: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
+    codex_installation_id: str | None = None,
+    enforce_openai_sdk_contract: bool = True,
+) -> AsyncIterator[str]:
+    effective_allow_direct_egress = allow_direct_egress or (route is None and session is not None)
+    async with lease_http_session(session) as client_session:
+        async for event_block in _stream_responses_with_session(
+            payload=payload,
+            headers=headers,
+            access_token=access_token,
+            account_id=account_id,
+            base_url=base_url,
+            raise_for_status=raise_for_status,
+            session=client_session,
+            upstream_stream_transport_override=upstream_stream_transport_override,
+            route=route,
+            codex_client=codex_client,
+            route_trace=route_trace,
+            allow_direct_egress=effective_allow_direct_egress,
+            codex_installation_id=codex_installation_id,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
+            yield event_block
+
+
+async def _stream_responses_with_session(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    session: aiohttp.ClientSession,
+    base_url: str | None = None,
+    raise_for_status: bool = False,
+    upstream_stream_transport_override: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
+    codex_installation_id: str | None = None,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/codex/responses"
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation="responses stream",
+    )
+    if route is None and route_trace is not None:
+        route_trace.record_direct()
     pre_request_started_at = time.monotonic()
     # Keep a default total timeout so direct callers cannot hang forever before
-    # response headers or the first SSE event. ProxyService stream attempts clamp
-    # this further by installing per-attempt overrides from the remaining budget.
+    # response headers or the first SSE event. Responses streams can run much
+    # longer than control calls; ProxyService stream attempts clamp this further
+    # by installing per-attempt overrides from the remaining budget.
     request_total_timeout = _effective_stream_timeout(
-        settings.proxy_request_budget_seconds,
+        getattr(
+            settings,
+            "http_responses_stream_request_budget_seconds",
+            settings.proxy_request_budget_seconds,
+        ),
         "total",
     )
     effective_connect_timeout = _effective_stream_timeout(settings.upstream_connect_timeout_seconds, "connect")
@@ -1910,17 +2492,27 @@ async def stream_responses(
 
     seen_terminal = False
     status_code: int | None = None
+    last_stream_activity_at: float | None = None
     error_code: str | None = None
     error_message: str | None = None
-    client_session = session or get_http_client().session
-    payload_dict = payload.to_payload()
+    failure_phase: str | None = None
+    failure_detail: str | None = None
+    failure_exception_type: str | None = None
+    retryable_same_contract: bool | None = None
+    client_session = session
+    payload_dict = dict(payload.to_payload())
+    apply_codex_installation_metadata(payload_dict, codex_installation_id)
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
             payload_dict,
             _as_image_fetch_session(client_session),
             effective_connect_timeout,
         )
-    payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
+    http_payload_dict = dict(payload_dict)
+    _strip_responses_lite_websocket_client_metadata(http_payload_dict)
+    websocket_payload_dict = dict(payload_dict)
+    _set_responses_lite_websocket_client_metadata(websocket_payload_dict)
+    payload_json = json.dumps(websocket_payload_dict, ensure_ascii=True, separators=(",", ":"))
     payload_size_estimate_bytes = len(payload_json.encode("utf-8"))
     transport_mode = _configured_stream_transport(
         transport=settings.upstream_stream_transport,
@@ -1935,11 +2527,14 @@ async def stream_responses(
         has_image_generation_tool=_payload_uses_image_generation_tool(payload_dict),
         payload_size_estimate_bytes=payload_size_estimate_bytes,
     )
+    payload_dict = websocket_payload_dict if transport == "websocket" else http_payload_dict
+    payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
     if transport == "websocket":
         upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
         method = "GET"
     else:
         upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+        _apply_responses_lite_http_header(upstream_headers, payload_dict)
         method = "POST"
     remaining_request_timeout = _remaining_total_timeout(
         request_total_timeout,
@@ -1957,7 +2552,106 @@ async def stream_responses(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
     ) -> AsyncIterator[str]:
-        nonlocal status_code, error_code, error_message, seen_terminal
+        nonlocal status_code, last_stream_activity_at, error_code, error_message, seen_terminal
+
+        if route is not None:
+            owns_codex_client = codex_client is None
+            active_codex_client = codex_client or CodexClient(create_codex_session())
+            try:
+                request_kwargs: dict[str, Any] = {
+                    "json": payload_dict,
+                    "headers": current_headers,
+                    "timeout": remaining_request_timeout or request_total_timeout,
+                    "buffer_response": False,
+                }
+                request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                if callable(request_with_metadata):
+                    result = await request_with_metadata("POST", url, route=route, **request_kwargs)
+                    raw_resp = result.response
+                    if route_trace is not None:
+                        route_trace.record(route=result.route, fallback_used=result.fallback_used)
+                else:
+                    raw_resp = await active_codex_client.request("POST", url, route=route, **request_kwargs)
+                    if route_trace is not None:
+                        route_trace.record(route=route, fallback_used=False)
+                resp = _CodexSSEResponse(raw_resp)
+                status_code = resp.status
+                last_stream_activity_at = time.monotonic()
+                if resp.status >= 400:
+                    if raise_for_status:
+                        error_payload = await _error_payload_from_response(resp)
+                        error_code, error_message = _error_details_from_envelope(error_payload)
+                        archive_json(
+                            direction="server_to_codex",
+                            kind="responses",
+                            transport="http",
+                            payload=error_payload,
+                            account_id=account_id,
+                            method="POST",
+                            url=url,
+                            status_code=status_code,
+                            headers=current_headers,
+                        )
+                        raise ProxyResponseError(resp.status, error_payload)
+                    event = await _error_event_from_response(resp)
+                    error_code, error_message = _error_details_from_failed_event(event)
+                    event_block = format_sse_event(event)
+                    archive_text(
+                        direction="server_to_codex",
+                        kind="responses",
+                        transport="http",
+                        text=event_block,
+                        account_id=account_id,
+                        method="POST",
+                        url=url,
+                        status_code=status_code,
+                        headers=current_headers,
+                        extra={"event_format": "sse"},
+                    )
+                    yield event_block
+                    return
+
+                async for event_block in _iter_sse_events(
+                    cast(SSEResponse, resp),
+                    effective_idle_timeout,
+                    settings.max_sse_event_bytes,
+                ):
+                    last_stream_activity_at = time.monotonic()
+                    event_block = _normalize_sse_event_block(event_block)
+                    event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
+                        event_block,
+                        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    )
+                    event = parse_sse_event(event_block)
+                    if event:
+                        if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
+                            event.type == "error" and not enforce_openai_sdk_contract
+                        ):
+                            seen_terminal = True
+                    elif isinstance(normalized_event_type, str) and (
+                        normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                        or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
+                    ):
+                        seen_terminal = True
+                    archive_text(
+                        direction="server_to_codex",
+                        kind="responses",
+                        transport="http",
+                        text=event_block,
+                        account_id=account_id,
+                        method="POST",
+                        url=url,
+                        status_code=status_code,
+                        headers=current_headers,
+                        extra={"event_format": "sse"},
+                    )
+                    yield event_block
+                    if seen_terminal:
+                        break
+                return
+            finally:
+                if owns_codex_client:
+                    await active_codex_client.close()
 
         async with _service_circuit_breaker_context(
             client_session.post(
@@ -1970,6 +2664,7 @@ async def stream_responses(
             account_id=account_id,
         ) as resp:
             status_code = resp.status
+            last_stream_activity_at = time.monotonic()
             if resp.status >= 400:
                 if raise_for_status:
                     error_payload = await _error_payload_from_response(resp)
@@ -2009,12 +2704,23 @@ async def stream_responses(
                 effective_idle_timeout,
                 settings.max_sse_event_bytes,
             ):
+                last_stream_activity_at = time.monotonic()
                 event_block = _normalize_sse_event_block(event_block)
+                event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
+                    event_block,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                )
                 event = parse_sse_event(event_block)
                 if event:
-                    event_type = event.type
-                    if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+                    if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
+                        event.type == "error" and not enforce_openai_sdk_contract
+                    ):
                         seen_terminal = True
+                elif isinstance(normalized_event_type, str) and (
+                    normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                    or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
+                ):
+                    seen_terminal = True
                 archive_text(
                     direction="server_to_codex",
                     kind="responses",
@@ -2050,6 +2756,70 @@ async def stream_responses(
             url=url,
             headers=upstream_headers,
         )
+
+    async def _stream_via_http_after_websocket_rejection(
+        *,
+        rejection_status: int | None,
+        rejection_message: str,
+    ) -> AsyncIterator[str]:
+        nonlocal transport, upstream_headers, method, remaining_request_timeout, timeout, started_at, payload_dict
+        nonlocal payload_json
+
+        logger.warning(
+            "upstream_websocket_handshake_rejected request_id=%s status=%s target=%s retrying_transport=http",
+            get_request_id(),
+            rejection_status,
+            _summarize_upstream_target(url),
+        )
+        _maybe_log_upstream_request_complete(
+            kind="responses",
+            url=url,
+            headers=upstream_headers,
+            method=method,
+            started_at=started_at,
+            status_code=rejection_status,
+            error_code="upstream_websocket_handshake_rejected",
+            error_message=rejection_message,
+        )
+
+        transport = "http"
+        payload_dict = http_payload_dict
+        payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
+        upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+        _apply_responses_lite_http_header(upstream_headers, payload_dict)
+        method = "POST"
+        remaining_request_timeout = _remaining_total_timeout(
+            request_total_timeout,
+            pre_request_started_at,
+            time.monotonic(),
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=remaining_request_timeout,
+            sock_connect=effective_connect_timeout,
+            sock_read=None,
+        )
+        started_at = time.monotonic()
+        _maybe_log_upstream_request_start(
+            kind="responses",
+            url=url,
+            headers=upstream_headers,
+            method=method,
+            payload_summary=_summarize_json_payload(payload_dict),
+            payload_json=payload_json if settings.log_upstream_request_payload else None,
+        )
+        archive_json(
+            direction="codex_to_server",
+            kind="responses",
+            transport="http",
+            payload=payload_dict,
+            account_id=account_id,
+            method=method,
+            url=url,
+            headers=upstream_headers,
+        )
+        async for event_block in _stream_via_http(upstream_headers, timeout):
+            yield event_block
+
     try:
         if transport == "websocket":
             try:
@@ -2064,17 +2834,22 @@ async def stream_responses(
                     max_event_bytes=settings.max_sse_event_bytes,
                     raise_for_status=raise_for_status,
                     account_id=account_id,
+                    route=route,
+                    codex_client=codex_client,
+                    route_trace=route_trace,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 ):
                     if status_code is None:
                         status_code = 101
                     event = parse_sse_event(event_block)
                     if event:
                         event_type = event.type
-                        if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+                        if _is_response_stream_terminal_event_type(
+                            event_type,
+                            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                        ):
                             seen_terminal = True
                     yield event_block
-                    if seen_terminal:
-                        break
             except aiohttp.WSServerHandshakeError as exc:
                 if not _should_fallback_to_http_after_websocket_handshake_error(transport_mode, exc):
                     error_payload = _error_payload_from_websocket_handshake_error(exc)
@@ -2084,63 +2859,27 @@ async def stream_responses(
                         error_message = exc.message or str(exc)
                     if error_code is None:
                         error_code = "upstream_error"
+                    response_error_code = cast(str, error_code)
+                    response_error_message = cast(str, error_message)
                     if raise_for_status:
                         raise ProxyResponseError(exc.status, error_payload) from exc
                     yield format_sse_event(
-                        response_failed_event(error_code, error_message, response_id=get_request_id())
+                        response_failed_event(response_error_code, response_error_message, response_id=get_request_id())
                     )
                     return
 
-                logger.warning(
-                    "upstream_websocket_handshake_rejected request_id=%s status=%s target=%s retrying_transport=http",
-                    get_request_id(),
-                    exc.status,
-                    _summarize_upstream_target(url),
-                )
-                _maybe_log_upstream_request_complete(
-                    kind="responses",
-                    url=url,
-                    headers=upstream_headers,
-                    method=method,
-                    started_at=started_at,
-                    status_code=exc.status,
-                    error_code="upstream_websocket_handshake_rejected",
-                    error_message=str(exc),
-                )
-
-                transport = "http"
-                upstream_headers = _build_upstream_headers(headers, access_token, account_id)
-                method = "POST"
-                remaining_request_timeout = _remaining_total_timeout(
-                    request_total_timeout,
-                    pre_request_started_at,
-                    time.monotonic(),
-                )
-                timeout = aiohttp.ClientTimeout(
-                    total=remaining_request_timeout,
-                    sock_connect=effective_connect_timeout,
-                    sock_read=None,
-                )
-                started_at = time.monotonic()
-                _maybe_log_upstream_request_start(
-                    kind="responses",
-                    url=url,
-                    headers=upstream_headers,
-                    method=method,
-                    payload_summary=_summarize_json_payload(payload_dict),
-                    payload_json=payload_json if settings.log_upstream_request_payload else None,
-                )
-                archive_json(
-                    direction="codex_to_server",
-                    kind="responses",
-                    transport="http",
-                    payload=payload_dict,
-                    account_id=account_id,
-                    method=method,
-                    url=url,
-                    headers=upstream_headers,
-                )
-                async for event_block in _stream_via_http(upstream_headers, timeout):
+                async for event_block in _stream_via_http_after_websocket_rejection(
+                    rejection_status=exc.status,
+                    rejection_message=str(exc),
+                ):
+                    yield event_block
+            except CodexTransportError as exc:
+                if not _should_fallback_to_http_after_websocket_status(transport_mode, exc.status_code):
+                    raise
+                async for event_block in _stream_via_http_after_websocket_rejection(
+                    rejection_status=exc.status_code,
+                    rejection_message=str(exc),
+                ):
                     yield event_block
         else:
             async for event_block in _stream_via_http(upstream_headers, timeout):
@@ -2151,6 +2890,10 @@ async def stream_responses(
     except StreamIdleTimeoutError:
         error_code = "stream_idle_timeout"
         error_message = "Upstream stream idle timeout"
+        failure_phase = "upstream"
+        failure_detail = "stream_idle_timeout"
+        failure_exception_type = "StreamIdleTimeoutError"
+        retryable_same_contract = False
         yield format_sse_event(
             response_failed_event(
                 "stream_idle_timeout",
@@ -2174,14 +2917,45 @@ async def stream_responses(
         error_code = "upstream_unavailable"
         error_message = "Upstream circuit breaker is open"
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event(
+                "upstream_unavailable",
+                "Upstream circuit breaker is open",
+                response_id=get_request_id(),
+            ),
+        )
+        return
+    except CodexTransportError as exc:
+        error_code = "upstream_unavailable"
+        error_message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="stream",
+            exc=exc,
+        )
+        response_error_message = cast(str, error_message)
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
+        yield format_sse_event(
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
         return
     except aiohttp.ClientError as exc:
         error_code = "upstream_unavailable"
-        error_message = str(exc)
+        error_message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="stream",
+            exc=exc,
+        )
+        response_error_message = cast(str, error_message)
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", str(exc), response_id=get_request_id()),
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
         return
     except asyncio.CancelledError:
@@ -2189,13 +2963,78 @@ async def stream_responses(
     except asyncio.TimeoutError as exc:
         if isinstance(exc, aiohttp.ClientError):
             error_code = "upstream_unavailable"
-            error_message = str(exc) or "Request to upstream timed out"
+            error_message = (
+                _codex_route_transport_error_message(
+                    route=route,
+                    route_trace=route_trace,
+                    operation="stream",
+                    exc=exc,
+                )
+                if route is not None
+                else str(exc) or "Request to upstream timed out"
+            )
+            response_error_message = cast(str, error_message)
+            failure_phase = "upstream"
+            failure_detail = "transport_error"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
             yield format_sse_event(
-                response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+                response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
+            )
+            return
+        now = time.monotonic()
+        idle_elapsed_seconds = max(0.0, now - last_stream_activity_at) if last_stream_activity_at is not None else None
+        if (
+            idle_elapsed_seconds is not None
+            and effective_idle_timeout <= (request_total_timeout or effective_idle_timeout)
+            and idle_elapsed_seconds >= effective_idle_timeout
+        ):
+            error_code = "stream_idle_timeout"
+            error_message = "Upstream stream idle timeout"
+            failure_phase = "upstream"
+            failure_detail = "stream_idle_timeout"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = False
+            yield format_sse_event(
+                response_failed_event(
+                    "stream_idle_timeout",
+                    "Upstream stream idle timeout",
+                    response_id=get_request_id(),
+                ),
+            )
+            return
+        total_elapsed_seconds = max(0.0, now - pre_request_started_at)
+        if request_total_timeout is None or total_elapsed_seconds < request_total_timeout:
+            error_code = "upstream_unavailable"
+            error_message = (
+                _codex_route_transport_error_message(
+                    route=route,
+                    route_trace=route_trace,
+                    operation="stream",
+                    exc=exc,
+                )
+                if route is not None
+                else str(exc) or "Request to upstream timed out"
+            )
+            response_error_message = cast(str, error_message)
+            failure_phase = "upstream"
+            failure_detail = "transport_error"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
+            yield format_sse_event(
+                response_failed_event(
+                    "upstream_unavailable",
+                    response_error_message,
+                    response_id=get_request_id(),
+                ),
             )
             return
         error_code = "upstream_request_timeout"
         error_message = "Proxy request budget exhausted"
+        failure_phase = "upstream"
+        failure_detail = "request_timeout"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = False
         yield format_sse_event(
             response_failed_event(
                 "upstream_request_timeout",
@@ -2204,10 +3043,43 @@ async def stream_responses(
             ),
         )
         return
+    except GeneratorExit:
+        error_code = "client_disconnected"
+        error_message = "Downstream client disconnected before response.completed"
+        failure_phase = "downstream"
+        failure_detail = "client_disconnected_before_terminal_event"
+        failure_exception_type = "GeneratorExit"
+        retryable_same_contract = False
+        raise
+    except OSError as exc:
+        error_code = "upstream_unavailable"
+        error_message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="stream",
+            exc=exc,
+        )
+        response_error_message = cast(str, error_message)
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
+        yield format_sse_event(
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
+        )
+        return
     except Exception as exc:
         error_code = "upstream_error"
-        error_message = str(exc)
-        yield format_sse_event(response_failed_event("upstream_error", str(exc), response_id=get_request_id()))
+        error_message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="stream",
+            exc=exc,
+        )
+        response_error_message = cast(str, error_message)
+        yield format_sse_event(
+            response_failed_event("upstream_error", response_error_message, response_id=get_request_id())
+        )
         return
     else:
         if not seen_terminal:
@@ -2230,6 +3102,10 @@ async def stream_responses(
             status_code=status_code,
             error_code=error_code,
             error_message=error_message,
+            failure_phase=failure_phase,
+            failure_detail=failure_detail,
+            failure_exception_type=failure_exception_type,
+            retryable_same_contract=retryable_same_contract,
         )
 
 
@@ -2329,19 +3205,30 @@ async def compact_responses(
     access_token: str,
     account_id: str | None,
     session: aiohttp.ClientSession | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    chatgpt_account_id: str | None = None,
+    allow_direct_egress: bool = True,
 ) -> CompactResponsePayload:
-    transport = _CompactCommandTransport(
-        payload=payload,
-        headers=headers,
-        access_token=access_token,
-        account_id=account_id,
-        session=session or get_http_client().session,
-    )
-    return await transport.execute()
+    async with lease_http_session(session) as client_session:
+        transport = _CompactCommandTransport(
+            payload=payload,
+            headers=headers,
+            access_token=access_token,
+            account_id=account_id,
+            session=client_session,
+            route=route,
+            codex_client=codex_client,
+            route_trace=route_trace,
+            chatgpt_account_id=chatgpt_account_id,
+            allow_direct_egress=allow_direct_egress,
+        )
+        return await transport.execute()
 
 
 def _is_retryable_compact_status(status_code: int) -> bool:
-    return status_code in {401, 500, 502, 503, 504}
+    return status_code in {500, 502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -2351,15 +3238,28 @@ class _CompactCommandTransport:
     access_token: str
     account_id: str | None
     session: aiohttp.ClientSession
+    route: ResolvedUpstreamRoute | None = None
+    codex_client: CodexClient | None = None
+    route_trace: UpstreamProxyRouteTrace | None = None
+    chatgpt_account_id: str | None = None
+    allow_direct_egress: bool = False
 
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
         upstream_base = settings.upstream_base_url.rstrip("/")
         url = f"{upstream_base}/codex/responses/compact"
+        require_route_or_direct_egress_opt_in(
+            route=self.route,
+            allow_direct_egress=self.allow_direct_egress,
+            operation="responses compact",
+        )
+        if self.route is None and self.route_trace is not None:
+            self.route_trace.record_direct()
+        upstream_account_id = self.chatgpt_account_id or self.account_id
         upstream_headers = _build_upstream_headers(
             self.headers,
             self.access_token,
-            self.account_id,
+            upstream_account_id,
             accept="application/json",
         )
         pre_request_started_at = time.monotonic()
@@ -2372,6 +3272,18 @@ class _CompactCommandTransport:
                 _as_image_fetch_session(self.session),
                 effective_connect_timeout,
             )
+        _apply_responses_lite_http_header(upstream_headers, payload_dict)
+        try:
+            validate_compact_input_wire_budget(payload_dict)
+        except ClientPayloadError as exc:
+            error = openai_error(
+                exc.code or "invalid_request_error",
+                str(exc),
+                error_type=exc.error_type or "invalid_request_error",
+            )
+            if exc.param is not None:
+                error["error"]["param"] = exc.param
+            raise ProxyResponseError(400, error) from exc
         now = time.monotonic()
         compact_timeout_seconds = _remaining_total_timeout(
             compact_timeout_seconds,
@@ -2422,6 +3334,94 @@ class _CompactCommandTransport:
             headers=upstream_headers,
         )
         try:
+            if self.route is not None:
+                owns_codex_client = self.codex_client is None
+                active_codex_client = self.codex_client or CodexClient(create_codex_session())
+                request_kwargs: dict[str, Any] = {"json": payload_dict, "headers": upstream_headers}
+                if compact_timeout_seconds is not None:
+                    request_kwargs["timeout"] = compact_timeout_seconds
+                try:
+                    request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                    if callable(request_with_metadata):
+                        result = await request_with_metadata("POST", url, route=self.route, **request_kwargs)
+                        resp = result.response
+                        if self.route_trace is not None:
+                            self.route_trace.record(route=result.route, fallback_used=result.fallback_used)
+                    else:
+                        resp = await active_codex_client.request("POST", url, route=self.route, **request_kwargs)
+                        if self.route_trace is not None:
+                            self.route_trace.record(route=self.route, fallback_used=False)
+                finally:
+                    if owns_codex_client:
+                        await active_codex_client.close()
+                status_code = _codex_response_status(resp)
+                if status_code >= 400:
+                    error_payload = await _codex_error_payload_from_response(resp)
+                    archive_json(
+                        direction="server_to_codex",
+                        kind="compact",
+                        transport="http",
+                        payload=error_payload,
+                        account_id=self.account_id,
+                        method="POST",
+                        url=url,
+                        status_code=status_code,
+                        headers=upstream_headers,
+                    )
+                    error_code, error_message = _error_details_from_envelope(error_payload)
+                    failure_phase = "status"
+                    failure_detail = error_message
+                    retryable_same_contract = _is_retryable_compact_status(status_code)
+                    raise ProxyResponseError(
+                        status_code,
+                        error_payload,
+                        failure_phase=failure_phase,
+                        retryable_same_contract=retryable_same_contract,
+                        failure_detail=failure_detail,
+                        upstream_status_code=status_code,
+                    )
+                try:
+                    data = await _codex_response_json(resp)
+                except Exception as exc:
+                    error_code = "upstream_error"
+                    error_message = "Invalid JSON from upstream"
+                    failure_phase = "parse"
+                    failure_detail = str(exc) or error_message
+                    failure_exception_type = type(exc).__name__
+                    raise ProxyResponseError(
+                        502,
+                        openai_error("upstream_error", "Invalid JSON from upstream"),
+                        failure_phase=failure_phase,
+                        failure_detail=failure_detail,
+                        failure_exception_type=failure_exception_type,
+                        upstream_status_code=status_code,
+                    ) from exc
+                parsed = parse_compact_response_payload(data)
+                archive_json(
+                    direction="server_to_codex",
+                    kind="compact",
+                    transport="http",
+                    payload=data,
+                    account_id=self.account_id,
+                    method="POST",
+                    url=url,
+                    status_code=status_code,
+                    headers=upstream_headers,
+                )
+                if parsed:
+                    payload_object = parsed.object
+                    return parsed
+                error_code = "upstream_error"
+                error_message = "Unexpected upstream payload"
+                failure_phase = "parse"
+                failure_detail = f"payload_type={type(data).__name__}"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", "Unexpected upstream payload"),
+                    failure_phase=failure_phase,
+                    failure_detail=failure_detail,
+                    upstream_status_code=status_code,
+                )
             async with _service_circuit_breaker_context(
                 self.session.post(
                     url,
@@ -2557,6 +3557,24 @@ class _CompactCommandTransport:
                 failure_detail=failure_detail,
                 failure_exception_type=failure_exception_type,
             ) from exc
+        except Exception as exc:
+            if self.route is None:
+                raise
+            message = str(exc) or "Request to upstream failed before response"
+            error_code = "upstream_unavailable"
+            error_message = message
+            failure_phase = "connect"
+            failure_detail = message
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", message),
+                failure_phase=failure_phase,
+                retryable_same_contract=retryable_same_contract,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+            ) from exc
         finally:
             _maybe_log_upstream_request_complete(
                 kind="responses_compact",
@@ -2575,6 +3593,85 @@ class _CompactCommandTransport:
             )
 
 
+def _codex_response_status(response: Any) -> int:
+    value = getattr(response, "status_code", getattr(response, "status", None))
+    if value is None:
+        return 0
+    return int(value)
+
+
+async def _codex_response_json(response: Any) -> Any:
+    json_method = getattr(response, "json", None)
+    if callable(json_method):
+        result = json_method()
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+    text = await _codex_response_text(response)
+    return json.loads(text)
+
+
+async def _codex_response_text(response: Any) -> str:
+    text_value = getattr(response, "text", None)
+    if isinstance(text_value, str):
+        return text_value
+    content = await _codex_response_body(response)
+    return content.decode("utf-8", errors="replace")
+
+
+async def _codex_response_body(response: Any) -> bytes:
+    content = getattr(response, "content", None)
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, str):
+        return content.encode()
+    acontent = getattr(response, "acontent", None)
+    if callable(acontent):
+        result = acontent()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if isinstance(result, bytes):
+            return result
+        if isinstance(result, str):
+            return result.encode()
+    read = getattr(response, "read", None)
+    if callable(read):
+        result = read()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if isinstance(result, bytes):
+            return result
+        if isinstance(result, str):
+            return result.encode()
+    return b""
+
+
+def _codex_response_headers(response: Any) -> dict[str, str]:
+    headers = getattr(response, "headers", {}) or {}
+    return {str(key): str(value) for key, value in headers.items()}
+
+
+async def _codex_error_payload_from_response(response: Any) -> OpenAIErrorEnvelope:
+    body = await _codex_response_body(response)
+    status = _codex_response_status(response)
+    try:
+        data: object | None = json.loads(body)
+        text = None
+    except Exception:
+        data = None
+        text = body.decode("utf-8", errors="replace")
+    if is_json_mapping(data):
+        payload_data = cast(dict[str, JsonValue], data)
+        error = parse_error_payload(payload_data)
+        if error:
+            return {"error": _openai_error_detail(error)}
+        message = _extract_upstream_message(payload_data)
+        if message:
+            return openai_error("upstream_error", message)
+    message = (text or "").strip() or f"Upstream error: HTTP {status}"
+    return openai_error("upstream_error", message)
+
+
 async def thread_goal_request(
     operation: str,
     payload: Mapping[str, JsonValue],
@@ -2586,6 +3683,10 @@ async def thread_goal_request(
     timeout_seconds: float | None = None,
     base_url: str | None = None,
     session: aiohttp.ClientSession | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
 ) -> dict[str, JsonValue]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -2606,7 +3707,22 @@ async def thread_goal_request(
         sock_connect=connect_timeout,
         sock_read=total_timeout,
     )
-    client_session = session or get_http_client().session
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation=f"thread goal {operation}",
+    )
+    if route is None and route_trace is not None:
+        route_trace.record_direct()
+    if route is not None:
+        lease = None
+        client_session = None
+    elif session is None:
+        lease = await acquire_http_client()
+        client_session = lease.client.session
+    else:
+        lease = None
+        client_session = session
     started_at = time.monotonic()
     status_code: int | None = None
     error_code: str | None = None
@@ -2623,31 +3739,40 @@ async def thread_goal_request(
         else None,
     )
     try:
-        request_kwargs: dict[str, object] = {
+        request_kwargs: dict[str, Any] = {
             "headers": upstream_headers,
-            "timeout": timeout,
+            "timeout": total_timeout if route is not None else timeout,
         }
         if request_method == "GET":
             request_kwargs["params"] = {key: str(value) for key, value in payload_dict.items() if value is not None}
         else:
             request_kwargs["json"] = payload_dict
-        async with _service_circuit_breaker_context(
-            client_session.request(request_method, url, **request_kwargs),
-            settings=settings,
-            account_id=account_id,
-        ) as resp:
-            status_code = resp.status
-            if resp.status >= 400:
-                error_payload = await _error_payload_from_response(resp)
-                error_code, error_message = _error_details_from_envelope(error_payload)
-                raise ProxyResponseError(resp.status, error_payload)
+        if route is not None:
+            owns_codex_client = codex_client is None
+            active_codex_client = codex_client or CodexClient(create_codex_session())
             try:
-                data = await resp.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                message = str(exc) or "Request to upstream timed out"
-                error_code = "upstream_unavailable"
-                error_message = message
-                raise ProxyResponseError(502, openai_error("upstream_unavailable", message)) from exc
+                request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                if callable(request_with_metadata):
+                    result = await request_with_metadata(request_method, url, route=route, **request_kwargs)
+                    response = result.response
+                    if route_trace is not None:
+                        route_trace.record(route=result.route, fallback_used=result.fallback_used)
+                else:
+                    response = await active_codex_client.request(request_method, url, route=route, **request_kwargs)
+                    if route_trace is not None:
+                        route_trace.record(route=route, fallback_used=False)
+            finally:
+                if owns_codex_client:
+                    close = getattr(active_codex_client, "close", None)
+                    if callable(close):
+                        await close()
+            status_code = _codex_response_status(response)
+            if status_code >= 400:
+                error_payload = await _codex_error_payload_from_response(response)
+                error_code, error_message = _error_details_from_envelope(error_payload)
+                raise ProxyResponseError(status_code, error_payload)
+            try:
+                data = await _codex_response_json(response)
             except Exception as exc:
                 error_code = "upstream_error"
                 error_message = "Invalid JSON from upstream"
@@ -2657,6 +3782,55 @@ async def thread_goal_request(
             error_code = "upstream_error"
             error_message = "Unexpected upstream payload"
             raise ProxyResponseError(502, openai_error("upstream_error", "Unexpected upstream payload"))
+        assert client_session is not None
+        async with _service_circuit_breaker_context(
+            client_session.request(request_method, url, **request_kwargs),
+            settings=settings,
+            account_id=account_id,
+        ) as resp:
+            status_code = resp.status
+            if resp.status >= 400:
+                try:
+                    error_payload = await _error_payload_from_response(resp)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    message = str(exc) or "Request to upstream timed out"
+                    error_code = "upstream_unavailable"
+                    error_message = message
+                    raise ProxyResponseError(
+                        resp.status,
+                        openai_error("upstream_unavailable", message),
+                        failure_phase="status",
+                    ) from exc
+                error_code, error_message = _error_details_from_envelope(error_payload)
+                raise ProxyResponseError(resp.status, error_payload, failure_phase="status")
+            try:
+                data = await resp.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                message = str(exc) or "Request to upstream timed out"
+                error_code = "upstream_unavailable"
+                error_message = message
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", message),
+                    failure_phase="body_read",
+                ) from exc
+            except Exception as exc:
+                error_code = "upstream_error"
+                error_message = "Invalid JSON from upstream"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", "Invalid JSON from upstream"),
+                    failure_phase="parse",
+                ) from exc
+            if isinstance(data, dict):
+                return cast(dict[str, JsonValue], data)
+            error_code = "upstream_error"
+            error_message = "Unexpected upstream payload"
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_error", "Unexpected upstream payload"),
+                failure_phase="parse",
+            )
     except ProxyResponseError as exc:
         if error_code is None and error_message is None:
             error_code, error_message = _error_details_from_envelope(exc.payload)
@@ -2664,23 +3838,46 @@ async def thread_goal_request(
     except CircuitBreakerOpenError as exc:
         error_code = "upstream_unavailable"
         error_message = "Upstream circuit breaker is open"
-        raise ProxyResponseError(503, openai_error("upstream_unavailable", error_message)) from exc
+        raise ProxyResponseError(
+            503,
+            openai_error("upstream_unavailable", error_message),
+            failure_phase="connect",
+        ) from exc
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         message = str(exc) or "Request to upstream timed out"
         error_code = "upstream_unavailable"
         error_message = message
-        raise ProxyResponseError(502, openai_error("upstream_unavailable", message)) from exc
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+        ) from exc
+    except Exception as exc:
+        if route is None:
+            raise
+        message = str(exc) or "Request to upstream failed before response"
+        error_code = "upstream_unavailable"
+        error_message = message
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+        ) from exc
     finally:
-        _maybe_log_upstream_request_complete(
-            kind=f"thread_goal_{operation}",
-            url=url,
-            headers=upstream_headers,
-            method=request_method,
-            started_at=started_at,
-            status_code=status_code,
-            error_code=error_code,
-            error_message=error_message,
-        )
+        try:
+            _maybe_log_upstream_request_complete(
+                kind=f"thread_goal_{operation}",
+                url=url,
+                headers=upstream_headers,
+                method=request_method,
+                started_at=started_at,
+                status_code=status_code,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        finally:
+            if lease is not None:
+                await lease.close()
 
 
 async def codex_control_request(
@@ -2695,6 +3892,10 @@ async def codex_control_request(
     timeout_seconds: float | None = None,
     base_url: str | None = None,
     session: aiohttp.ClientSession | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
 ) -> CodexControlResponse:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -2722,7 +3923,22 @@ async def codex_control_request(
         sock_connect=connect_timeout,
         sock_read=total_timeout,
     )
-    client_session = session or get_http_client().session
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation=f"Codex control {normalized_path}",
+    )
+    if route is None and route_trace is not None:
+        route_trace.record_direct()
+    if route is not None:
+        lease = None
+        client_session = None
+    elif session is None:
+        lease = await acquire_http_client()
+        client_session = lease.client.session
+    else:
+        lease = None
+        client_session = session
     started_at = time.monotonic()
     status_code: int | None = None
     error_code: str | None = None
@@ -2744,6 +3960,44 @@ async def codex_control_request(
         else None,
     )
     try:
+        if route is not None:
+            owns_codex_client = codex_client is None
+            active_codex_client = codex_client or CodexClient(create_codex_session())
+            try:
+                request_kwargs = {
+                    "route": route,
+                    "params": query_params,
+                    "data": payload,
+                    "headers": upstream_headers,
+                    "timeout": total_timeout,
+                }
+                request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                if callable(request_with_metadata):
+                    result = await request_with_metadata(request_method, url, **request_kwargs)
+                    response = result.response
+                    if route_trace is not None:
+                        route_trace.record(route=result.route, fallback_used=result.fallback_used)
+                else:
+                    response = await active_codex_client.request(request_method, url, **request_kwargs)
+                    if route_trace is not None:
+                        route_trace.record(route=route, fallback_used=False)
+            finally:
+                if owns_codex_client:
+                    close = getattr(active_codex_client, "close", None)
+                    if callable(close):
+                        await close()
+            status_code = _codex_response_status(response)
+            body = await _codex_response_body(response)
+            if status_code >= 400:
+                error_payload = await _codex_error_payload_from_response(response)
+                error_code, error_message = _error_details_from_envelope(error_payload)
+                raise ProxyResponseError(status_code, error_payload)
+            return CodexControlResponse(
+                status_code=status_code,
+                body=body,
+                headers=_codex_response_headers(response),
+            )
+        assert client_session is not None
         async with _service_circuit_breaker_context(
             client_session.request(
                 request_method,
@@ -2757,11 +4011,21 @@ async def codex_control_request(
             account_id=account_id,
         ) as resp:
             status_code = resp.status
-            body = await resp.read()
+            try:
+                body = await resp.read()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                message = str(exc) or "Request to upstream timed out"
+                error_code = "upstream_unavailable"
+                error_message = message
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", message),
+                    failure_phase="body_read",
+                ) from exc
             if resp.status >= 400:
                 error_payload = await _error_payload_from_raw_body(resp, body)
                 error_code, error_message = _error_details_from_envelope(error_payload)
-                raise ProxyResponseError(resp.status, error_payload)
+                raise ProxyResponseError(resp.status, error_payload, failure_phase="status")
             return CodexControlResponse(
                 status_code=resp.status,
                 body=body,
@@ -2774,23 +4038,46 @@ async def codex_control_request(
     except CircuitBreakerOpenError as exc:
         error_code = "upstream_unavailable"
         error_message = "Upstream circuit breaker is open"
-        raise ProxyResponseError(503, openai_error("upstream_unavailable", error_message)) from exc
+        raise ProxyResponseError(
+            503,
+            openai_error("upstream_unavailable", error_message),
+            failure_phase="connect",
+        ) from exc
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         message = str(exc) or "Request to upstream timed out"
         error_code = "upstream_unavailable"
         error_message = message
-        raise ProxyResponseError(502, openai_error("upstream_unavailable", message)) from exc
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+        ) from exc
+    except Exception as exc:
+        if route is None:
+            raise
+        message = str(exc) or "Request to upstream failed before response"
+        error_code = "upstream_unavailable"
+        error_message = message
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+        ) from exc
     finally:
-        _maybe_log_upstream_request_complete(
-            kind=f"codex_control_{normalized_path.replace('/', '_')}",
-            url=url,
-            headers=upstream_headers,
-            method=request_method,
-            started_at=started_at,
-            status_code=status_code,
-            error_code=error_code,
-            error_message=error_message,
-        )
+        try:
+            _maybe_log_upstream_request_complete(
+                kind=f"codex_control_{normalized_path.replace('/', '_')}",
+                url=url,
+                headers=upstream_headers,
+                method=request_method,
+                started_at=started_at,
+                status_code=status_code,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        finally:
+            if lease is not None:
+                await lease.close()
 
 
 async def transcribe_audio(
@@ -2804,6 +4091,44 @@ async def transcribe_audio(
     account_id: str | None,
     base_url: str | None = None,
     session: aiohttp.ClientSession | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = True,
+) -> dict[str, JsonValue]:
+    async with lease_http_session(session) as client_session:
+        return await _transcribe_audio_with_session(
+            audio_bytes,
+            filename=filename,
+            content_type=content_type,
+            prompt=prompt,
+            headers=headers,
+            access_token=access_token,
+            account_id=account_id,
+            base_url=base_url,
+            session=client_session,
+            route=route,
+            codex_client=codex_client,
+            route_trace=route_trace,
+            allow_direct_egress=allow_direct_egress,
+        )
+
+
+async def _transcribe_audio_with_session(
+    audio_bytes: bytes,
+    *,
+    filename: str,
+    content_type: str | None,
+    prompt: str | None,
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    session: aiohttp.ClientSession,
+    base_url: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    route_trace: UpstreamProxyRouteTrace | None = None,
+    allow_direct_egress: bool = False,
 ) -> dict[str, JsonValue]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -2823,6 +4148,13 @@ async def transcribe_audio(
         sock_connect=effective_connect_timeout,
         sock_read=effective_total_timeout,
     )
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation="audio transcription",
+    )
+    if route is None and route_trace is not None:
+        route_trace.record_direct()
 
     normalized_filename = filename.strip() if filename else ""
     if not normalized_filename:
@@ -2841,7 +4173,7 @@ async def transcribe_audio(
     if prompt is not None:
         form.add_field("prompt", prompt)
 
-    client_session = session or get_http_client().session
+    client_session = session
     started_at = time.monotonic()
     status_code: int | None = None
     error_code: str | None = None
@@ -2863,6 +4195,72 @@ async def transcribe_audio(
         else None,
     )
     try:
+        if route is not None:
+            owns_codex_client = codex_client is None
+            active_codex_client = codex_client or CodexClient(create_codex_session())
+            data_fields: dict[str, str] = {}
+            if prompt is not None:
+                data_fields["prompt"] = prompt
+            try:
+                request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                request_kwargs: dict[str, Any] = {
+                    "files": {
+                        "file": (
+                            normalized_filename,
+                            audio_bytes,
+                            normalized_content_type,
+                        )
+                    },
+                    "data": data_fields,
+                    "headers": upstream_headers,
+                    "timeout": effective_total_timeout,
+                }
+                if callable(request_with_metadata):
+                    result = await request_with_metadata("POST", url, route=route, **request_kwargs)
+                    response = result.response
+                    if route_trace is not None:
+                        route_trace.record(route=result.route, fallback_used=result.fallback_used)
+                else:
+                    response = await active_codex_client.request("POST", url, route=route, **request_kwargs)
+                    if route_trace is not None:
+                        route_trace.record(route=route, fallback_used=False)
+            except CodexTransportError as exc:
+                error_code = "upstream_unavailable"
+                error_message = _codex_route_transport_error_message(
+                    route=route,
+                    route_trace=route_trace,
+                    operation="transcribe",
+                    exc=exc,
+                )
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", error_message),
+                ) from exc
+            finally:
+                if owns_codex_client:
+                    await active_codex_client.close()
+            status_code = _codex_response_status(response)
+            if status_code >= 400:
+                error_payload = await _codex_error_payload_from_response(response)
+                error_code, error_message = _error_details_from_envelope(error_payload)
+                raise ProxyResponseError(status_code, error_payload)
+            try:
+                data = await _codex_response_json(response)
+            except Exception as exc:
+                error_code = "upstream_error"
+                error_message = "Invalid JSON from upstream"
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_error", "Invalid JSON from upstream"),
+                ) from exc
+            if isinstance(data, dict):
+                return cast(dict[str, JsonValue], data)
+            error_code = "upstream_error"
+            error_message = "Unexpected upstream payload"
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_error", "Unexpected upstream payload"),
+            )
         async with _service_circuit_breaker_context(
             client_session.post(
                 url,
@@ -2875,9 +4273,19 @@ async def transcribe_audio(
         ) as resp:
             status_code = resp.status
             if resp.status >= 400:
-                error_payload = await _error_payload_from_response(resp)
+                try:
+                    error_payload = await _error_payload_from_response(resp)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    message = str(exc) or "Request to upstream timed out"
+                    error_code = "upstream_unavailable"
+                    error_message = message
+                    raise ProxyResponseError(
+                        resp.status,
+                        openai_error("upstream_unavailable", message),
+                        failure_phase="status",
+                    ) from exc
                 error_code, error_message = _error_details_from_envelope(error_payload)
-                raise ProxyResponseError(resp.status, error_payload)
+                raise ProxyResponseError(resp.status, error_payload, failure_phase="status")
             try:
                 data = await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -2887,6 +4295,7 @@ async def transcribe_audio(
                 raise ProxyResponseError(
                     502,
                     openai_error("upstream_unavailable", message),
+                    failure_phase="body_read",
                 ) from exc
             except Exception as exc:
                 error_code = "upstream_error"
@@ -2894,12 +4303,14 @@ async def transcribe_audio(
                 raise ProxyResponseError(
                     502,
                     openai_error("upstream_error", "Invalid JSON from upstream"),
+                    failure_phase="parse",
                 ) from exc
             if isinstance(data, dict):
                 return data
             raise ProxyResponseError(
                 502,
                 openai_error("upstream_error", "Unexpected upstream payload"),
+                failure_phase="parse",
             )
     except ProxyResponseError as exc:
         if error_code is None and error_message is None:
@@ -2911,9 +4322,26 @@ async def transcribe_audio(
         raise ProxyResponseError(
             503,
             openai_error("upstream_unavailable", error_message),
+            failure_phase="connect",
         ) from exc
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         message = str(exc) or "Request to upstream timed out"
+        error_code = "upstream_unavailable"
+        error_message = message
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+        ) from exc
+    except Exception as exc:
+        if route is None:
+            raise
+        message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="transcribe",
+            exc=exc,
+        )
         error_code = "upstream_unavailable"
         error_message = message
         raise ProxyResponseError(

@@ -16,6 +16,7 @@ from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_dict, is_json_list
 
 _SUPPORTED_MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
+_TEXT_CONTENT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
 
 def _json_dict_or_none(value: JsonValue) -> dict[str, JsonValue] | None:
@@ -30,7 +31,12 @@ def _content_parts(content: JsonValue) -> list[JsonValue]:
     return [content]
 
 
-def coerce_messages(existing_instructions: str, messages: Sequence[JsonValue]) -> tuple[str, list[JsonValue]]:
+def coerce_messages(
+    existing_instructions: str,
+    messages: Sequence[JsonValue],
+    *,
+    preserve_instruction_roles: bool = False,
+) -> tuple[str, list[JsonValue]]:
     instruction_parts: list[str] = []
     input_messages: list[JsonValue] = []
     for message in messages:
@@ -45,6 +51,9 @@ def coerce_messages(existing_instructions: str, messages: Sequence[JsonValue]) -
             raise ClientPayloadError(f"Unsupported message role: {role}", param="messages")
         if role in ("system", "developer"):
             _ensure_text_only_content(message_dict.get("content"), role)
+            if preserve_instruction_roles:
+                input_messages.append(cast(JsonValue, _normalize_message_content(cast(OpenAIMessage, message_dict))))
+                continue
             content_text = _content_to_text(message_dict.get("content"))
             if content_text:
                 instruction_parts.append(content_text)
@@ -114,7 +123,7 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
             part_dict = _json_dict_or_none(part)
             if part_dict is not None:
                 part_type = part_dict.get("type")
-                if part_type not in (None, "text"):
+                if part_type not in (None, *_TEXT_CONTENT_PART_TYPES):
                     raise ClientPayloadError(f"{role} messages must be text-only.", param="messages")
                 text = part_dict.get("text")
                 if isinstance(text, str):
@@ -124,7 +133,7 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
     content_dict = _json_dict_or_none(content)
     if content_dict is not None:
         part_type = content_dict.get("type")
-        if part_type not in (None, "text"):
+        if part_type not in (None, *_TEXT_CONTENT_PART_TYPES):
             raise ClientPayloadError(f"{role} messages must be text-only.", param="messages")
         text = content_dict.get("text")
         if isinstance(text, str):
@@ -139,7 +148,7 @@ def _decompose_assistant_tool_calls(message: OpenAIMessage) -> list[JsonValue]:
     if content is not None or refusal is not None:
         parts = _to_content_list(_normalize_content_parts(content, "assistant")) if content is not None else []
         if refusal is not None:
-            parts.append(RefusalContentPart(type="refusal", refusal=refusal))
+            parts.append(cast(JsonValue, RefusalContentPart(type="refusal", refusal=refusal)))
         msg_item: OpenAIMessage = {"role": "assistant", "content": parts}
         items.append(cast(JsonValue, msg_item))
     tool_calls = message.get("tool_calls")
@@ -289,7 +298,7 @@ def _normalize_content_parts(content: JsonValue, role: str = "user") -> JsonValu
 def _normalize_content_part(part: dict[str, JsonValue], role: str = "user") -> JsonValue:
     part_type = part.get("type") or ("text" if "text" in part else None)
     text_type = _text_type_for_role(role)
-    if part_type in ("text", "input_text", "output_text"):
+    if part_type in _TEXT_CONTENT_PART_TYPES:
         text = part.get("text")
         if isinstance(text, str):
             return cast(JsonValue, TextContentPart(type=text_type, text=text))

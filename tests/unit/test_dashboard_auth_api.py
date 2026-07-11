@@ -8,6 +8,7 @@ import pytest
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from app.core.auth.dashboard_access import DashboardRole
 from app.core.auth.dashboard_mode import DashboardAuthMode
 from app.core.auth.dashboard_session_ttl import (
     DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
@@ -130,7 +131,12 @@ async def test_login_password_uses_configured_dashboard_session_ttl_for_cookie()
     )
     session_store = SimpleNamespace(
         create=Mock(return_value="session-1"),
-        get=lambda _sid: SimpleNamespace(password_verified=True, totp_verified=False),
+        get=lambda _sid: SimpleNamespace(
+            password_verified=True,
+            totp_verified=False,
+            role=DashboardRole.ADMIN,
+            guest_verified=False,
+        ),
     )
     context = cast(
         DashboardAuthContext,
@@ -168,6 +174,8 @@ async def test_login_password_uses_configured_dashboard_session_ttl_for_cookie()
         password_verified=True,
         totp_verified=False,
         ttl_seconds=7200,
+        role=DashboardRole.ADMIN,
+        guest_verified=False,
     )
     limiter.check_and_increment.assert_awaited_once()
     limiter.clear_for_key.assert_awaited_once()
@@ -181,7 +189,12 @@ async def test_login_password_uses_one_year_ttl_for_direct_loopback_dashboard_re
     )
     session_store = SimpleNamespace(
         create=Mock(return_value="session-1"),
-        get=lambda _sid: SimpleNamespace(password_verified=True, totp_verified=False),
+        get=lambda _sid: SimpleNamespace(
+            password_verified=True,
+            totp_verified=False,
+            role=DashboardRole.ADMIN,
+            guest_verified=False,
+        ),
     )
     context = cast(
         DashboardAuthContext,
@@ -230,6 +243,8 @@ async def test_login_password_uses_one_year_ttl_for_direct_loopback_dashboard_re
         password_verified=True,
         totp_verified=False,
         ttl_seconds=DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
+        role=DashboardRole.ADMIN,
+        guest_verified=False,
     )
     limiter.check_and_increment.assert_awaited_once()
     limiter.clear_for_key.assert_awaited_once()
@@ -243,7 +258,12 @@ async def test_login_password_caps_non_loopback_dashboard_session_ttl():
     )
     session_store = SimpleNamespace(
         create=Mock(return_value="session-1"),
-        get=lambda _sid: SimpleNamespace(password_verified=True, totp_verified=False),
+        get=lambda _sid: SimpleNamespace(
+            password_verified=True,
+            totp_verified=False,
+            role=DashboardRole.ADMIN,
+            guest_verified=False,
+        ),
     )
     context = cast(
         DashboardAuthContext,
@@ -285,6 +305,8 @@ async def test_login_password_caps_non_loopback_dashboard_session_ttl():
         password_verified=True,
         totp_verified=False,
         ttl_seconds=REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
+        role=DashboardRole.ADMIN,
+        guest_verified=False,
     )
     limiter.check_and_increment.assert_awaited_once()
     limiter.clear_for_key.assert_awaited_once()

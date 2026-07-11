@@ -10,6 +10,7 @@ import {
   sumRemaining,
   weeklyCreditPaceStatus,
   type RemainingItem,
+  type WeeklyCreditPace,
 } from "@/features/dashboard/utils";
 import { createDashboardOverview, createDefaultRequestLogs } from "@/test/mocks/factories";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
@@ -21,15 +22,24 @@ function account(overrides: Partial<AccountSummary> & Pick<AccountSummary, "acco
     displayName: overrides.displayName ?? overrides.email,
     planType: overrides.planType ?? "plus",
     status: overrides.status ?? "active",
+    limitWarmupEnabled: overrides.limitWarmupEnabled ?? false,
+    limitWarmup: overrides.limitWarmup ?? null,
     usage: overrides.usage ?? null,
     resetAtPrimary: overrides.resetAtPrimary ?? null,
     resetAtSecondary: overrides.resetAtSecondary ?? null,
+    resetAtMonthly: overrides.resetAtMonthly ?? null,
     windowMinutesPrimary: overrides.windowMinutesPrimary ?? null,
     windowMinutesSecondary: overrides.windowMinutesSecondary ?? null,
+    windowMinutesMonthly: overrides.windowMinutesMonthly ?? null,
+    capacityCreditsPrimary: overrides.capacityCreditsPrimary ?? null,
+    remainingCreditsPrimary: overrides.remainingCreditsPrimary ?? null,
     capacityCreditsSecondary: overrides.capacityCreditsSecondary ?? null,
     remainingCreditsSecondary: overrides.remainingCreditsSecondary ?? null,
+    capacityCreditsMonthly: overrides.capacityCreditsMonthly ?? null,
+    remainingCreditsMonthly: overrides.remainingCreditsMonthly ?? null,
     auth: overrides.auth ?? null,
     additionalQuotas: overrides.additionalQuotas ?? [],
+    isEmailDuplicate: overrides.isEmailDuplicate,
   };
 }
 
@@ -243,13 +253,13 @@ describe("buildRemainingItems", () => {
     expect(items[1].label).toBe("two@example.com");
   });
 
-  it("appends compact account id only for duplicate emails", () => {
+  it("appends compact account id only when backend marks the slot duplicate", () => {
     const duplicateA = "d48f0bfc-8ea6-48a7-8d76-d0e5ef1816c5_6f12b5d5";
     const duplicateB = "7f9de2ad-7621-4a6f-88bc-ec7f3d914701_91a95cee";
     const items = buildRemainingItems(
       [
-        account({ accountId: duplicateA, email: "dup@example.com" }),
-        account({ accountId: duplicateB, email: "dup@example.com" }),
+        account({ accountId: duplicateA, email: "dup@example.com", isEmailDuplicate: false }),
+        account({ accountId: duplicateB, email: "dup@example.com", isEmailDuplicate: true }),
         account({ accountId: "acc-3", email: "unique@example.com" }),
       ],
       null,
@@ -257,7 +267,7 @@ describe("buildRemainingItems", () => {
     );
 
     expect(items[0].label).toBe("dup@example.com");
-    expect(items[0].labelSuffix).toBe(` (${formatCompactAccountId(duplicateA, 5, 4)})`);
+    expect(items[0].labelSuffix).toBe("");
     expect(items[0].isEmail).toBe(true);
     expect(items[1].label).toBe("dup@example.com");
     expect(items[1].labelSuffix).toBe(` (${formatCompactAccountId(duplicateB, 5, 4)})`);
@@ -265,6 +275,25 @@ describe("buildRemainingItems", () => {
     expect(items[2].label).toBe("unique@example.com");
     expect(items[2].labelSuffix).toBe("");
     expect(items[2].isEmail).toBe(true);
+  });
+
+  it("omits monthly-only accounts from primary and secondary donuts", () => {
+    const monthly = account({
+      accountId: "acc-monthly",
+      email: "monthly@example.com",
+      planType: "free",
+      usage: {
+        primaryRemainingPercent: null,
+        secondaryRemainingPercent: null,
+        monthlyRemainingPercent: 88,
+      },
+      windowMinutesPrimary: null,
+      windowMinutesSecondary: null,
+      windowMinutesMonthly: 43_200,
+    });
+
+    expect(buildRemainingItems([monthly], null, "primary")).toEqual([]);
+    expect(buildRemainingItems([monthly], null, "secondary")).toEqual([]);
   });
 });
 
@@ -444,7 +473,8 @@ describe("buildWeeklyCreditPace", () => {
 
     expect(pace).not.toBeNull();
     expect(pace?.totalExpectedRemainingCredits).toBeCloseTo(800_000);
-    expect(pace?.overPlanCredits).toBeCloseTo(3_950_000);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(790_000);
+    expect(pace?.projectedShortfallCredits).toBeCloseTo(3_950_000);
     expect(pace?.deltaPercent).toBeCloseTo(79);
     expect(pace?.pauseForBreakEvenHours).toBeCloseTo(134.06);
     expect(pace?.paceMultiplier).toBeCloseTo(4.95);
@@ -469,9 +499,10 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.totalExpectedRemainingCredits).toBeCloseTo(100_000);
     expect(pace?.scheduledUsedPercent).toBeCloseTo(50);
     expect(pace?.actualUsedPercent).toBeCloseTo(50);
-    expect(pace?.overPlanCredits).toBeGreaterThan(0);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(0);
+    expect(pace?.projectedShortfallCredits).toBeGreaterThan(0);
     expect(pace?.pauseForBreakEvenHours).toBeCloseTo(90.72);
-    expect(pace?.paceMultiplier).toBeCloseTo(1);
+    expect(pace?.paceMultiplier).toBeCloseTo(2.78);
     expect(pace?.proAccountEquivalentToCoverOverPlan).toBeGreaterThan(0);
     expect(pace?.proAccountsToCoverOverPlan).toBe(6);
     expect(pace?.status).toBe("danger");
@@ -516,7 +547,8 @@ describe("buildWeeklyCreditPace", () => {
     );
 
     expect(pace).not.toBeNull();
-    expect(pace?.overPlanCredits).toBeCloseTo(59_999.01);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(30_000.02);
+    expect(pace?.projectedShortfallCredits).toBeCloseTo(59_999.01);
     expect(pace?.projectedDepletionHours).toBeLessThan(40);
     expect(pace?.proAccountEquivalentToCoverOverPlan).toBeGreaterThan(1);
     expect(pace?.proAccountsToCoverOverPlan).toBe(2);
@@ -533,10 +565,11 @@ describe("buildWeeklyCreditPace", () => {
     );
 
     expect(pace).not.toBeNull();
-    expect(pace?.overPlanCredits).toBeCloseTo(900_000);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(100_000);
+    expect(pace?.projectedShortfallCredits).toBeCloseTo(900_000);
     expect(pace?.pauseForBreakEvenHours).toBeGreaterThan(0);
     expect(pace?.pauseForBreakEvenHours).toBeCloseTo(136.08);
-    expect(pace?.paceMultiplier).toBeCloseTo(2);
+    expect(pace?.paceMultiplier).toBeCloseTo(5.56);
     expect(pace?.throttleToPercent).toBeCloseTo(10);
     expect(pace?.reduceByPercent).toBeCloseTo(90);
     expect(pace?.proAccountEquivalentToCoverOverPlan).toBeCloseTo(17.86);
@@ -555,7 +588,8 @@ describe("buildWeeklyCreditPace", () => {
     );
 
     expect(pace).not.toBeNull();
-    expect(pace?.overPlanCredits).toBeCloseTo(99_999.01);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(50_000.02);
+    expect(pace?.projectedShortfallCredits).toBeCloseTo(99_999.01);
     expect(pace?.pauseForBreakEvenHours).toBeCloseTo(84);
     expect(pace?.throttleToPercent).toBeCloseTo(0.002);
     expect(pace?.projectedDepletionHours).toBeCloseTo(0);
@@ -618,7 +652,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace).not.toBeNull();
     expect(pace?.accountCount).toBe(5);
     expect(pace?.totalActualRemainingCredits).toBeCloseTo(58_438.8);
-    expect(pace?.overPlanCredits).toBeCloseTo(20_510.96);
+    expect(pace?.scheduleGapCredits).toBeCloseTo(17_226.02);
+    expect(pace?.projectedShortfallCredits).toBeCloseTo(20_510.96);
     expect(pace?.pauseForBreakEvenHours).toBeGreaterThan(0);
     expect(pace?.paceMultiplier).toBeGreaterThan(1);
     expect(pace?.throttleToPercent).toBeGreaterThanOrEqual(0);
@@ -644,6 +679,81 @@ describe("buildWeeklyCreditPace", () => {
 });
 
 describe("buildDashboardView", () => {
+  it("prefers backend weekly credit pace when the overview provides it", () => {
+    const serverPace: WeeklyCreditPace = {
+      totalFullCredits: 50_400,
+      totalActualRemainingCredits: 38_304,
+      totalExpectedRemainingCredits: 41_904,
+      actualUsedPercent: 24,
+      scheduledUsedPercent: 16.86,
+      deltaPercent: 7.14,
+      scheduleGapCredits: 3_600,
+      smoothedDeltaPercent: 7.14,
+      smoothedScheduleGapCredits: 3_600,
+      paceGapSmoothingMinutes: 30,
+      overPlanCredits: 3_600,
+      projectedShortfallCredits: 0,
+      pauseForBreakEvenHours: null,
+      paceMultiplier: 0,
+      throttleToPercent: null,
+      reduceByPercent: null,
+      proAccountEquivalentToCoverOverPlan: null,
+      proAccountsToCoverOverPlan: null,
+      projectedDepletionHours: null,
+      projectedMinimumRemainingCredits: 38_304,
+      forecastBurnRateCreditsPerHour: 0,
+      scheduledBurnRateCreditsPerHour: 300,
+      status: "ahead",
+      accountCount: 1,
+      staleAccountCount: 0,
+      inactiveAccountCount: 0,
+      confidence: "high",
+    };
+    const overview = createDashboardOverview({
+      accounts: [
+        account({
+          accountId: "acc-server-pace",
+          email: "pace@example.com",
+          capacityCreditsSecondary: 50_400,
+          remainingCreditsSecondary: 50_400,
+          resetAtSecondary: "2026-01-14T12:00:00Z",
+          windowMinutesSecondary: 10_080,
+        }),
+      ],
+    });
+
+    const view = buildDashboardView({ ...overview, weeklyCreditPace: serverPace }, createDefaultRequestLogs(), false);
+
+    expect(view.weeklyCreditPace).toBe(serverPace);
+  });
+
+  it("keeps an explicit null backend weekly credit pace instead of falling back locally", () => {
+    const weeklyResetAt = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const overview = createDashboardOverview({
+      weeklyCreditPace: null,
+      accounts: [
+        account({
+          accountId: "acc-null-server-pace",
+          email: "null-pace@example.com",
+          usage: {
+            primaryRemainingPercent: null,
+            secondaryRemainingPercent: 50,
+          },
+          capacityCreditsSecondary: 50_400,
+          remainingCreditsSecondary: 25_200,
+          resetAtSecondary: weeklyResetAt,
+          windowMinutesSecondary: 10_080,
+        }),
+      ],
+    });
+
+    expect(buildWeeklyCreditPace(overview.accounts)).not.toBeNull();
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
+
+    expect(view.weeklyCreditPace).toBeNull();
+  });
+
   it("keeps donut totals anchored to window capacity even when displayed slices are constrained", () => {
     const overview = createDashboardOverview({
       accounts: [
@@ -790,5 +900,292 @@ describe("buildDashboardView", () => {
     expect(view.primaryUsageItems[0]?.value).toBeCloseTo(202.5);
     expect(view.primaryUsageItems[0]?.remainingPercent).toBe(90);
     expect(overview.summary.primaryWindow.capacityCredits).toBe(225);
+  });
+
+  it("adds account burn rate from per-account window consumption", () => {
+    const overview = createDashboardOverview({
+      accounts: [
+        account({
+          accountId: "acc-1",
+          email: "one@example.com",
+          usage: {
+            primaryRemainingPercent: 50,
+            secondaryRemainingPercent: 25,
+          },
+          resetAtPrimary: null,
+          resetAtSecondary: null,
+          windowMinutesPrimary: 300,
+          windowMinutesSecondary: 10080,
+        }),
+        account({
+          accountId: "acc-2",
+          email: "two@example.com",
+          usage: {
+            primaryRemainingPercent: 80,
+            secondaryRemainingPercent: 100,
+          },
+          resetAtPrimary: null,
+          resetAtSecondary: null,
+          windowMinutesPrimary: 300,
+          windowMinutesSecondary: 10080,
+        }),
+      ],
+    });
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
+    const burn = view.stats[3];
+
+    expect(burn.label).toBe("Account burn projection (5h/7d)");
+    expect(burn.value).toBe("0.7 / 0.8");
+    expect(burn.meta).toBe("Projected account-equivalents: 0.7/5h · 0.8/7d");
+    expect(view.stats[4]?.label).toBe("Error rate (7d)");
+  });
+
+  it("can hide the account burn rate card", () => {
+    const overview = createDashboardOverview();
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), {
+      isDark: false,
+      showAccountBurnrate: false,
+    });
+
+    expect(view.stats.map((stat) => stat.label)).not.toContain("Account burn projection (5h/7d)");
+    expect(view.stats).toHaveLength(4);
+  });
+
+  it("counts quota-exceeded secondary windows as fully burned", () => {
+    const overview = createDashboardOverview({
+      accounts: [
+        account({
+          accountId: "acc-1",
+          email: "one@example.com",
+          status: "quota_exceeded",
+          usage: {
+            primaryRemainingPercent: 100,
+            secondaryRemainingPercent: 80,
+          },
+          resetAtPrimary: null,
+          resetAtSecondary: null,
+          windowMinutesPrimary: 300,
+          windowMinutesSecondary: 10080,
+        }),
+      ],
+    });
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
+    const burn = view.stats[3];
+
+    expect(burn.value).toBe("0.0 / 1.0");
+    expect(burn.meta).toBe("Projected account-equivalents: 0.0/5h · 1.0/7d");
+  });
+
+  it("shows only the averaged cost text on the estimated cost card", () => {
+    const weeklyView = buildDashboardView(
+      createDashboardOverview({
+        summary: {
+          primaryWindow: {
+            remainingPercent: 63.5,
+            capacityCredits: 225,
+            remainingCredits: 142.875,
+            resetAt: null,
+            windowMinutes: 300,
+          },
+          secondaryWindow: {
+            remainingPercent: 55.2,
+            capacityCredits: 7560,
+            remainingCredits: 4173.12,
+            resetAt: null,
+            windowMinutes: 10080,
+          },
+          cost: {
+            currency: "USD",
+            totalUsd: 56,
+          },
+          metrics: {
+            requests: 228,
+            tokens: 45000,
+            cachedInputTokens: 8200,
+            errorRate: 0.028,
+            errorCount: 6,
+            topError: "rate_limit_exceeded",
+          },
+        },
+      }),
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    const dailyView = buildDashboardView(
+      createDashboardOverview({
+        timeframe: {
+          key: "1d",
+          windowMinutes: 1440,
+          bucketSeconds: 3600,
+          bucketCount: 24,
+        },
+        summary: {
+          primaryWindow: {
+            remainingPercent: 63.5,
+            capacityCredits: 225,
+            remainingCredits: 142.875,
+            resetAt: null,
+            windowMinutes: 300,
+          },
+          secondaryWindow: {
+            remainingPercent: 55.2,
+            capacityCredits: 7560,
+            remainingCredits: 4173.12,
+            resetAt: null,
+            windowMinutes: 10080,
+          },
+          cost: {
+            currency: "USD",
+            totalUsd: 24,
+          },
+          metrics: {
+            requests: 228,
+            tokens: 45000,
+            cachedInputTokens: 8200,
+            errorRate: 0.028,
+            errorCount: 6,
+            topError: "rate_limit_exceeded",
+          },
+        },
+      }),
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    expect(weeklyView.stats[2]?.meta).toBe("Avg/day $8.00");
+    expect(dailyView.stats[2]?.meta).toBe("Avg/hr $1.00");
+  });
+
+  it("adds previous-window comparison indicators to requests tokens and cost cards", () => {
+    const overview = createDashboardOverview();
+
+    const view = buildDashboardView(
+      {
+        ...overview,
+        summary: {
+          ...overview.summary,
+          metrics: {
+            requests: 1500,
+            tokens: 450,
+            cachedInputTokens: 0,
+            errorRate: 0.028,
+            errorCount: 6,
+            topError: "rate_limit_exceeded",
+          },
+          cost: {
+            currency: "USD",
+            totalUsd: 15,
+          },
+          comparison: {
+            canCompare: true,
+            previous: {
+              requests: 1000,
+              tokens: 900,
+              costUsd: 10,
+            },
+          },
+        },
+      },
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    expect(view.stats[0]?.comparison).toEqual({ text: "▲ 50%", tone: "positive" });
+    expect(view.stats[1]?.comparison).toEqual({ text: "▼ 50%", tone: "negative" });
+    expect(view.stats[2]?.comparison).toEqual({ text: "▲ 50%", tone: "positive" });
+    expect(view.stats[view.stats.length - 1]?.comparison).toBeUndefined();
+  });
+
+  it("hides comparison indicators for sub-percent deltas that would round to 0%", () => {
+    const overview = createDashboardOverview();
+
+    const view = buildDashboardView(
+      {
+        ...overview,
+        summary: {
+          ...overview.summary,
+          metrics: {
+            requests: 1001,
+            tokens: 999,
+            cachedInputTokens: 0,
+            errorRate: 0.028,
+            errorCount: 6,
+            topError: "rate_limit_exceeded",
+          },
+          cost: {
+            currency: "USD",
+            totalUsd: 10.04,
+          },
+          comparison: {
+            canCompare: true,
+            previous: {
+              requests: 1000,
+              tokens: 1000,
+              costUsd: 10,
+            },
+          },
+        },
+      },
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    expect(view.stats[0]?.comparison).toBeUndefined();
+    expect(view.stats[1]?.comparison).toBeUndefined();
+    expect(view.stats[2]?.comparison).toBeUndefined();
+  });
+
+  it("hides previous-window comparison indicators when comparison is unavailable or previous totals are zero", () => {
+    const overview = createDashboardOverview();
+
+    const unavailableView = buildDashboardView(
+      {
+        ...overview,
+        summary: {
+          ...overview.summary,
+          comparison: {
+            canCompare: false,
+            previous: {
+              requests: 1000,
+              tokens: 1000,
+              costUsd: 10,
+            },
+          },
+        },
+      },
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    expect(unavailableView.stats[0]?.comparison).toBeUndefined();
+    expect(unavailableView.stats[1]?.comparison).toBeUndefined();
+    expect(unavailableView.stats[2]?.comparison).toBeUndefined();
+
+    const zeroPreviousView = buildDashboardView(
+      {
+        ...overview,
+        summary: {
+          ...overview.summary,
+          comparison: {
+            canCompare: true,
+            previous: {
+              requests: 0,
+              tokens: 0,
+              costUsd: 0,
+            },
+          },
+        },
+      },
+      createDefaultRequestLogs(),
+      false,
+    );
+
+    expect(zeroPreviousView.stats[0]?.comparison).toBeUndefined();
+    expect(zeroPreviousView.stats[1]?.comparison).toBeUndefined();
+    expect(zeroPreviousView.stats[2]?.comparison).toBeUndefined();
   });
 });

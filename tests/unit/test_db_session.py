@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import app.db.session as session_module
+from app.db.models import Account, AccountStatus, Base
 from app.db.sqlite_utils import IntegrityCheck, SqliteIntegrityCheckMode
 
 
@@ -84,6 +88,63 @@ def test_import_session_with_postgres_url_does_not_error() -> None:
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+@pytest.mark.asyncio
+async def test_sqlite_writer_section_serializes_file_sqlite_writers(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'store.db'}"),
+    )
+    monkeypatch.setattr(session_module, "_sqlite_writer_lock", None)
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    order: list[str] = []
+
+    async def first_writer() -> None:
+        async with session_module.sqlite_writer_section():
+            order.append("first-start")
+            first_entered.set()
+            await release_first.wait()
+            order.append("first-end")
+
+    async def second_writer() -> None:
+        async with session_module.sqlite_writer_section():
+            order.append("second-start")
+            order.append("second-end")
+
+    first_task = asyncio.create_task(first_writer())
+    await first_entered.wait()
+    second_task = asyncio.create_task(second_writer())
+    await asyncio.sleep(0)
+
+    assert order == ["first-start"]
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert order == ["first-start", "first-end", "second-start", "second-end"]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_writer_section_does_not_serialize_memory_sqlite(monkeypatch) -> None:
+    monkeypatch.setattr(session_module, "_settings", _FakeSettings(database_url="sqlite+aiosqlite:///:memory:"))
+    monkeypatch.setattr(session_module, "_sqlite_writer_lock", None)
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def first_writer() -> None:
+        async with session_module.sqlite_writer_section():
+            first_entered.set()
+            await second_entered.wait()
+
+    async def second_writer() -> None:
+        await first_entered.wait()
+        async with session_module.sqlite_writer_section():
+            second_entered.set()
+
+    await asyncio.wait_for(asyncio.gather(first_writer(), second_writer()), timeout=1)
 
 
 def test_background_pool_defaults_to_main_pool_settings(monkeypatch) -> None:
@@ -184,6 +245,108 @@ def test_postgres_engine_kwargs_use_nullpool_under_test_db_url(monkeypatch) -> N
     assert kwargs["poolclass"] is NullPool
     assert "pool_pre_ping" not in kwargs
     assert "pool_recycle" not in kwargs
+
+
+def test_sqlite_file_engine_kwargs_use_nullpool_without_pool_controls(monkeypatch) -> None:
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(
+            database_url="sqlite+aiosqlite:///store.db",
+            database_pool_size=15,
+            database_max_overflow=10,
+            database_pool_timeout_seconds=30.0,
+        ),
+    )
+
+    kwargs = session_module._sqlite_file_async_engine_kwargs()
+
+    assert kwargs["poolclass"] is NullPool
+    assert kwargs["connect_args"] == {"timeout": 30.0}
+    assert "pool_size" not in kwargs
+    assert "max_overflow" not in kwargs
+    assert "pool_timeout" not in kwargs
+
+
+def test_postgres_engine_kwargs_keep_pool_controls(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_LB_TEST_DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(
+            database_url="postgresql+asyncpg://u:p@h/db",
+            database_pool_size=12,
+            database_max_overflow=4,
+            database_pool_timeout_seconds=11.0,
+            database_pool_recycle_seconds=900,
+        ),
+    )
+
+    kwargs = session_module._postgres_async_engine_kwargs("postgresql+asyncpg://u:p@h/db", background=False)
+
+    assert kwargs["pool_pre_ping"] is True
+    assert kwargs["pool_recycle"] == 900
+    assert kwargs["pool_size"] == 12
+    assert kwargs["max_overflow"] == 4
+    assert kwargs["pool_timeout"] == 11.0
+
+
+@pytest.mark.asyncio
+async def test_close_session_rolls_back_open_transaction_before_close() -> None:
+    calls: list[str] = []
+
+    class _Session:
+        def in_transaction(self) -> bool:
+            return True
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    await session_module.close_session(cast(Any, _Session()))
+
+    assert calls == ["rollback", "close"]
+
+
+@pytest.mark.asyncio
+async def test_detach_session_objects_keeps_loaded_fields_available_after_rollback() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with session_factory() as session:
+            session.add(
+                Account(
+                    id="acc_detached",
+                    chatgpt_account_id="workspace-detached",
+                    email="detached@example.com",
+                    plan_type="plus",
+                    access_token_encrypted=b"access",
+                    refresh_token_encrypted=b"refresh",
+                    id_token_encrypted=b"id",
+                    last_refresh=datetime(2026, 1, 1),
+                    status=AccountStatus.ACTIVE,
+                )
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            account = await session.get(Account, "acc_detached")
+            assert account is not None
+            assert account.status == AccountStatus.ACTIVE
+            session_module.detach_session_objects(session)
+            await session.rollback()
+
+        assert account.id == "acc_detached"
+        assert account.status == AccountStatus.ACTIVE
+        assert account.chatgpt_account_id == "workspace-detached"
+        assert account.access_token_encrypted == b"access"
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -499,28 +662,17 @@ async def test_init_background_db_creates_separate_engine() -> None:
 
 
 @pytest.mark.asyncio
-async def test_init_background_db_uses_main_pool_size_for_postgres_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("CODEX_LB_TEST_DATABASE_URL", raising=False)
-    monkeypatch.setattr(
-        session_module,
-        "_settings",
-        _FakeSettings(
-            database_url="postgresql+asyncpg://user:pass@localhost/db",
-            database_pool_size=15,
-            database_max_overflow=10,
-            database_background_pool_size=None,
-            database_background_max_overflow=None,
-        ),
-    )
-
+async def test_init_background_db_uses_main_pool_size_for_postgres_by_default() -> None:
     session_module.init_background_db("postgresql+asyncpg://user:pass@localhost/db")
 
     assert session_module._background_engine is not None
     assert session_module._background_session_factory is not None
 
     pool = session_module._background_engine.pool
-    assert not isinstance(pool, NullPool)
-    assert cast(Any, pool).size() == 15
+    if os.environ.get("CODEX_LB_TEST_DATABASE_URL"):
+        assert isinstance(pool, NullPool)
+    else:
+        assert cast(Any, pool).size() == 15
 
     if session_module._background_engine is not None:
         await session_module._background_engine.dispose()
@@ -550,3 +702,68 @@ async def test_get_background_session_falls_back_to_main_pool_when_not_initializ
     async with session_module.get_background_session() as session:
         assert session is not None
         assert isinstance(session, session_module.AsyncSession)
+
+
+@pytest.mark.asyncio
+async def test_safe_close_outlives_caller_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    cleanup_done = asyncio.Event()
+
+    class FakeSession:
+        async def close(self) -> None:
+            started.set()
+            await release.wait()
+            closed.set()
+
+    async def run_cleanup() -> None:
+        try:
+            await session_module._safe_close(cast(session_module.AsyncSession, FakeSession()))
+        finally:
+            cleanup_done.set()
+
+    async with asyncio.TaskGroup() as group:
+        task = group.create_task(run_cleanup())
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup_done.is_set()
+        release.set()
+
+    assert closed.is_set()
+    assert cleanup_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_safe_rollback_outlives_caller_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    rolled_back = asyncio.Event()
+    cleanup_done = asyncio.Event()
+
+    class FakeSession:
+        def in_transaction(self) -> bool:
+            return True
+
+        async def rollback(self) -> None:
+            started.set()
+            await release.wait()
+            rolled_back.set()
+
+    async def run_cleanup() -> None:
+        try:
+            await session_module._safe_rollback(cast(session_module.AsyncSession, FakeSession()))
+        finally:
+            cleanup_done.set()
+
+    async with asyncio.TaskGroup() as group:
+        task = group.create_task(run_cleanup())
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup_done.is_set()
+        release.set()
+
+    assert rolled_back.is_set()
+    assert cleanup_done.is_set()
