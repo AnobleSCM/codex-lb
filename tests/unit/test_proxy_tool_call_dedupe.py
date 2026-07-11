@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from collections.abc import Mapping
+from typing import Any, cast
 
 import pytest
 
@@ -11,6 +12,12 @@ from app.modules.proxy import service as proxy_service
 from app.modules.proxy import tool_call_dedupe
 
 pytestmark = pytest.mark.unit
+
+
+def _loads_item_arguments(item: Mapping[str, JsonValue]) -> Any:
+    arguments = item["arguments"]
+    assert isinstance(arguments, str)
+    return json.loads(arguments)
 
 
 def test_mark_duplicate_tool_call_downstream_event_keeps_distinct_call_ids_with_same_arguments():
@@ -110,6 +117,84 @@ def test_mark_duplicate_tool_call_downstream_event_suppresses_exec_command_with_
             response_id="resp_dupe",
         )
         is True
+    )
+
+
+def test_mark_duplicate_tool_call_downstream_event_suppresses_code_mode_exec_replay():
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    first_payload: dict[str, JsonValue] = {
+        "type": "response.output_item.done",
+        "response_id": "resp_code_mode",
+        "item": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": "const r = await tools.exec_command({cmd: 'touch marker'}); text(r.output);",
+            "call_id": "call_exec",
+        },
+    }
+    replay_payload: dict[str, JsonValue] = {
+        **first_payload,
+        "response_id": "resp_code_mode_replay",
+    }
+
+    assert (
+        tool_call_dedupe.mark_duplicate_tool_call_downstream_event(
+            first_payload,
+            seen_tool_call_keys=upstream_control.seen_tool_call_keys,
+            response_id="resp_code_mode",
+            scope_side_effects_by_response_id=False,
+        )
+        is False
+    )
+    assert (
+        tool_call_dedupe.mark_duplicate_tool_call_downstream_event(
+            replay_payload,
+            seen_tool_call_keys=upstream_control.seen_tool_call_keys,
+            response_id="resp_code_mode_replay",
+            scope_side_effects_by_response_id=False,
+        )
+        is True
+    )
+
+
+def test_mark_duplicate_tool_call_downstream_event_keeps_distinct_code_mode_exec_call_ids():
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    first_payload: dict[str, JsonValue] = {
+        "type": "response.output_item.done",
+        "response_id": "resp_code_mode_first",
+        "item": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": "const r = await tools.exec_command({cmd: 'pwd'}); text(r.output);",
+            "call_id": "call_exec_first",
+        },
+    }
+    second_payload: dict[str, JsonValue] = {
+        "type": "response.output_item.done",
+        "response_id": "resp_code_mode_second",
+        "item": {
+            **cast(dict[str, JsonValue], first_payload["item"]),
+            "call_id": "call_exec_second",
+        },
+    }
+
+    assert (
+        tool_call_dedupe.mark_duplicate_tool_call_downstream_event(
+            first_payload,
+            seen_tool_call_keys=upstream_control.seen_tool_call_keys,
+            response_id="resp_code_mode_first",
+            scope_side_effects_by_response_id=False,
+        )
+        is False
+    )
+    assert (
+        tool_call_dedupe.mark_duplicate_tool_call_downstream_event(
+            second_payload,
+            seen_tool_call_keys=upstream_control.seen_tool_call_keys,
+            response_id="resp_code_mode_second",
+            scope_side_effects_by_response_id=False,
+        )
+        is False
     )
 
 
@@ -280,7 +365,7 @@ def test_rewrite_parallel_tool_call_payload_removes_duplicate_side_effect_tool_u
     assert isinstance(rewritten_payload, dict)
     item = rewritten_payload["item"]
     assert isinstance(item, dict)
-    rewritten_arguments = json.loads(item["arguments"])
+    rewritten_arguments = _loads_item_arguments(item)
     assert len(rewritten_arguments["tool_uses"]) == 2
     commands = [tool_use["parameters"]["cmd"] for tool_use in rewritten_arguments["tool_uses"]]
     assert commands == [
@@ -338,7 +423,7 @@ def test_rewrite_parallel_tool_call_payload_removes_duplicate_write_stdin_owner(
     assert isinstance(rewritten_payload, dict)
     item = rewritten_payload["item"]
     assert isinstance(item, dict)
-    rewritten_arguments = json.loads(item["arguments"])
+    rewritten_arguments = _loads_item_arguments(item)
     chars = [tool_use["parameters"]["chars"] for tool_use in rewritten_arguments["tool_uses"]]
     assert chars == ["", "y"]
 
@@ -380,7 +465,7 @@ def test_rewrite_parallel_tool_call_payload_removes_duplicate_wait_agent_targets
     assert isinstance(rewritten_payload, dict)
     item = rewritten_payload["item"]
     assert isinstance(item, dict)
-    rewritten_arguments = json.loads(item["arguments"])
+    rewritten_arguments = _loads_item_arguments(item)
     assert len(rewritten_arguments["tool_uses"]) == 1
     assert rewritten_arguments["tool_uses"][0]["parameters"]["targets"] == ["agent_b", "agent_a"]
 
@@ -1365,6 +1450,40 @@ def test_dedupe_replayed_side_effect_input_items_keeps_read_only_custom_tool_cal
     assert deduped_items == input_items
 
 
+@pytest.mark.parametrize("tool_name", ["exec", "collaboration"])
+def test_dedupe_replayed_side_effect_input_items_keeps_distinct_code_mode_calls(tool_name: str):
+    repeated_input = "const result = await tools.exec_command({cmd: 'pwd'}); text(result.output);"
+    input_items: list[JsonValue] = [
+        {
+            "type": "custom_tool_call",
+            "name": tool_name,
+            "input": repeated_input,
+            "call_id": "call_code_mode_first",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_code_mode_first",
+            "output": "first result",
+        },
+        {
+            "type": "custom_tool_call",
+            "name": tool_name,
+            "input": repeated_input,
+            "call_id": "call_code_mode_second",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_code_mode_second",
+            "output": "second result",
+        },
+    ]
+
+    deduped_items, removed_count = tool_call_dedupe.dedupe_replayed_side_effect_input_items(input_items)
+
+    assert removed_count == 0
+    assert deduped_items == input_items
+
+
 def test_dedupe_replayed_side_effect_input_items_resets_across_read_only_tool_call():
     repeated_arguments = json.dumps({"cmd": "pytest"})
     input_items: list[JsonValue] = [
@@ -1498,7 +1617,7 @@ def test_rewrite_parallel_tool_call_payload_removes_duplicate_goal_side_effects(
     assert isinstance(rewritten_payload, dict)
     item = rewritten_payload["item"]
     assert isinstance(item, dict)
-    rewritten_arguments = json.loads(item["arguments"])
+    rewritten_arguments = _loads_item_arguments(item)
     assert [tool_use["recipient_name"] for tool_use in rewritten_arguments["tool_uses"]] == [
         "functions.update_plan",
         "functions.request_user_input",

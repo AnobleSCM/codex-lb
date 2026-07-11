@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.openai.exceptions import ClientPayloadError
 from app.core.types import JsonObject, JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 
@@ -38,6 +39,13 @@ _INTERLEAVED_REASONING_KEYS = frozenset({"reasoning_content", "reasoning_details
 _INTERLEAVED_REASONING_PART_TYPES = frozenset({"reasoning", "reasoning_content", "reasoning_details"})
 _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
+_COMPACT_STATE_TOOL_NAMES = frozenset({"create_goal", "get_goal", "update_goal", "update_plan"})
+_COMPACT_TOOL_CALL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call", "apply_patch_call"})
+_COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(
+    {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
+)
+_GOAL_CONTINUATION_CONTEXT_PREFIX = '<codex_internal_context source="goal">'
+_PLAN_MODE_CONTEXT_PREFIX = "<collaboration_mode># Plan Mode"
 
 
 def _json_mapping_or_none(value: JsonValue) -> Mapping[str, JsonValue] | None:
@@ -185,6 +193,41 @@ def extract_input_file_ids(input_value: JsonValue) -> set[str]:
     return file_ids
 
 
+def _append_input_image_file_references(
+    references: list[InputImageFileReference],
+    value: JsonValue,
+    *,
+    item_index: int,
+    content_index: int | None,
+) -> None:
+    if is_json_mapping(value):
+        file_id = _input_image_file_reference(value)
+        if file_id is not None:
+            references.append(
+                InputImageFileReference(
+                    item_index=item_index,
+                    content_index=content_index,
+                    file_id=file_id,
+                )
+            )
+        for child in value.values():
+            _append_input_image_file_references(
+                references,
+                child,
+                item_index=item_index,
+                content_index=content_index,
+            )
+        return
+    if is_json_list(value):
+        for child in value:
+            _append_input_image_file_references(
+                references,
+                child,
+                item_index=item_index,
+                content_index=content_index,
+            )
+
+
 def extract_input_image_file_references(input_value: JsonValue) -> list[InputImageFileReference]:
     if not is_json_list(input_value):
         return []
@@ -210,28 +253,172 @@ def extract_input_image_file_references(input_value: JsonValue) -> list[InputIma
         else:
             parts = []
         for content_index, part in enumerate(parts):
-            if not is_json_mapping(part):
-                continue
-            file_id = _input_image_file_reference(part)
-            if file_id is not None:
-                references.append(
-                    InputImageFileReference(
-                        item_index=item_index,
-                        content_index=content_index,
-                        file_id=file_id,
-                    )
-                )
+            _append_input_image_file_references(
+                references,
+                part,
+                item_index=item_index,
+                content_index=content_index,
+            )
+        output = item_mapping.get("output")
+        _append_input_image_file_references(
+            references,
+            output,
+            item_index=item_index,
+            content_index=None,
+        )
     return references
+
+
+def _is_preserved_non_message_directive(item: Mapping[str, JsonValue]) -> bool:
+    # Shared preservation rule: any system/developer-role input item whose type
+    # is present and not "message" must reach upstream byte-identical. It gates
+    # instruction hoisting, input sanitization, and compact trim anchoring.
+    if item.get("role") not in ("system", "developer"):
+        return False
+    item_type = item.get("type")
+    return item_type is not None and item_type != "message"
 
 
 def _sanitize_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
     sanitized_input: list[JsonValue] = []
     for item in input_items:
+        item_mapping = _json_mapping_or_none(item)
+        if item_mapping is not None and _is_preserved_non_message_directive(item_mapping):
+            # Preserved directives are forwarded unchanged; the interleaved
+            # reasoning sanitizer targets assistant-message echo fields and
+            # must not strip keys such as tool_calls or reasoning_content
+            # from a typed directive.
+            sanitized_input.append(item)
+            continue
         sanitized_item = _sanitize_interleaved_reasoning_input_item(item)
         if sanitized_item is None:
             continue
         sanitized_input.append(_normalize_role_input_item(sanitized_item))
     return sanitized_input
+
+
+def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
+    if not is_json_mapping(data):
+        return data
+    input_value = data.get("input")
+    if not is_json_list(input_value):
+        return data
+    # Codex deliberately places the Lite tool bundle and base instructions in
+    # the input prefix. Keep that wire shape intact instead of lifting its
+    # developer message into the top-level ``instructions`` field.
+    if responses_input_uses_lite_tools(input_value):
+        return data
+
+    instruction_parts: list[str] = []
+    input_items: list[JsonValue] = []
+    changed = False
+    for item in input_value:
+        item_mapping = _json_mapping_or_none(item)
+        if item_mapping is None:
+            input_items.append(item)
+            continue
+        # Only hoist actual message items (type omitted or "message"). Non-message
+        # typed system/developer items (e.g. the Codex responses-lite
+        # {"type": "additional_tools", "role": "developer", "tools": [...]} bundle, or
+        # any future typed item) carry no instruction content; hoisting used to drop
+        # them entirely, so pass them through untouched regardless of role.
+        if _is_preserved_non_message_directive(item_mapping):
+            input_items.append(item)
+            # Still counts as a normalization outcome: directive-only inputs
+            # must default top-level ``instructions`` (to "") so the request
+            # validates instead of failing on the required field.
+            changed = True
+            continue
+        role = item_mapping.get("role")
+        if role not in ("system", "developer"):
+            input_items.append(item)
+            continue
+        instruction_text, preserved_content = _split_responses_instruction_item_content(item_mapping)
+        if instruction_text:
+            instruction_parts.append(instruction_text)
+        if preserved_content is not None:
+            preserved_item = dict(item_mapping)
+            preserved_item["role"] = "user"
+            preserved_item["content"] = preserved_content
+            input_items.append(preserved_item)
+        changed = True
+
+    if not changed:
+        return data
+
+    normalized: MutableJsonObject = dict(data)
+    existing_instructions = normalized.get("instructions")
+    merged_instructions = _merge_responses_instructions(
+        existing_instructions if isinstance(existing_instructions, str) else "",
+        instruction_parts,
+    )
+    normalized["instructions"] = merged_instructions
+    normalized["input"] = input_items
+    return normalized
+
+
+def _is_responses_lite_input(input_value: list[JsonValue]) -> bool:
+    # Responses Lite requests carry their tool bundle as an input item with
+    # type=additional_tools and deliberately place base instructions as a
+    # developer message in input (with empty top-level instructions). That
+    # shape is exactly what the lite upstream expects, so the instruction
+    # lift must leave the whole request untouched.
+    return any(
+        (mapping := _json_mapping_or_none(item)) is not None and mapping.get("type") == "additional_tools"
+        for item in input_value
+    )
+
+
+def responses_input_uses_lite_tools(input_value: JsonValue) -> bool:
+    return is_json_list(input_value) and _is_responses_lite_input(input_value)
+
+
+def _merge_responses_instructions(existing: str, extra_parts: list[str]) -> str:
+    extra = "\n".join(part for part in extra_parts if part)
+    if not extra:
+        return existing
+    if existing:
+        return f"{existing}\n{extra}"
+    return extra
+
+
+def _split_responses_instruction_item_content(item: Mapping[str, JsonValue]) -> tuple[str, JsonValue | None]:
+    content = item.get("content")
+    if content is None:
+        return "", None
+    if isinstance(content, str):
+        return content, None
+    if is_json_list(content):
+        instruction_parts: list[str] = []
+        preserved_parts: list[JsonValue] = []
+        for part in _json_parts(content):
+            text = _responses_instruction_content_text(part)
+            if text is not None:
+                if text:
+                    instruction_parts.append(text)
+                continue
+            preserved_parts.append(part)
+        preserved_content: JsonValue | None = preserved_parts if preserved_parts else None
+        return "\n".join(instruction_parts), preserved_content
+    text = _responses_instruction_content_text(content)
+    if text is not None:
+        return text, None
+    return "", content
+
+
+def _responses_instruction_item_text(item: Mapping[str, JsonValue]) -> str:
+    instruction_text, _ = _split_responses_instruction_item_content(item)
+    return instruction_text
+
+
+def _responses_instruction_content_text(content: JsonValue) -> str | None:
+    if isinstance(content, str):
+        return content
+    content_mapping = _json_mapping_or_none(content)
+    if content_mapping is None:
+        return None
+    text = content_mapping.get("text")
+    return text if isinstance(text, str) else None
 
 
 def _sanitize_interleaved_reasoning_input_item(item: JsonValue) -> JsonValue | None:
@@ -420,6 +607,11 @@ class ResponsesTextControls(BaseModel):
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _move_input_instruction_messages(cls, data: JsonValue) -> JsonValue:
+        return _normalize_responses_input_instructions(data)
+
     model: str = Field(min_length=1)
     instructions: str
     input: JsonValue
@@ -466,7 +658,9 @@ class ResponsesRequest(BaseModel):
     def _validate_truncation(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        raise ValueError("truncation is not supported")
+        if value not in {"auto", "disabled"}:
+            raise ValueError("truncation must be 'auto' or 'disabled'")
+        return value
 
     @field_validator("store")
     @classmethod
@@ -513,6 +707,11 @@ class ResponsesRequest(BaseModel):
 class ResponsesCompactRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _move_input_instruction_messages(cls, data: JsonValue) -> JsonValue:
+        return _normalize_responses_input_instructions(data)
+
     model: str = Field(min_length=1)
     instructions: str
     input: JsonValue
@@ -558,21 +757,75 @@ class ResponsesCompactRequest(BaseModel):
 
 _UNSUPPORTED_UPSTREAM_FIELDS = {
     "max_output_tokens",
+    "metadata",
     "prompt_cache_retention",
     "safety_identifier",
     "temperature",
     "top_p",
+    "truncation",
+    "user",
 }
+
+_POISONED_LOCAL_COMPACT_FALLBACK_TEXT = "Local compact fallback preserved the latest encrypted reasoning state."
+_MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS = 100_000
+_COMPACT_UPSTREAM_HEAD_ESTIMATED_TOKENS = 12_000
+_ESTIMATED_CHARS_PER_TOKEN = 4
 
 
 def _strip_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     _normalize_openai_compatible_aliases(payload)
     _normalize_service_tier_aliases(payload)
     _sanitize_interleaved_reasoning_input(payload)
+    _strip_poisoned_local_compact_fallback_items(payload)
     _canonicalize_tools(payload)
     for key in _UNSUPPORTED_UPSTREAM_FIELDS:
         payload.pop(key, None)
     return payload
+
+
+def _strip_poisoned_local_compact_fallback_items(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if not is_json_list(input_value):
+        return
+
+    input_items = input_value
+    kept: list[JsonValue] = []
+    skip_next_poison_compaction = False
+    changed = False
+    for item in input_items:
+        if skip_next_poison_compaction and is_json_mapping(item) and item.get("type") == "compaction":
+            encrypted_content = item.get("encrypted_content")
+            if isinstance(encrypted_content, str) and encrypted_content:
+                skip_next_poison_compaction = False
+                changed = True
+                continue
+        skip_next_poison_compaction = False
+
+        if _is_poisoned_local_compact_fallback_message(item):
+            skip_next_poison_compaction = True
+            changed = True
+            continue
+
+        kept.append(item)
+
+    if changed:
+        payload["input"] = kept
+
+
+def _is_poisoned_local_compact_fallback_message(item: JsonValue) -> bool:
+    if not is_json_mapping(item):
+        return False
+    if item.get("type") != "message" or item.get("role") != "assistant":
+        return False
+    content = item.get("content")
+    if not is_json_list(content):
+        return False
+    for part in content:
+        if not is_json_mapping(part):
+            continue
+        if part.get("text") == _POISONED_LOCAL_COMPACT_FALLBACK_TEXT:
+            return True
+    return False
 
 
 def _canonicalize_tools(payload: MutableJsonObject) -> None:
@@ -612,11 +865,395 @@ def _sort_keys_recursive(value: JsonValue) -> JsonValue:
 
 def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     payload = _strip_unsupported_fields(payload)
+    normalized_payload = _normalize_responses_input_instructions(payload)
+    if is_json_mapping(normalized_payload):
+        payload = dict(normalized_payload)
+    _trim_compact_input_for_upstream(payload)
     payload.pop("store", None)
+    payload.pop("text", None)
     payload.pop("tools", None)
     payload.pop("tool_choice", None)
+    payload.pop("client_metadata", None)
     payload["parallel_tool_calls"] = False
     return payload
+
+
+def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if not is_json_list(input_value):
+        return
+    token_counts = [_estimated_json_array_item_tokens(item) for item in input_value]
+    total_tokens = _estimated_json_tokens(input_value)
+    if total_tokens <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        return
+
+    head_count = _compact_trim_prefix_count(token_counts)
+    preserved_indices = _compact_state_anchor_indices(input_value)
+    required_indices = set(preserved_indices)
+    if input_value:
+        required_indices.add(len(input_value) - 1)
+    required_indices = _compact_reconciled_tool_call_indices(
+        input_value,
+        required_indices,
+        token_counts=token_counts,
+        token_budget=sum(token_counts),
+        required_indices=required_indices,
+    )
+    required_input = _compact_trimmed_input_with_markers(input_value, token_counts, required_indices)
+    required_tokens = _estimated_json_tokens(required_input)
+    if required_tokens > _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        raise ClientPayloadError(
+            "Compact input exceeds the upstream size limit and cannot be trimmed "
+            "without removing required state anchors.",
+            param="input",
+            code="responses_compact_input_too_large",
+        )
+    selected_indices = set(preserved_indices)
+    selected_indices.update(range(head_count))
+    marker_tokens = _estimated_json_array_item_tokens(_compact_trim_marker(omitted_items=0, omitted_tokens=0))
+    selected_tokens = sum(token_counts[index] for index in selected_indices)
+    tail_budget = max(0, _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS - selected_tokens - marker_tokens)
+    selected_indices.update(
+        _compact_trim_suffix_indices(
+            token_counts,
+            selected_indices=selected_indices,
+            start_index=head_count,
+            token_budget=tail_budget,
+        )
+    )
+    selected_indices.update(required_indices)
+    selected_indices = _compact_reconciled_tool_call_indices(
+        input_value,
+        selected_indices,
+        token_counts=token_counts,
+        token_budget=max(0, _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS - marker_tokens),
+        required_indices=required_indices,
+    )
+    selected_indices = _compact_fit_selected_indices_to_wire_budget(
+        input_value,
+        token_counts,
+        selected_indices=selected_indices,
+        required_indices=required_indices,
+    )
+    trimmed_input = (
+        input_value
+        if len(selected_indices) == len(input_value)
+        else _compact_trimmed_input_with_markers(input_value, token_counts, selected_indices)
+    )
+    trimmed_tokens = _estimated_json_tokens(trimmed_input)
+    if trimmed_tokens > _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        raise ClientPayloadError(
+            "Compact input still exceeds the upstream size limit after retaining required compact context.",
+            param="input",
+            code="responses_compact_input_too_large",
+        )
+    if trimmed_input is input_value:
+        return
+    payload["input"] = trimmed_input
+
+
+def _compact_fit_selected_indices_to_wire_budget(
+    input_value: list[JsonValue],
+    token_counts: list[int],
+    *,
+    selected_indices: set[int],
+    required_indices: set[int],
+) -> set[int]:
+    """Drop best-effort middle context until the exact serialized input fits."""
+
+    selected = set(selected_indices)
+    optional_indices = sorted(
+        selected - required_indices,
+        key=lambda index: (min(index, len(input_value) - 1 - index), index),
+        reverse=True,
+    )
+    marker_budget = max(
+        0,
+        _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS
+        - _estimated_json_array_item_tokens(_compact_trim_marker(omitted_items=0, omitted_tokens=0)),
+    )
+    for index in optional_indices:
+        candidate_input = _compact_trimmed_input_with_markers(input_value, token_counts, selected)
+        if _estimated_json_tokens(candidate_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+            break
+        if index not in selected:
+            continue
+        trial = set(selected)
+        trial.remove(index)
+        trial = _compact_reconciled_tool_call_indices(
+            input_value,
+            trial,
+            token_counts=token_counts,
+            token_budget=marker_budget,
+            required_indices=required_indices,
+            allow_pair_additions=False,
+        )
+        if required_indices <= trial and trial != selected:
+            selected = trial
+    return selected
+
+
+def validate_compact_input_wire_budget(payload: Mapping[str, JsonValue]) -> None:
+    """Reject compact input that exceeds the upstream budget after transformations."""
+
+    input_value = payload.get("input")
+    if not is_json_list(input_value):
+        return
+    if _estimated_json_tokens(input_value) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        return
+    raise ClientPayloadError(
+        "Compact input exceeds the upstream size limit after preparing the final wire payload.",
+        param="input",
+        code="responses_compact_input_too_large",
+        error_type="invalid_request_error",
+    )
+
+
+def _compact_state_anchor_indices(input_value: list[JsonValue]) -> set[int]:
+    preserved_indices: set[int] = set()
+    for index, item in enumerate(input_value):
+        if not is_json_mapping(item):
+            continue
+        item_mapping = item
+        if item_mapping.get("type") == "additional_tools":
+            preserved_indices.add(index)
+            developer_index = index + 1
+            if developer_index < len(input_value):
+                developer_item = input_value[developer_index]
+                if is_json_mapping(developer_item) and developer_item.get("role") == "developer":
+                    developer_type = developer_item.get("type")
+                    if developer_type is None or developer_type == "message":
+                        preserved_indices.add(developer_index)
+        if _is_preserved_non_message_directive(item_mapping):
+            preserved_indices.add(index)
+        if _compact_item_is_state_anchor(item_mapping):
+            preserved_indices.add(index)
+    return preserved_indices
+
+
+def _compact_reconciled_tool_call_indices(
+    input_value: list[JsonValue],
+    selected_indices: set[int],
+    *,
+    token_counts: list[int],
+    token_budget: int,
+    required_indices: set[int] | None = None,
+    allow_pair_additions: bool = True,
+) -> set[int]:
+    call_indices_by_id: dict[str, list[int]] = {}
+    output_indices_by_id: dict[str, list[int]] = {}
+    for index, item in enumerate(input_value):
+        if not is_json_mapping(item):
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        item_type = item.get("type")
+        if item_type in _COMPACT_TOOL_CALL_ITEM_TYPES:
+            call_indices_by_id.setdefault(call_id, []).append(index)
+        elif item_type in _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES:
+            output_indices_by_id.setdefault(call_id, []).append(index)
+
+    reconciled = set(selected_indices)
+    protected_indices = required_indices or set()
+    selected_tokens = sum(token_counts[index] for index in reconciled)
+
+    def add_indices(indices: Iterable[int]) -> bool:
+        nonlocal selected_tokens
+        missing_indices = [index for index in indices if index not in reconciled]
+        missing_tokens = sum(token_counts[index] for index in missing_indices)
+        if selected_tokens + missing_tokens > token_budget:
+            return False
+        reconciled.update(missing_indices)
+        selected_tokens += missing_tokens
+        return True
+
+    def remove_indices(indices: Iterable[int]) -> None:
+        nonlocal selected_tokens
+        for index in indices:
+            if index in reconciled and index not in protected_indices:
+                reconciled.remove(index)
+                selected_tokens -= token_counts[index]
+
+    def matching_call_index(call_indices: list[int], output_index: int) -> int | None:
+        if not call_indices:
+            return None
+        preceding_call_indices = [call_index for call_index in call_indices if call_index < output_index]
+        if preceding_call_indices:
+            return preceding_call_indices[-1]
+        return call_indices[0]
+
+    def matching_output_indices(call_indices: list[int], call_index: int, output_indices: list[int]) -> list[int]:
+        next_call_indices = [next_call_index for next_call_index in call_indices if next_call_index > call_index]
+        next_call_index = next_call_indices[0] if next_call_indices else None
+        return [
+            output_index
+            for output_index in output_indices
+            if output_index > call_index and (next_call_index is None or output_index < next_call_index)
+        ]
+
+    for call_id, output_indices in output_indices_by_id.items():
+        selected_outputs = [index for index in output_indices if index in reconciled]
+        if not selected_outputs:
+            continue
+        call_indices = call_indices_by_id.get(call_id, [])
+        for output_index in selected_outputs:
+            call_index = matching_call_index(call_indices, output_index)
+            if call_index is None:
+                remove_indices([output_index])
+            elif not allow_pair_additions and call_index not in reconciled:
+                remove_indices([output_index])
+            elif not add_indices([call_index]):
+                remove_indices([output_index])
+    for call_id, call_indices in call_indices_by_id.items():
+        output_indices = output_indices_by_id.get(call_id, [])
+        for call_index in call_indices:
+            if call_index not in reconciled:
+                continue
+            matched_output_indices = matching_output_indices(call_indices, call_index, output_indices)
+            if not matched_output_indices:
+                remove_indices([call_index])
+                continue
+            if not allow_pair_additions and any(index not in reconciled for index in matched_output_indices):
+                remove_indices([call_index, *matched_output_indices])
+                continue
+            if not add_indices(matched_output_indices):
+                remove_indices([call_index, *matched_output_indices])
+    return reconciled
+
+
+def _compact_item_is_state_anchor(item: Mapping[str, JsonValue]) -> bool:
+    item_type = item.get("type")
+    if item_type == "additional_tools":
+        return True
+    if item_type in {None, "message"} and item.get("role") in {"system", "developer"}:
+        return True
+    if item_type == "function_call":
+        name = item.get("name")
+        if isinstance(name, str) and name in _COMPACT_STATE_TOOL_NAMES:
+            return True
+        function = item.get("function")
+        if is_json_mapping(function):
+            function_name = function.get("name")
+            if isinstance(function_name, str) and function_name in _COMPACT_STATE_TOOL_NAMES:
+                return True
+    for text in _compact_item_texts(item):
+        stripped = text.lstrip()
+        if stripped.startswith(_GOAL_CONTINUATION_CONTEXT_PREFIX):
+            return True
+        if stripped.startswith(_PLAN_MODE_CONTEXT_PREFIX):
+            return True
+    return False
+
+
+def _compact_item_texts(item: Mapping[str, JsonValue]) -> list[str]:
+    content = item.get("content")
+    if isinstance(content, str):
+        return [content]
+    if is_json_mapping(content):
+        content_parts: list[JsonValue] = [content]
+    elif is_json_list(content):
+        content_parts = content
+    else:
+        return []
+
+    texts: list[str] = []
+    for part in content_parts:
+        if isinstance(part, str):
+            texts.append(part)
+            continue
+        if not is_json_mapping(part):
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
+
+
+def _compact_trimmed_input_with_markers(
+    input_value: list[JsonValue], token_counts: list[int], selected_indices: set[int]
+) -> list[JsonValue]:
+    trimmed: list[JsonValue] = []
+    omitted_items = 0
+    omitted_tokens = 0
+    for index, item in enumerate(input_value):
+        if index in selected_indices:
+            if omitted_items:
+                trimmed.append(_compact_trim_marker(omitted_items=omitted_items, omitted_tokens=omitted_tokens))
+                omitted_items = 0
+                omitted_tokens = 0
+            trimmed.append(item)
+        else:
+            omitted_items += 1
+            omitted_tokens += token_counts[index]
+    if omitted_items:
+        trimmed.append(_compact_trim_marker(omitted_items=omitted_items, omitted_tokens=omitted_tokens))
+    return trimmed
+
+
+def _compact_trim_prefix_count(token_counts: list[int]) -> int:
+    used = 0
+    count = 0
+    for token_count in token_counts:
+        if used + token_count > _COMPACT_UPSTREAM_HEAD_ESTIMATED_TOKENS:
+            break
+        used += token_count
+        count += 1
+    return count
+
+
+def _compact_trim_suffix_indices(
+    token_counts: list[int], *, selected_indices: set[int], start_index: int, token_budget: int
+) -> set[int]:
+    used = 0
+    indices: set[int] = set()
+    for index in range(len(token_counts) - 1, start_index - 1, -1):
+        if index in selected_indices:
+            continue
+        token_count = token_counts[index]
+        if indices and used + token_count > token_budget:
+            break
+        if not indices and token_count > token_budget:
+            indices.add(index)
+            break
+        used += token_count
+        indices.add(index)
+    return indices
+
+
+def _compact_trim_marker(*, omitted_items: int, omitted_tokens: int) -> JsonObject:
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    "[compact trim] Omitted "
+                    f"{omitted_items} input items (~{omitted_tokens} estimated tokens) "
+                    "before forwarding this oversized compact request upstream. The initial "
+                    "context, most recent context, and compact state anchors were preserved."
+                ),
+            }
+        ],
+    }
+
+
+def _estimated_json_tokens(value: JsonValue) -> int:
+    # Match stdlib/aiohttp's default JSON wire escaping and separators. Calling
+    # this on the whole input list also counts brackets, commas, and inter-item
+    # whitespace, so many individually small items cannot bypass the cap.
+    serialized = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    return max(1, (len(serialized) + _ESTIMATED_CHARS_PER_TOKEN - 1) // _ESTIMATED_CHARS_PER_TOKEN)
+
+
+def _estimated_json_array_item_tokens(value: JsonValue) -> int:
+    serialized = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    # Every retained item also needs the array's comma-space delimiter. The
+    # final whole-array validation below accounts exactly for brackets and the
+    # missing delimiter after the last item.
+    wire_chars = len(serialized) + 2
+    return max(1, (wire_chars + _ESTIMATED_CHARS_PER_TOKEN - 1) // _ESTIMATED_CHARS_PER_TOKEN)
 
 
 def _sanitize_interleaved_reasoning_input(payload: MutableJsonObject) -> None:
@@ -667,7 +1304,7 @@ def _normalize_thinking_alias(
         return {"effort": "medium"} if thinking else None
     if isinstance(thinking, str):
         normalized = thinking.strip().lower()
-        if normalized in {"low", "medium", "high", "xhigh"}:
+        if normalized in {"low", "medium", "high", "xhigh", "max", "ultra"}:
             return {"effort": normalized}
         if normalized in {"enabled", "true", "on"}:
             return {"effort": "medium"}

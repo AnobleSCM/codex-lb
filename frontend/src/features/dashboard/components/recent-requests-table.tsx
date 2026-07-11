@@ -32,6 +32,7 @@ import {
   formatCompactNumber,
   formatCurrency,
   formatModelLabel,
+  formatElapsed,
   formatSlug,
   formatTimeLong,
 } from "@/utils/formatters";
@@ -44,13 +45,18 @@ const STATUS_CLASS_MAP: Record<string, string> = {
 };
 
 const TRANSPORT_LABELS: Record<string, string> = {
+  auto: "Auto",
   http: "HTTP",
   websocket: "WS",
+  automation: "Automation",
 };
 
 const TRANSPORT_CLASS_MAP: Record<string, string> = {
+  auto: "bg-purple-500/10 text-purple-700 border-purple-500/20 hover:bg-purple-500/15 dark:text-purple-300",
   http: "bg-slate-500/10 text-slate-700 border-slate-500/20 hover:bg-slate-500/15 dark:text-slate-300",
   websocket: "bg-sky-500/15 text-sky-700 border-sky-500/20 hover:bg-sky-500/20 dark:text-sky-300",
+  automation:
+    "bg-indigo-500/15 text-indigo-700 border-indigo-500/20 hover:bg-indigo-500/20 dark:text-indigo-300",
 };
 
 const PLAN_CLASS_MAP: Record<string, string> = {
@@ -58,6 +64,12 @@ const PLAN_CLASS_MAP: Record<string, string> = {
   plus: "bg-emerald-500/15 text-emerald-700 border-emerald-500/20 hover:bg-emerald-500/20 dark:text-emerald-400",
   team: "bg-sky-500/15 text-sky-700 border-sky-500/20 hover:bg-sky-500/20 dark:text-sky-300",
   pro: "bg-violet-500/15 text-violet-700 border-violet-500/20 hover:bg-violet-500/20 dark:text-violet-300",
+};
+
+const REQUEST_KIND_LABELS: Record<string, string> = {
+  normal: "Normal",
+  warmup: "Warmup",
+  limit_warmup: "Warmup",
 };
 
 export type RecentRequestsTableProps = {
@@ -71,6 +83,46 @@ export type RecentRequestsTableProps = {
   onOffsetChange: (offset: number) => void;
 };
 
+function formatRequestCostSummary(request: RequestLog | null): string | null {
+  if (!request || request.status !== "ok") {
+    return null;
+  }
+
+  const totalUsd = request.costBreakdown?.totalUsd ?? request.costUsd;
+  const segments: string[] = [];
+  const cachedInputTokens = request.cachedInputTokens ?? 0;
+  const nonCachedInputTokens =
+    request.inputTokens == null ? null : Math.max(0, request.inputTokens - cachedInputTokens);
+
+  if (nonCachedInputTokens != null && request.costBreakdown?.inputUsd != null) {
+    segments.push(
+      `${formatCompactNumber(nonCachedInputTokens)} Input (${formatCurrency(request.costBreakdown.inputUsd)})`,
+    );
+  }
+
+  if (request.cachedInputTokens != null && request.costBreakdown?.cachedInputUsd != null) {
+    segments.push(
+      `${formatCompactNumber(request.cachedInputTokens)} Cached (${formatCurrency(request.costBreakdown.cachedInputUsd)})`,
+    );
+  }
+
+  if (request.outputTokens != null && request.costBreakdown?.outputUsd != null) {
+    segments.push(
+      `${formatCompactNumber(request.outputTokens)} Output (${formatCurrency(request.costBreakdown.outputUsd)})`,
+    );
+  }
+
+  if (segments.length === 0) {
+    return null;
+  }
+
+  if (totalUsd == null) {
+    return segments.join(" + ");
+  }
+
+  return `${formatCurrency(totalUsd)} = ${segments.join(" + ")}`;
+}
+
 export function RecentRequestsTable({
   requests,
   accounts,
@@ -83,6 +135,7 @@ export function RecentRequestsTable({
 }: RecentRequestsTableProps) {
   const [selectedRequest, setSelectedRequest] = useState<RequestLog | null>(null);
   const blurred = usePrivacyStore((s) => s.blurred);
+  const selectedRequestCostSummary = formatRequestCostSummary(selectedRequest);
 
   const accountLabelMap = useMemo(() => {
     const index = new Map<string, string>();
@@ -126,8 +179,8 @@ export function RecentRequestsTable({
               <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Plan</TableHead>
               <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">API Key</TableHead>
               <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Model</TableHead>
-              <TableHead className="w-20 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Transport</TableHead>
-              <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Status</TableHead>
+              <TableHead className="w-32 pr-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Transport</TableHead>
+              <TableHead className="w-24 pl-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Status</TableHead>
               <TableHead className="w-24 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Tokens</TableHead>
               <TableHead className="w-16 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Cost</TableHead>
               <TableHead className="w-72 pr-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Details</TableHead>
@@ -136,7 +189,7 @@ export function RecentRequestsTable({
           <TableBody>
             {requests.map((request) => {
               const time = formatTimeLong(request.requestedAt);
-              const accountLabel = request.accountId ? (accountLabelMap.get(request.accountId) ?? request.accountId) : "—";
+              const accountLabel = request.accountId ? (accountLabelMap.get(request.accountId) ?? request.accountId) : "Unassigned";
               const isEmailLabel = !!(request.accountId && emailLabelIds.has(request.accountId));
               const errorPreview = request.errorMessage || request.errorCode || "-";
               const hasError = !!(request.errorCode || request.errorMessage);
@@ -145,6 +198,7 @@ export function RecentRequestsTable({
                 !!request.requestedServiceTier && request.requestedServiceTier !== visibleServiceTier;
               const planType = request.planType?.trim().toLowerCase() || null;
               const planLabel = planType ? formatSlug(planType) : "--";
+              const upstreamTransport = request.upstreamTransport;
 
               return (
                 <TableRow key={request.requestId}>
@@ -181,6 +235,11 @@ export function RecentRequestsTable({
                       <span className="font-mono text-xs">
                         {formatModelLabel(request.model, request.reasoningEffort, visibleServiceTier)}
                       </span>
+                      {request.requestKind === "warmup" || request.requestKind === "limit_warmup" ? (
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {REQUEST_KIND_LABELS.warmup}
+                        </div>
+                      ) : null}
                       {showRequestedTier ? (
                         <div className="text-[11px] text-muted-foreground">
                           Requested {request.requestedServiceTier}
@@ -188,19 +247,27 @@ export function RecentRequestsTable({
                       ) : null}
                     </div>
                   </TableCell>
-                  <TableCell className="align-top">
+                  <TableCell className="pr-3 align-top">
                     {request.transport ? (
-                      <Badge
-                        variant="outline"
-                        className={TRANSPORT_CLASS_MAP[request.transport] ?? TRANSPORT_CLASS_MAP.http}
-                      >
-                        {TRANSPORT_LABELS[request.transport] ?? request.transport}
-                      </Badge>
+                      <div className="space-y-1">
+                        <Badge
+                          variant="outline"
+                          className={TRANSPORT_CLASS_MAP[request.transport] ?? TRANSPORT_CLASS_MAP.http}
+                          title="Downstream client transport"
+                        >
+                          {TRANSPORT_LABELS[request.transport] ?? request.transport}
+                        </Badge>
+                        {upstreamTransport ? (
+                          <div className="text-[11px] text-muted-foreground">
+                            Up {TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport}
+                          </div>
+                        ) : null}
+                      </div>
                     ) : (
                       <span className="text-xs text-muted-foreground">--</span>
                     )}
                   </TableCell>
-                  <TableCell className="align-top">
+                  <TableCell className="pl-3 align-top">
                     <Badge
                       variant="outline"
                       className={STATUS_CLASS_MAP[request.status] ?? STATUS_CLASS_MAP.error}
@@ -294,14 +361,46 @@ export function RecentRequestsTable({
               <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label="Status" value={selectedRequest ? (REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status) : "—"} />
                 <RequestDetailField label="Model" value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
+                <RequestDetailField label="Request kind" value={selectedRequest ? (REQUEST_KIND_LABELS[selectedRequest.requestKind] ?? selectedRequest.requestKind) : "—"} />
                 <RequestDetailField label="Plan" value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
+                <RequestDetailField label="Elapsed" value={formatElapsed(selectedRequest?.latencyMs ?? null)} />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label="Transport" value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
                 <RequestDetailField label="Time" value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt) : "—"} />
                 <RequestDetailField label="Error Code" value={selectedRequest?.errorCode ?? "—"} mono />
               </div>
+              <RequestDetailField
+                label="User Agent"
+                value={selectedRequest?.useragent ?? "—"}
+                copyValue={selectedRequest?.useragent ?? undefined}
+                copyLabel="Copy User Agent"
+                compactCopy
+              />
+              <RequestDetailField
+                label="Client IP"
+                value={selectedRequest?.clientIp ?? "—"}
+                copyValue={selectedRequest?.clientIp ?? undefined}
+                copyLabel="Copy Client IP"
+                compactCopy
+              />
             </div>
 
-            <RequestArchivePanel requestId={selectedRequest?.requestId} requestedAt={selectedRequest?.requestedAt} />
+            <RequestArchivePanel
+              requestId={selectedRequest?.archiveRequestId ?? selectedRequest?.requestId}
+              requestedAt={selectedRequest?.requestedAt}
+            />
+
+            {selectedRequestCostSummary ? (
+              <div className="space-y-2">
+                <h3 className="text-sm font-medium">Cost</h3>
+                <div className="rounded-md bg-muted/50 p-3">
+                  <p className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">
+                    {selectedRequestCostSummary}
+                  </p>
+                </div>
+              </div>
+            ) : null}
 
             <div className="space-y-2">
               <div className="flex items-center gap-2">

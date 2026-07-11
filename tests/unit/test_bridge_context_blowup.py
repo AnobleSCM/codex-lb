@@ -18,6 +18,7 @@ These tests are LOCAL ONLY — not pushed upstream.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -35,6 +36,16 @@ from app.db.models import AccountStatus
 from app.modules.proxy import service as proxy_service
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio(loop_scope="session")]
+
+
+def _without_installation_metadata(text: str) -> dict[str, Any]:
+    payload = json.loads(text)
+    client_metadata = payload.get("client_metadata")
+    if isinstance(client_metadata, dict):
+        client_metadata.pop("x-codex-installation-id", None)
+        if not client_metadata:
+            payload.pop("client_metadata", None)
+    return payload
 
 
 def _make_session(*, closed: bool = False) -> proxy_service._HTTPBridgeSession:
@@ -118,6 +129,7 @@ class TestSubmitClosedSessionWithPreviousResponseId:
         websocket reconnect since there's no server-side state to preserve."""
         service = proxy_service.ProxyService(cast(Any, nullcontext()))
         session = _make_session(closed=True)
+        service._http_bridge_sessions[session.key] = session
         request_state = _make_request_state(previous_response_id=None)
 
         # Mock the retry to succeed (reconnect works)
@@ -297,10 +309,20 @@ class TestRetryHelperPreservesPreviousResponseId:
         )
 
         assert result is True
-        send_text.assert_awaited_once_with('{"type":"response.create","input":"hello"}')
+        send_text.assert_awaited_once()
+        send_text_await = send_text.await_args
+        assert send_text_await is not None
+        assert _without_installation_metadata(send_text_await.args[0]) == {
+            "type": "response.create",
+            "input": "hello",
+        }
         assert request_state.previous_response_id is None
         assert request_state.proxy_injected_previous_response_id is False
-        assert request_state.request_text == '{"type":"response.create","input":"hello"}'
+        assert request_state.request_text is not None
+        assert _without_installation_metadata(request_state.request_text) == {
+            "type": "response.create",
+            "input": "hello",
+        }
 
 
 class TestContextGrowthScenarios:
@@ -311,7 +333,7 @@ class TestContextGrowthScenarios:
     - Apr 13 (broken):   17 turns, 70K tok/turn, max 853K, 2 compactions
     """
 
-    def test_healthy_growth_rate_stays_within_budget(self):
+    async def test_healthy_growth_rate_stays_within_budget(self):
         """With previous_response_id preserved, each turn adds only new content."""
         system_prompt_tokens = 50_000
         content_per_turn = 2_300  # avg from Apr 11 sessions
@@ -330,7 +352,7 @@ class TestContextGrowthScenarios:
 
         assert context < context_window
 
-    def test_broken_growth_rate_fills_window_fast(self):
+    async def test_broken_growth_rate_fills_window_fast(self):
         """Without previous_response_id, context fills in <20 turns."""
         system_prompt_tokens = 50_000
         growth_per_turn = 70_000  # avg from Apr 13 sessions (broken)
@@ -347,7 +369,7 @@ class TestContextGrowthScenarios:
         assert compaction_turn is not None
         assert compaction_turn < 20
 
-    def test_error_code_determines_growth_rate(self):
+    async def test_error_code_determines_growth_rate(self):
         """502 -> CLI retries with previous_response_id -> healthy growth
         400 previous_response_not_found -> CLI drops it -> broken growth"""
         error_502 = ProxyResponseError(

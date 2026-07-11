@@ -367,22 +367,7 @@ async def test_internal_drain_start_rejects_non_loopback_clients():
 
 
 @pytest.mark.asyncio
-async def test_internal_drain_start_rejects_private_network_clients():
-    from app.modules.health.api import start_internal_drain
-
-    request = SimpleNamespace(
-        client=SimpleNamespace(host="10.42.0.12"),
-        app=SimpleNamespace(state=SimpleNamespace(proxy_service=None)),
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await start_internal_drain(cast(Any, request))
-
-    assert exc_info.value.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_internal_drain_stop_clears_draining_state():
+async def test_internal_drain_stop_clears_draining_flags():
     from app.modules.health.api import stop_internal_drain
 
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
@@ -393,10 +378,10 @@ async def test_internal_drain_stop_clears_draining_state():
     ):
         response = await stop_internal_drain(cast(Any, request))
 
-    set_bridge_drain_active.assert_called_once_with(False)
     set_draining.assert_called_once_with(False)
+    set_bridge_drain_active.assert_called_once_with(False)
     assert response.status == "ok"
-    assert response.checks == {"draining": "stopped"}
+    assert response.checks == {"draining": "false"}
 
 
 @pytest.mark.asyncio
@@ -407,6 +392,21 @@ async def test_internal_drain_stop_rejects_non_loopback_clients():
 
     with pytest.raises(HTTPException) as exc_info:
         await stop_internal_drain(cast(Any, request))
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_internal_drain_start_rejects_private_network_clients():
+    from app.modules.health.api import start_internal_drain
+
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="10.42.0.12"),
+        app=SimpleNamespace(state=SimpleNamespace(proxy_service=None)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_internal_drain(cast(Any, request))
 
     assert exc_info.value.status_code == 403
 
@@ -430,6 +430,42 @@ async def test_internal_drain_status_reports_shutdown_state():
         "bridge_drain_active": "true",
         "in_flight": "2",
     }
+
+
+@pytest.mark.asyncio
+async def test_internal_drain_status_reports_bridge_activity():
+    from app.modules.health.api import internal_drain_status
+
+    proxy_service = SimpleNamespace(
+        http_bridge_activity_snapshot_nowait=MagicMock(
+            return_value={
+                "http_bridge_live_sessions": 2,
+                "http_bridge_pending_or_queued_requests": 1,
+                "http_bridge_pending_unknown_sessions": 0,
+                "http_bridge_inflight_session_creates": 1,
+                "http_bridge_active": True,
+                "http_bridge_restart_blocking": True,
+            }
+        )
+    )
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="127.0.0.1"),
+        app=SimpleNamespace(state=SimpleNamespace(proxy_service=proxy_service)),
+    )
+
+    with (
+        patch("app.core.shutdown.is_draining", return_value=False),
+        patch("app.core.shutdown.is_bridge_drain_active", return_value=False),
+        patch("app.core.shutdown.get_in_flight", return_value=0),
+    ):
+        response = await internal_drain_status(cast(Any, request))
+
+    assert response.checks is not None
+    assert response.checks["http_bridge_live_sessions"] == "2"
+    assert response.checks["http_bridge_pending_or_queued_requests"] == "1"
+    assert response.checks["http_bridge_inflight_session_creates"] == "1"
+    assert response.checks["http_bridge_active"] == "true"
+    assert response.checks["http_bridge_restart_blocking"] == "true"
 
 
 @pytest.mark.asyncio

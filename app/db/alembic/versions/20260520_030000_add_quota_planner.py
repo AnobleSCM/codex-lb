@@ -7,11 +7,8 @@ Create Date: 2026-05-20
 
 from __future__ import annotations
 
-import warnings
-
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.exc import SAWarning
 
 revision = "20260520_030000_add_quota_planner"
 down_revision = "20260520_000000_merge_api_key_and_http_bridge_heads"
@@ -31,28 +28,10 @@ def _column_names(table_name: str) -> set[str]:
 
 
 def _index_names(table_name: str) -> set[str]:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
+    inspector = sa.inspect(op.get_bind())
     if not inspector.has_table(table_name):
         return set()
-    sqlite_index_names: set[str] = set()
-    if bind.dialect.name == "sqlite":
-        sqlite_index_names = {
-            str(row[0])
-            for row in bind.execute(
-                sa.text("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :table_name"),
-                {"table_name": table_name},
-            )
-            if row[0]
-        }
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Skipped unsupported reflection of expression-based index",
-            category=SAWarning,
-        )
-        reflected_index_names = {str(index["name"]) for index in inspector.get_indexes(table_name) if index.get("name")}
-    return sqlite_index_names | reflected_index_names
+    return {str(index["name"]) for index in inspector.get_indexes(table_name) if index.get("name")}
 
 
 def _ensure_request_logs_request_kind() -> None:
@@ -161,9 +140,8 @@ def upgrade() -> None:
             sa.PrimaryKeyConstraint("id"),
         )
 
-    request_log_columns = _column_names("request_logs")
     request_log_indexes = _index_names("request_logs")
-    if "request_kind" in request_log_columns and "idx_logs_request_kind_time" not in request_log_indexes:
+    if "idx_logs_request_kind_time" not in request_log_indexes:
         op.create_index(
             "idx_logs_request_kind_time",
             "request_logs",
@@ -206,9 +184,6 @@ def downgrade() -> None:
         op.drop_index("idx_quota_planner_decisions_status_created", table_name="quota_planner_decisions")
     if "idx_logs_request_kind_time" in _index_names("request_logs"):
         op.drop_index("idx_logs_request_kind_time", table_name="request_logs")
-    if "request_kind" in _column_names("request_logs"):
-        with op.batch_alter_table("request_logs") as batch_op:
-            batch_op.drop_column("request_kind")
 
     tables = _table_names()
     if "quota_window_observations" in tables:

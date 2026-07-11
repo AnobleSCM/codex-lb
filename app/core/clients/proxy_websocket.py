@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Any, Mapping, Protocol, cast
 from urllib.parse import urlparse, urlunparse
 
+import aiohttp
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.datastructures import Headers
@@ -18,26 +20,42 @@ from websockets.exceptions import (
 )
 from websockets.typing import Origin
 
-from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
+from app.core.clients.codex import (
+    CodexClient,
+    CodexTransportError,
+    codex_transport_error_message,
+    create_codex_session,
+    require_route_or_direct_egress_opt_in,
+)
+from app.core.clients.proxy import (
+    _CHATGPT_ACCOUNT_ID_HEADER,
+    _HOP_BY_HOP_HEADER_NAMES,
+    ProxyResponseError,
+    _is_native_codex_request,
+    _normalize_non_native_upstream_fingerprint,
+    filter_inbound_headers,
+)
 from app.core.config.settings import get_settings
 from app.core.conversation_archive import archive_bytes, archive_text
 from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope, openai_error
 from app.core.openai.models import OpenAIError
 from app.core.openai.parsing import parse_error_payload
+from app.core.upstream_proxy import ResolvedUpstreamRoute
+from app.core.utils.proxy_env import resolve_websocket_proxy_from_env
 from app.core.utils.request_id import get_request_id
 
-_WEBSOCKET_HOP_BY_HOP_HEADERS = {
-    "accept",
-    "connection",
-    "content-type",
-    "cookie",
-    "sec-websocket-extensions",
-    "sec-websocket-key",
-    "sec-websocket-protocol",
-    "sec-websocket-version",
-    "upgrade",
-}
+_WEBSOCKET_HOP_BY_HOP_HEADERS = _HOP_BY_HOP_HEADER_NAMES | frozenset(
+    {
+        "accept-encoding",
+        "cookie",
+        "sec-websocket-extensions",
+        "sec-websocket-key",
+        "sec-websocket-protocol",
+        "sec-websocket-version",
+    }
+)
 _RESPONSES_WEBSOCKET_BETA_HEADER = "responses_websockets=2026-02-06"
+_RESPONSES_WEBSOCKET_INCOMPATIBLE_BETA_HEADERS = frozenset({"responses=experimental"})
 
 
 @dataclass(slots=True)
@@ -103,6 +121,85 @@ class WebsocketsResponsesWebSocket:
         return str(value)
 
 
+class CodexResponsesWebSocket:
+    def __init__(
+        self,
+        websocket: Any,
+        *,
+        context: Any | None = None,
+        codex_client: CodexClient | None = None,
+        owns_codex_client: bool = False,
+        endpoint_id: str | None = None,
+        response_headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._websocket = websocket
+        self._context = context
+        self._codex_client = codex_client
+        self._owns_codex_client = owns_codex_client
+        self._endpoint_id = endpoint_id
+        self._response_headers = _normalize_response_headers(response_headers)
+
+    async def send_text(self, text: str) -> None:
+        try:
+            result = self._websocket.send_str(text)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            raise RuntimeError(codex_transport_error_message("websocket send", self._endpoint_id, exc)) from None
+
+    async def send_bytes(self, data: bytes) -> None:
+        try:
+            result = self._websocket.send_bytes(data)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            raise RuntimeError(codex_transport_error_message("websocket send", self._endpoint_id, exc)) from None
+
+    async def receive(self) -> UpstreamWebSocketMessage:
+        try:
+            msg = await self._websocket.receive()
+        except Exception as exc:
+            return UpstreamWebSocketMessage(
+                kind="error",
+                error=codex_transport_error_message("websocket receive", self._endpoint_id, exc),
+            )
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+            return UpstreamWebSocketMessage(
+                kind="close",
+                close_code=_aiohttp_ws_close_code(self._websocket, msg),
+            )
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            exception = msg.data if isinstance(msg.data, BaseException) else None
+            return UpstreamWebSocketMessage(
+                kind="error",
+                error=(
+                    codex_transport_error_message("websocket receive", self._endpoint_id, exception)
+                    if exception is not None
+                    else "Upstream websocket error"
+                ),
+            )
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            text = msg.data if isinstance(msg.data, str) else str(msg.data)
+            return UpstreamWebSocketMessage(kind="text", text=text)
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            return UpstreamWebSocketMessage(kind="binary", data=bytes(msg.data) if isinstance(msg.data, bytes) else b"")
+        return UpstreamWebSocketMessage(kind="error", error=f"Unexpected ws type: {msg.type!r}")
+
+    async def close(self) -> None:
+        try:
+            result = self._websocket.close()
+            if asyncio.iscoroutine(result):
+                await result
+        finally:
+            if self._context is not None:
+                await self._context.__aexit__(None, None, None)
+            if self._owns_codex_client and self._codex_client is not None:
+                await self._codex_client.close()
+
+    def response_header(self, name: str) -> str | None:
+        return self._response_headers.get(name.lower())
+
+
 class ArchivingResponsesWebSocket:
     def __init__(
         self,
@@ -111,11 +208,18 @@ class ArchivingResponsesWebSocket:
         url: str,
         headers: dict[str, str],
         account_id: str | None,
+        route: ResolvedUpstreamRoute | None = None,
+        fallback_used: bool | None = None,
+        direct_egress: bool = False,
     ) -> None:
         self._wrapped = wrapped
         self._url = url
         self._headers = headers
         self._account_id = account_id
+        self.upstream_proxy_route_mode = route.mode if route is not None else ("direct" if direct_egress else None)
+        self.upstream_proxy_pool_id = route.pool_id if route is not None else None
+        self.upstream_proxy_endpoint_id = route.endpoint_id if route is not None else None
+        self.upstream_proxy_fallback_used = fallback_used if route is not None else None
 
     async def send_text(self, text: str) -> None:
         archive_text(
@@ -147,6 +251,9 @@ class ArchivingResponsesWebSocket:
 
     async def receive(self) -> UpstreamWebSocketMessage:
         message = await self._wrapped.receive()
+        return message
+
+    def archive_received(self, message: UpstreamWebSocketMessage) -> None:
         if message.kind == "text" and message.text is not None:
             archive_text(
                 direction="server_to_codex",
@@ -183,7 +290,6 @@ class ArchivingResponsesWebSocket:
                 headers=self._headers,
                 extra={"frame_type": message.kind, "close_code": message.close_code},
             )
-        return message
 
     async def close(self) -> None:
         await self._wrapped.close()
@@ -192,9 +298,19 @@ class ArchivingResponsesWebSocket:
         return self._wrapped.response_header(name)
 
 
-def filter_inbound_websocket_headers(headers: dict[str, str]) -> dict[str, str]:
+def _connection_header_tokens(headers: Mapping[str, str]) -> set[str]:
+    tokens: set[str] = set()
+    for key, value in headers.items():
+        if key.lower() != "connection":
+            continue
+        tokens.update(token.strip().lower() for token in value.split(",") if token.strip())
+    return tokens
+
+
+def filter_inbound_websocket_headers(headers: Mapping[str, str]) -> dict[str, str]:
     filtered = filter_inbound_headers(headers)
-    return {key: value for key, value in filtered.items() if key.lower() not in _WEBSOCKET_HOP_BY_HOP_HEADERS}
+    blocked_header_names = _WEBSOCKET_HOP_BY_HOP_HEADERS | _connection_header_tokens(filtered)
+    return {key: value for key, value in filtered.items() if key.lower() not in blocked_header_names}
 
 
 def _build_upstream_websocket_headers(
@@ -202,15 +318,27 @@ def _build_upstream_websocket_headers(
     access_token: str,
     account_id: str | None,
 ) -> dict[str, str]:
-    headers = {key: value for key, value in inbound.items() if key.lower() != "cookie"}
+    headers = filter_inbound_websocket_headers(inbound)
+    native = _is_native_codex_request(headers)
     lower_keys = {key.lower() for key in headers}
     if "x-request-id" not in lower_keys and "request-id" not in lower_keys:
         request_id = get_request_id()
         if request_id:
             headers["x-request-id"] = request_id
+    # Normalize a non-native client's fingerprint on the client-facing
+    # ``/v1/responses`` websocket egress too. This builder is the upstream egress
+    # for a direct websocket caller, so without normalization an OpenAI SDK that
+    # speaks the responses websocket protocol would reach upstream with its
+    # ``OpenAI/Python`` / ``x-openai-client-*`` / ``x-stainless-*`` fingerprint
+    # intact and trigger the priority downgrade this change exists to prevent.
+    if not native:
+        _normalize_non_native_upstream_fingerprint(headers)
     headers["Authorization"] = f"Bearer {access_token}"
     if account_id:
-        headers["chatgpt-account-id"] = account_id
+        if native:
+            headers["chatgpt-account-id"] = account_id
+        else:
+            headers[_CHATGPT_ACCOUNT_ID_HEADER] = account_id
     _ensure_responses_websocket_beta_header(headers)
     return headers
 
@@ -218,7 +346,11 @@ def _build_upstream_websocket_headers(
 def _ensure_responses_websocket_beta_header(headers: dict[str, str]) -> None:
     header_key = next((key for key in headers if key.lower() == "openai-beta"), "openai-beta")
     current_value = headers.get(header_key, "")
-    beta_tokens = [token.strip() for token in current_value.split(",") if token.strip()]
+    beta_tokens = [
+        token.strip()
+        for token in current_value.split(",")
+        if token.strip() and token.strip().lower() not in _RESPONSES_WEBSOCKET_INCOMPATIBLE_BETA_HEADERS
+    ]
     if _RESPONSES_WEBSOCKET_BETA_HEADER.lower() not in {token.lower() for token in beta_tokens}:
         beta_tokens.append(_RESPONSES_WEBSOCKET_BETA_HEADER)
     headers[header_key] = ", ".join(beta_tokens)
@@ -231,6 +363,13 @@ def _pop_header_case_insensitive(headers: dict[str, str], name: str) -> str | No
             continue
         return headers.pop(key)
     return None
+
+
+def _aiohttp_ws_close_code(websocket: Any, message: aiohttp.WSMessage) -> int | None:
+    if isinstance(message.data, int):
+        return message.data
+    close_code = getattr(websocket, "close_code", None)
+    return close_code if isinstance(close_code, int) else None
 
 
 def _responses_websocket_url(base_url: str) -> str:
@@ -250,23 +389,100 @@ async def connect_responses_websocket(
     account_id: str | None,
     *,
     base_url: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    allow_direct_egress: bool = False,
 ) -> UpstreamResponsesWebSocket:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = _responses_websocket_url(upstream_base)
     upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation="responses websocket",
+    )
+    if route is not None:
+        owns_codex_client = codex_client is None
+        active_codex_client = codex_client or CodexClient(create_codex_session())
+        endpoint_id = route.endpoint_id
+        active_route = route
+        fallback_used = False
+        try:
+            opener = getattr(active_codex_client, "open_ws_with_route_metadata", None)
+            if callable(opener):
+                result = await opener(
+                    url,
+                    route=route,
+                    headers=upstream_headers,
+                    timeout=settings.upstream_connect_timeout_seconds,
+                    max_msg_size=settings.max_sse_event_bytes,
+                )
+                context = result.context
+                websocket = result.websocket
+                endpoint_id = result.route.endpoint_id
+                active_route = result.route
+                fallback_used = result.fallback_used
+            else:
+                context = await active_codex_client.ws_connect(
+                    url,
+                    route=route,
+                    headers=upstream_headers,
+                    timeout=settings.upstream_connect_timeout_seconds,
+                    max_msg_size=settings.max_sse_event_bytes,
+                )
+                websocket = await context.__aenter__() if hasattr(context, "__aenter__") else context
+                if not hasattr(context, "__aenter__"):
+                    context = None
+                endpoint_id = route.endpoint_id
+        except CodexTransportError as exc:
+            if owns_codex_client:
+                await active_codex_client.close()
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", str(exc), error_type="server_error"),
+            ) from exc
+        except Exception:
+            if owns_codex_client:
+                await active_codex_client.close()
+            raise
+        return ArchivingResponsesWebSocket(
+            CodexResponsesWebSocket(
+                websocket,
+                context=context if hasattr(context, "__aenter__") else None,
+                codex_client=active_codex_client,
+                owns_codex_client=owns_codex_client,
+                endpoint_id=endpoint_id,
+                response_headers=_codex_websocket_response_headers(websocket, context),
+            ),
+            url=url,
+            headers=upstream_headers,
+            account_id=account_id,
+            route=active_route,
+            fallback_used=fallback_used,
+        )
     origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
     user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
+    proxy_env = (
+        settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
+    )
+    proxy_url = resolve_websocket_proxy_from_env(url, proxy_env) if settings.upstream_websocket_trust_env else None
+    connect_kwargs: dict[str, Any] = {
+        "origin": origin,
+        "additional_headers": upstream_headers or None,
+        "user_agent_header": user_agent,
+        "open_timeout": settings.upstream_connect_timeout_seconds,
+        # Long Codex turns can spend minutes in upstream reasoning without
+        # sending application frames. Keep transport pings enabled so
+        # intermediaries still see liveness, but disable the library's pong
+        # watchdog so codex-lb's own request/idle budgets decide when a
+        # healthy long turn has stalled.
+        "ping_timeout": None,
+        "max_size": settings.max_sse_event_bytes,
+    }
+    connect_kwargs["proxy"] = proxy_url
     try:
-        response = await websocket_connect(
-            url,
-            origin=origin,
-            additional_headers=upstream_headers or None,
-            user_agent_header=user_agent,
-            proxy=True if settings.upstream_websocket_trust_env else None,
-            open_timeout=settings.upstream_connect_timeout_seconds,
-            max_size=settings.max_sse_event_bytes,
-        )
+        response = await websocket_connect(url, **connect_kwargs)
     except asyncio.TimeoutError as exc:
         raise ProxyResponseError(
             502,
@@ -302,6 +518,7 @@ async def connect_responses_websocket(
         url=url,
         headers=upstream_headers,
         account_id=account_id,
+        direct_egress=allow_direct_egress,
     )
 
 
@@ -311,6 +528,35 @@ def _close_code_from_exception(exc: ConnectionClosedOK | ConnectionClosedError) 
     if exc.sent is not None:
         return int(exc.sent.code)
     return None
+
+
+def _codex_websocket_response_headers(websocket: object, context: object | None) -> Mapping[str, str]:
+    for source in (websocket, context):
+        headers = _response_headers_from_source(source)
+        if headers:
+            return headers
+    return {}
+
+
+def _response_headers_from_source(source: object | None) -> Mapping[str, str]:
+    if source is None:
+        return {}
+    for attr in ("response", "handshake_response"):
+        response = getattr(source, attr, None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            return _normalize_response_headers(headers)
+    for attr in ("headers", "response_headers"):
+        headers = getattr(source, attr, None)
+        if headers:
+            return _normalize_response_headers(headers)
+    return {}
+
+
+def _normalize_response_headers(headers: Mapping[str, object] | None) -> dict[str, str]:
+    if headers is None:
+        return {}
+    return {str(key).lower(): str(value) for key, value in headers.items()}
 
 
 def _handshake_error_payload(

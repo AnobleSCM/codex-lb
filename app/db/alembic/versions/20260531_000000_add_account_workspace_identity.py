@@ -17,17 +17,8 @@ branch_labels = None
 depends_on = None
 
 
-def _account_columns() -> set[str]:
-    inspector = inspect(op.get_bind())
-    if not inspector.has_table("accounts"):
-        return set()
-    return {column["name"] for column in inspector.get_columns("accounts")}
-
-
 def upgrade() -> None:
-    existing_columns = _account_columns()
-    if not existing_columns:
-        return
+    existing_columns = {column["name"] for column in inspect(op.get_bind()).get_columns("accounts")}
     with op.batch_alter_table("accounts") as batch_op:
         if "workspace_id" not in existing_columns:
             batch_op.add_column(sa.Column("workspace_id", sa.String(), nullable=True))
@@ -38,9 +29,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    existing_columns = _account_columns()
-    if not existing_columns:
-        return
+    existing_columns = {column["name"] for column in inspect(op.get_bind()).get_columns("accounts")}
     with op.batch_alter_table("accounts") as batch_op:
         if "seat_type" in existing_columns:
             batch_op.drop_column("seat_type")

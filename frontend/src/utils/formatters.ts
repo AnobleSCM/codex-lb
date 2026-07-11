@@ -226,9 +226,31 @@ export function formatDateTimeInline(iso: string | null | undefined): string {
   return formatted.time === "--" ? "--" : `${formatted.time} ${formatted.date}`;
 }
 
+function padTwo(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+export function formatLocalDateTimeSeconds(iso: string | null | undefined): string {
+  const date = parseDate(iso);
+  if (!date) {
+    return "--";
+  }
+  return `${date.getFullYear()}-${padTwo(date.getMonth() + 1)}-${padTwo(date.getDate())} ${padTwo(date.getHours())}:${padTwo(date.getMinutes())}:${padTwo(date.getSeconds())}`;
+}
+
 export function formatChartDateTime(iso: string | null | undefined): string {
   const date = parseDate(iso);
   return date ? getChartDateTimeFormatter().format(date) : "--";
+}
+
+export function formatElapsed(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) {
+    return "—";
+  }
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 export function formatRelative(ms: number): string {
@@ -283,6 +305,35 @@ export function formatQuotaResetLabel(resetAt: string | null | undefined): strin
     return "now";
   }
   return formatResetRelative(diffMs);
+}
+
+const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
+const MINUTE_MS = 60_000;
+const EXPIRING_SOON_THRESHOLD_MS = 7 * DAY_MS;
+
+export type SingleUnitRemaining = {
+  label: string;
+  expiringSoon: boolean;
+};
+
+export function formatSingleUnitRemaining(expiresAtIso: string): SingleUnitRemaining {
+  const ms = new Date(expiresAtIso).getTime() - Date.now();
+  if (ms <= 0) {
+    return { label: "now", expiringSoon: true };
+  }
+  const days = Math.floor(ms / DAY_MS);
+  const hours = Math.floor(ms / HOUR_MS);
+  const minutes = Math.floor(ms / MINUTE_MS);
+  const label =
+    days >= 1
+      ? `${days}d`
+      : hours >= 1
+        ? `${hours}h`
+        : minutes >= 1
+          ? `${minutes}m`
+          : "now";
+  return { label, expiringSoon: ms < EXPIRING_SOON_THRESHOLD_MS };
 }
 
 export function formatQuotaResetMeta(
@@ -344,55 +395,4 @@ export function formatIdTokenLabel(auth: AccountAuthStatus | null | undefined): 
     unknown: "Unknown",
   };
   return state && labelMap[state] ? labelMap[state] : "Unknown";
-}
-
-export function toModels(value: string): string[] | undefined {
-  const values = value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return values.length > 0 ? values : undefined;
-}
-
-export function toModelsNullable(value: string): string[] | null {
-  const values = value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return values.length > 0 ? values : null;
-}
-
-export function toIsoDateTime(value: string): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return undefined;
-  }
-  return date.toISOString();
-}
-
-export function toIsoDateTimeNullable(value: string): string | null {
-  if (!value) {
-    return null;
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-  return date.toISOString();
-}
-
-export function toLocalDateTime(value: string | null): string {
-  if (!value) {
-    return "";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-  const offset = date.getTimezoneOffset();
-  const adjusted = new Date(date.getTime() - offset * 60_000);
-  return adjusted.toISOString().slice(0, 16);
 }

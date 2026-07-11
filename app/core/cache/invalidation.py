@@ -12,6 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import CacheInvalidation
+from app.db.session import close_session
 
 if TYPE_CHECKING:
     pass
@@ -95,9 +96,9 @@ class CacheInvalidationPoller:
                     )
             await session.commit()
         except Exception:
-            logger.warning("cache_invalidation bump failed for %s", namespace, exc_info=True)
+            logger.warning("cache_invalidation bump failed", exc_info=True)
         finally:
-            await session.close()
+            await close_session(session)
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -118,7 +119,7 @@ class CacheInvalidationPoller:
         except Exception:
             return
         finally:
-            await session.close()
+            await close_session(session)
 
         for namespace, version in rows:
             prev = self._known_versions.get(namespace)

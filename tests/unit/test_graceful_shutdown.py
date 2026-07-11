@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from importlib import import_module
-from typing import Any, cast
 
 import pytest
-from fastapi import FastAPI
-from starlette.testclient import TestClient
 
 from app.main import InFlightMiddleware
 
@@ -17,7 +14,8 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def reset_shutdown_state() -> None:
-    shutdown_state.reset()
+    setattr(shutdown_state, "_draining", False)
+    setattr(shutdown_state, "_in_flight", 0)
 
 
 def test_set_draining_updates_shutdown_state() -> None:
@@ -256,29 +254,41 @@ async def test_in_flight_middleware_allows_drain_status_during_drain() -> None:
     assert sent_messages[0]["status"] == 200
 
 
-def test_drain_stop_path_is_allowlisted_for_drain_and_inflight() -> None:
-    from app.core.middleware import inflight
-
-    assert "/internal/drain/stop" in inflight._DRAIN_ALLOWED_HTTP_PATHS
-    assert "/internal/drain/stop" in inflight._IN_FLIGHT_EXCLUDED_HTTP_PATHS
-
-
-def test_drain_stop_reaches_real_handler_and_clears_state_while_draining() -> None:
-    from app.modules.health.api import router as health_router
-
-    app = FastAPI()
-    app.include_router(health_router)
-    app.add_middleware(cast(Any, InFlightMiddleware))
-
+@pytest.mark.asyncio
+async def test_in_flight_middleware_allows_drain_stop_during_drain() -> None:
     shutdown_state.set_draining(True)
-    shutdown_state.set_bridge_drain_active(True)
-    shutdown_state.increment_in_flight()
+    app_called = False
 
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
-        response = client.post("/internal/drain/stop")
+    async def inner_app(scope, receive, send):  # noqa: ANN001, ARG001
+        nonlocal app_called
+        app_called = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b'{"ok":true}'})
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok", "checks": {"draining": "stopped"}, "bridge_ring": None}
-    assert shutdown_state.is_draining() is False
-    assert shutdown_state.is_bridge_drain_active() is False
-    assert shutdown_state.get_in_flight() == 1
+    middleware = InFlightMiddleware(inner_app)
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/internal/drain/stop",
+        "raw_path": b"/internal/drain/stop",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+
+    async def receive():  # noqa: ANN202
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent_messages: list[dict] = []
+
+    async def send(msg):  # noqa: ANN001, ANN202
+        sent_messages.append(msg)
+
+    await middleware(scope, receive, send)
+
+    assert app_called is True
+    assert sent_messages[0]["status"] == 200

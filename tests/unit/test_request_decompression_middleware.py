@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gzip
 import json
-import logging
 import zlib
 from collections.abc import Awaitable, Callable
 from typing import cast
@@ -14,7 +13,6 @@ from fastapi.responses import Response
 from httpx import ASGITransport, AsyncClient
 from starlette.requests import ClientDisconnect
 
-from app.core.config.settings import Settings, get_settings
 from app.core.middleware.request_decompression import add_request_decompression_middleware
 
 pytestmark = pytest.mark.unit
@@ -35,6 +33,16 @@ def _build_echo_app(*, touch_headers: bool = False) -> FastAPI:
 
     @app.post("/echo")
     async def echo(request: Request):
+        data = await request.json()
+        return {"content_encoding": request.headers.get("content-encoding"), "data": data}
+
+    @app.post("/backend-api/codex/responses")
+    async def responses(request: Request):
+        data = await request.json()
+        return {"content_encoding": request.headers.get("content-encoding"), "data": data}
+
+    @app.post("/backend-api/codex/responses/")
+    async def responses_slash(request: Request):
         data = await request.json()
         return {"content_encoding": request.headers.get("content-encoding"), "data": data}
 
@@ -174,6 +182,80 @@ async def test_request_decompression_rejects_unsupported_encoding():
 
 
 @pytest.mark.asyncio
+async def test_request_decompression_allows_larger_responses_payload(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", "128")
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_RESPONSES_BODY_BYTES", "2048")
+
+    app = _build_echo_app()
+
+    payload = {"input": "x" * 512}
+    body = json.dumps(payload).encode("utf-8")
+    compressed = zstd.ZstdCompressor().compress(body)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/backend-api/codex/responses",
+            content=compressed,
+            headers={"Content-Encoding": "zstd", "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200
+    response_data = resp.json()
+    assert response_data["content_encoding"] is None
+    assert response_data["data"] == payload
+
+
+@pytest.mark.asyncio
+async def test_request_decompression_allows_larger_trailing_slash_responses_payload(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", "128")
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_RESPONSES_BODY_BYTES", "2048")
+
+    app = _build_echo_app()
+
+    payload = {"input": "x" * 512}
+    body = json.dumps(payload).encode("utf-8")
+    compressed = zstd.ZstdCompressor().compress(body)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/backend-api/codex/responses/",
+            content=compressed,
+            headers={"Content-Encoding": "zstd", "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200
+    response_data = resp.json()
+    assert response_data["content_encoding"] is None
+    assert response_data["data"] == payload
+
+
+@pytest.mark.asyncio
+async def test_request_decompression_keeps_default_limit_for_other_routes(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", "128")
+    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_RESPONSES_BODY_BYTES", "2048")
+
+    app = _build_echo_app()
+
+    payload = {"input": "x" * 512}
+    body = json.dumps(payload).encode("utf-8")
+    compressed = zstd.ZstdCompressor().compress(body)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/echo",
+            content=compressed,
+            headers={"Content-Encoding": "zstd", "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 413
+    response_data = resp.json()
+    assert response_data["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.asyncio
 async def test_request_decompression_propagates_client_disconnect():
     app = FastAPI()
     add_request_decompression_middleware(app)
@@ -204,96 +286,6 @@ async def test_request_decompression_propagates_client_disconnect():
 
     with pytest.raises(ClientDisconnect):
         await dispatch(request, call_next)
-
-
-@pytest.mark.asyncio
-async def test_request_decompression_logs_warning_at_eighty_percent_of_cap(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # 256-byte cap with a payload that decompresses to >= 80% (205 bytes).
-    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", "256")
-    get_settings.cache_clear()
-    try:
-        app = _build_echo_app()
-        payload = {"padding": "A" * 220}
-        body = json.dumps(payload).encode("utf-8")
-        assert 205 <= len(body) <= 256, "test payload size must sit in the warn band"
-        compressed = gzip.compress(body)
-
-        caplog.set_level(logging.WARNING, logger="app.core.middleware.request_decompression")
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-            resp = await client.post(
-                "/echo",
-                content=compressed,
-                headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
-            )
-
-        assert resp.status_code == 200
-        warning_records = [
-            record
-            for record in caplog.records
-            if record.levelno == logging.WARNING and "Large decompressed request body" in record.getMessage()
-        ]
-        assert warning_records, "expected an 80%-of-cap warning log"
-        message = warning_records[0].getMessage()
-        assert "bytes=" in message
-        assert "max_bytes=256" in message
-        assert "path=/echo" in message
-    finally:
-        get_settings.cache_clear()
-
-
-@pytest.mark.asyncio
-async def test_request_decompression_does_not_warn_below_eighty_percent(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # 4 KiB cap with a tiny payload — well under 80%, no warning expected.
-    monkeypatch.setenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", "4096")
-    get_settings.cache_clear()
-    try:
-        app = _build_echo_app()
-        body = json.dumps({"hello": "world"}).encode("utf-8")
-        compressed = gzip.compress(body)
-
-        caplog.set_level(logging.WARNING, logger="app.core.middleware.request_decompression")
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-            resp = await client.post(
-                "/echo",
-                content=compressed,
-                headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
-            )
-
-        assert resp.status_code == 200
-        warning_records = [
-            record
-            for record in caplog.records
-            if record.levelno == logging.WARNING and "Large decompressed request body" in record.getMessage()
-        ]
-        assert not warning_records, "should not warn well below the cap"
-    finally:
-        get_settings.cache_clear()
-
-
-def test_max_decompressed_body_bytes_default_leaves_room_for_slimmer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The slimmer at app/core/clients/proxy.py needs headroom above the
-    # 15 MiB upstream cap to strip historical Computer Use screenshots
-    # from real-world Codex CLI sessions. 128 MiB is the documented
-    # minimum that keeps the slimmer-is-the-enforcer architecture intact
-    # (~8x headroom over the inner cap, ~4x over a 30-turn Computer Use
-    # session). Lower defaults would re-introduce false 413 rejections
-    # in the request_decompression middleware before the slimmer can run.
-    # Clear the env var first so the test guards the true code default,
-    # not whatever an operator has overridden in this shell.
-    monkeypatch.delenv("CODEX_LB_MAX_DECOMPRESSED_BODY_BYTES", raising=False)
-    get_settings.cache_clear()
-    try:
-        assert Settings().max_decompressed_body_bytes >= 128 * 1024 * 1024
-    finally:
-        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio

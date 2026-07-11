@@ -53,6 +53,14 @@ describe("DashboardOverviewSchema", () => {
           errorCount: 10,
           topError: null,
         },
+        comparison: {
+          canCompare: true,
+          previous: {
+            requests: 250,
+            tokens: 1000,
+            costUsd: 6.25,
+          },
+        },
       },
       windows: {
         primary: {
@@ -66,6 +74,7 @@ describe("DashboardOverviewSchema", () => {
     });
 
     expect(parsed.accounts).toHaveLength(0);
+    expect(parsed.summary.comparison?.previous.requests).toBe(250);
   });
 
   it("drops legacy request_logs field from parse result", () => {
@@ -107,6 +116,45 @@ describe("DashboardOverviewSchema", () => {
 
     expect(parsed).not.toHaveProperty("request_logs");
   });
+
+  it("accepts overview payloads without comparison block for backward compatibility", () => {
+    const parsed = DashboardOverviewSchema.parse({
+      lastSyncAt: ISO,
+      timeframe: {
+        key: "7d",
+        windowMinutes: 10080,
+        bucketSeconds: 21600,
+        bucketCount: 28,
+      },
+      accounts: [],
+      summary: {
+        primaryWindow: {
+          remainingPercent: 70,
+          capacityCredits: 100,
+          remainingCredits: 70,
+          resetAt: ISO,
+          windowMinutes: 300,
+        },
+        secondaryWindow: null,
+        cost: {
+          currency: "USD",
+          totalUsd: 0,
+        },
+        metrics: null,
+      },
+      windows: {
+        primary: {
+          windowKey: "primary",
+          windowMinutes: 300,
+          accounts: [],
+        },
+        secondary: null,
+      },
+      trends: EMPTY_TRENDS,
+    });
+
+    expect(parsed.summary.comparison).toBeUndefined();
+  });
 });
 
 describe("RequestLogsResponseSchema", () => {
@@ -139,6 +187,126 @@ describe("RequestLogsResponseSchema", () => {
           apiKeyName: "Key A",
           apiKeyId: "key-1",
           requestId: "req-1",
+          archiveRequestId: "archive-req-1",
+          model: "gpt-5.1",
+          transport: "websocket",
+          useragent: "Mozilla/5.0",
+          useragentGroup: "Mozilla",
+          clientIp: "203.0.113.7",
+          status: "ok",
+          errorCode: null,
+          errorMessage: null,
+          failurePhase: "status",
+          failureDetail: "upstream_5xx",
+          failureExceptionType: "ProxyResponseError",
+          upstreamStatusCode: 503,
+          upstreamErrorCode: "server_error",
+          bridgeStage: "owner_forward_status",
+          tokens: 10,
+          inputTokens: 8,
+          outputTokens: 2,
+          cachedInputTokens: 0,
+          reasoningEffort: null,
+          costUsd: 0.001,
+          costBreakdown: {
+            inputUsd: 0.0004,
+            cachedInputUsd: 0,
+            outputUsd: 0.0006,
+            totalUsd: 0.001,
+          },
+          latencyMs: 42,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+    });
+
+    expect(parsed.requests[0]?.apiKeyName).toBe("Key A");
+    expect(parsed.requests[0]?.apiKeyId).toBe("key-1");
+    expect(parsed.requests[0]?.archiveRequestId).toBe("archive-req-1");
+    expect(parsed.requests[0]?.requestKind).toBe("normal");
+    expect(parsed.requests[0]?.planType).toBe("plus");
+    expect(parsed.requests[0]?.transport).toBe("websocket");
+    expect(parsed.requests[0]?.useragent).toBe("Mozilla/5.0");
+    expect(parsed.requests[0]?.useragentGroup).toBe("Mozilla");
+    expect(parsed.requests[0]?.clientIp).toBe("203.0.113.7");
+    expect(parsed.requests[0]?.failurePhase).toBe("status");
+    expect(parsed.requests[0]?.failureDetail).toBe("upstream_5xx");
+    expect(parsed.requests[0]?.failureExceptionType).toBe("ProxyResponseError");
+    expect(parsed.requests[0]?.upstreamStatusCode).toBe(503);
+    expect(parsed.requests[0]?.upstreamErrorCode).toBe("server_error");
+    expect(parsed.requests[0]?.bridgeStage).toBe("owner_forward_status");
+    expect(parsed.requests[0]?.inputTokens).toBe(8);
+    expect(parsed.requests[0]?.outputTokens).toBe(2);
+    expect(parsed.requests[0]?.costBreakdown?.totalUsd).toBe(0.001);
+  });
+
+  it("keeps archiveRequestId optional for older request-log responses", () => {
+    const parsed = RequestLogsResponseSchema.parse({
+      requests: [
+        {
+          requestedAt: ISO,
+          accountId: "acc-1",
+          requestId: "req-1",
+          model: "gpt-5.1",
+          status: "ok",
+          errorCode: null,
+          errorMessage: null,
+          tokens: 10,
+          cachedInputTokens: null,
+          reasoningEffort: null,
+          costUsd: null,
+          latencyMs: 42,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+    });
+
+    expect(parsed.requests[0]?.archiveRequestId).toBeUndefined();
+  });
+
+  it("accepts legacy limit warmup request kind rows", () => {
+    const parsed = RequestLogsResponseSchema.parse({
+      requests: [
+        {
+          requestedAt: ISO,
+          accountId: "acc-1",
+          planType: "plus",
+          apiKeyName: null,
+          apiKeyId: null,
+          requestId: "req-legacy-limit-warmup",
+          requestKind: "limit_warmup",
+          model: "gpt-5.1-codex-mini",
+          transport: "http",
+          status: "ok",
+          errorCode: null,
+          errorMessage: null,
+          tokens: 1,
+          inputTokens: 1,
+          outputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningEffort: null,
+          costUsd: 0,
+          latencyMs: 42,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+    });
+
+    expect(parsed.requests[0]?.requestKind).toBe("limit_warmup");
+  });
+
+  it("defaults omitted cost fields to null for backward compatibility", () => {
+    const parsed = RequestLogsResponseSchema.parse({
+      requests: [
+        {
+          requestedAt: ISO,
+          accountId: "acc-1",
+          planType: "plus",
+          apiKeyId: "key-1",
+          requestId: "req-legacy-cost-fields",
           model: "gpt-5.1",
           transport: "websocket",
           status: "ok",
@@ -155,10 +323,87 @@ describe("RequestLogsResponseSchema", () => {
       hasMore: false,
     });
 
-    expect(parsed.requests[0]?.apiKeyName).toBe("Key A");
-    expect(parsed.requests[0]?.apiKeyId).toBe("key-1");
-    expect(parsed.requests[0]?.planType).toBe("plus");
-    expect(parsed.requests[0]?.transport).toBe("websocket");
+    expect(parsed.requests[0]?.inputTokens).toBeNull();
+    expect(parsed.requests[0]?.outputTokens).toBeNull();
+    expect(parsed.requests[0]?.failurePhase).toBeNull();
+    expect(parsed.requests[0]?.upstreamStatusCode).toBeNull();
+    expect(parsed.requests[0]?.costBreakdown).toBeNull();
+    expect(parsed.requests[0]?.apiKeyName).toBeNull();
+    expect(parsed.requests[0]?.useragent).toBeNull();
+    expect(parsed.requests[0]?.useragentGroup).toBeNull();
+    expect(parsed.requests[0]?.clientIp).toBeNull();
+  });
+
+  it("accepts nullable user agent fields", () => {
+    const parsed = RequestLogsResponseSchema.parse({
+      requests: [
+        {
+          requestedAt: ISO,
+          accountId: "acc-1",
+          planType: "plus",
+          apiKeyName: "Key A",
+          apiKeyId: "key-1",
+          requestId: "req-null-useragent",
+          model: "gpt-5.1",
+          transport: "websocket",
+          useragent: null,
+          useragentGroup: null,
+          clientIp: null,
+          status: "ok",
+          errorCode: null,
+          errorMessage: null,
+          tokens: 10,
+          cachedInputTokens: 0,
+          reasoningEffort: null,
+          costUsd: 0.001,
+          latencyMs: 42,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+    });
+
+    expect(parsed.requests[0]?.useragent).toBeNull();
+    expect(parsed.requests[0]?.useragentGroup).toBeNull();
+    expect(parsed.requests[0]?.clientIp).toBeNull();
+  });
+
+  it("defaults omitted nested cost breakdown fields to null", () => {
+    const parsed = RequestLogsResponseSchema.parse({
+      requests: [
+        {
+          requestedAt: ISO,
+          accountId: "acc-1",
+          planType: "plus",
+          apiKeyName: "Key A",
+          apiKeyId: "key-1",
+          requestId: "req-partial-breakdown",
+          model: "gpt-5.1",
+          transport: "websocket",
+          status: "ok",
+          errorCode: null,
+          errorMessage: null,
+          tokens: 10,
+          inputTokens: 8,
+          outputTokens: 2,
+          cachedInputTokens: 0,
+          reasoningEffort: null,
+          costUsd: 0.001,
+          costBreakdown: {
+            inputUsd: 0.0004,
+            totalUsd: 0.001,
+          },
+          latencyMs: 42,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+    });
+
+    expect(parsed.requests[0]?.costBreakdown?.inputUsd).toBe(0.0004);
+    expect(parsed.requests[0]?.costBreakdown?.cachedInputUsd).toBeNull();
+    expect(parsed.requests[0]?.costBreakdown?.outputUsd).toBeNull();
+    expect(parsed.requests[0]?.costBreakdown?.totalUsd).toBe(0.001);
   });
 
   it("parses request-log filter options including API keys", () => {

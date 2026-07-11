@@ -4,8 +4,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 
 import { AlertMessage } from "@/components/alert-message";
+import { useDialogState } from "@/hooks/use-dialog-state";
 import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
+import { ResetCreditConfirmDialog } from "@/features/accounts/components/reset-credit-confirm-dialog";
 import { AccountCards } from "@/features/dashboard/components/account-cards";
+import { AccountList } from "@/features/dashboard/components/account-list";
+import { AccountSummaryLine } from "@/features/dashboard/components/account-summary-line";
+import { AccountViewModeToggle } from "@/features/dashboard/components/account-view-mode-toggle";
 import { DashboardSkeleton } from "@/features/dashboard/components/dashboard-skeleton";
 import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters/overview-timeframe-select";
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
@@ -13,7 +18,8 @@ import { RecentRequestsTable } from "@/features/dashboard/components/recent-requ
 import { StatsGrid } from "@/features/dashboard/components/stats-grid";
 import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
-import { useDashboard } from "@/features/dashboard/hooks/use-dashboard";
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
 import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
 import { buildDashboardView } from "@/features/dashboard/utils";
 import {
@@ -22,6 +28,7 @@ import {
   type AccountSummary,
   type OverviewTimeframe,
 } from "@/features/dashboard/schemas";
+import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 import { useThemeStore } from "@/hooks/use-theme";
 import { REQUEST_STATUS_LABELS } from "@/utils/constants";
 import { formatModelLabel, formatSlug } from "@/utils/formatters";
@@ -33,15 +40,24 @@ export function DashboardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isDark = useThemeStore((s) => s.theme === "dark");
+  const showAccountBurnrate = useDashboardPreferencesStore((s) => s.accountBurnrateEnabled);
+  const accountViewMode = useDashboardPreferencesStore((s) => s.accountViewMode);
+  const accountListSort = useDashboardPreferencesStore((s) => s.accountListSort);
+  const setAccountViewMode = useDashboardPreferencesStore((s) => s.setAccountViewMode);
+  const setAccountListSort = useDashboardPreferencesStore((s) => s.setAccountListSort);
+  const canWrite = useAuthStore((state) => state.canWrite);
   const overviewTimeframe = useMemo(
     () => parseOverviewTimeframe(searchParams.get("overviewTimeframe")),
     [searchParams],
   );
   const dashboardQuery = useDashboard(overviewTimeframe);
+  const projectionsQuery = useDashboardProjections(Boolean(dashboardQuery.data));
   const { filters, logsQuery, optionsQuery, updateFilters } = useRequestLogs();
-  const { resumeMutation } = useAccountMutations();
+  const { resumeMutation, limitWarmupMutation } = useAccountMutations();
+  type ResetCreditDialogTarget = { accountId: string; availableResetCredits: number };
+  const resetCreditDialog = useDialogState<ResetCreditDialogTarget>();
 
-  const isRefreshing = dashboardQuery.isFetching || logsQuery.isFetching;
+  const isRefreshing = dashboardQuery.isFetching || projectionsQuery.isFetching || logsQuery.isFetching;
 
   const handleRefresh = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -67,14 +83,30 @@ export function DashboardPage() {
           navigate(`/accounts?selected=${account.accountId}`);
           break;
         case "resume":
-          void resumeMutation.mutateAsync(account.accountId);
+          if (canWrite) {
+            void resumeMutation.mutateAsync(account.accountId);
+          }
           break;
         case "reauth":
           navigate(`/accounts?selected=${account.accountId}`);
           break;
+        case "warmup-toggle":
+          if (canWrite) {
+            void limitWarmupMutation.mutateAsync({
+              accountId: account.accountId,
+              enabled: !account.limitWarmupEnabled,
+            });
+          }
+          break;
+        case "reset-credit":
+          resetCreditDialog.show({
+            accountId: account.accountId,
+            availableResetCredits: account.availableResetCredits ?? 0,
+          });
+          break;
       }
     },
-    [navigate, resumeMutation],
+    [canWrite, limitWarmupMutation, navigate, resetCreditDialog, resumeMutation],
   );
 
   const overview = dashboardQuery.data;
@@ -84,8 +116,16 @@ export function DashboardPage() {
     if (!overview || !logPage) {
       return null;
     }
-    return buildDashboardView(overview, logPage.requests, isDark);
-  }, [overview, logPage, isDark]);
+    return buildDashboardView(
+      overview,
+      logPage.requests,
+      {
+        isDark,
+        showAccountBurnrate,
+      },
+      projectionsQuery.data,
+    );
+  }, [overview, logPage, isDark, showAccountBurnrate, projectionsQuery.data]);
 
   const accountOptions = useMemo(() => {
     const entries = new Map<string, { label: string; isEmail: boolean }>();
@@ -200,11 +240,25 @@ export function DashboardPage() {
           )}
 
           <section className="space-y-4">
-            <div className="flex items-center gap-3">
-              <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">Accounts</h2>
-              <div className="h-px flex-1 bg-border" />
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">Accounts</h2>
+                <AccountSummaryLine accounts={overview?.accounts ?? []} />
+              </div>
+              <div className="h-px min-w-8 flex-1 bg-border" />
+              <AccountViewModeToggle value={accountViewMode} onChange={setAccountViewMode} />
             </div>
-            <AccountCards accounts={overview?.accounts ?? []} onAction={handleAccountAction} />
+            {accountViewMode === "list" ? (
+              <AccountList
+                accounts={overview?.accounts ?? []}
+                readOnly={!canWrite}
+                sort={accountListSort}
+                onSortChange={setAccountListSort}
+                onAction={handleAccountAction}
+              />
+            ) : (
+              <AccountCards accounts={overview?.accounts ?? []} readOnly={!canWrite} onAction={handleAccountAction} />
+            )}
           </section>
 
           <section className="space-y-4">
@@ -253,6 +307,15 @@ export function DashboardPage() {
           </section>
         </>
       )}
+
+      {resetCreditDialog.data ? (
+        <ResetCreditConfirmDialog
+          open={resetCreditDialog.open}
+          accountId={resetCreditDialog.data.accountId}
+          summaryAvailableCount={resetCreditDialog.data.availableResetCredits}
+          onOpenChange={resetCreditDialog.onOpenChange}
+        />
+      ) : null}
 
     </div>
   );

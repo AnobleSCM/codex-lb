@@ -1,8 +1,14 @@
-import { Clock } from "lucide-react";
+import { lazy, Suspense } from "react";
+import { Clock, Flame, RotateCcw } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { AccountTrendChart } from "@/features/accounts/components/account-trend-chart";
-import type { AccountSummary, AccountTrendsResponse } from "@/features/accounts/schemas";
+import type { AccountTrendChartProps } from "@/features/accounts/components/account-trend-chart";
+import type {
+  AccountSummary,
+  AccountTrendsResponse,
+  AccountUsageResetCredits,
+} from "@/features/accounts/schemas";
 import { quotaBarColor, quotaBarTrack } from "@/utils/account-status";
 import {
   formatCompactNumber,
@@ -13,9 +19,20 @@ import {
   formatWindowLabel,
 } from "@/utils/formatters";
 
+const AccountTrendChart = lazy(() =>
+  import("@/features/accounts/components/account-trend-chart").then((module) => ({
+    default: (props: AccountTrendChartProps) => <module.AccountTrendChart {...props} />,
+  })),
+);
+
 export type AccountUsagePanelProps = {
   account: AccountSummary;
   trends?: AccountTrendsResponse | null;
+  resetCredits?: AccountUsageResetCredits | null;
+  resetCreditsLoading?: boolean;
+  resetCreditsUnavailable?: boolean;
+  resetDisabled?: boolean;
+  onReset?: (accountId: string) => void;
 };
 
 function QuotaRow({
@@ -122,27 +139,116 @@ function AdditionalQuotaRow({
   );
 }
 
-export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
+const ADDITIONAL_ROUTING_POLICY_LABELS: Record<string, string> = {
+  burn_first: "Burn first",
+  normal: "Normal",
+  preserve: "Preserve",
+};
+
+function ResetCreditsRow({
+  accountId,
+  resetCredits,
+  loading,
+  unavailable,
+  resetDisabled,
+  onReset,
+}: {
+  accountId: string;
+  resetCredits?: AccountUsageResetCredits | null;
+  loading?: boolean;
+  unavailable?: boolean;
+  resetDisabled?: boolean;
+  onReset?: (accountId: string) => void;
+}) {
+  if (resetCredits == null && !loading && !unavailable) {
+    return null;
+  }
+
+  const availableCount = resetCredits?.availableCount ?? 0;
+  const valueLabel =
+    loading && resetCredits == null
+      ? "Checking..."
+      : unavailable && resetCredits == null
+        ? "Unavailable"
+        : `${availableCount} available`;
+
+  return (
+    <div className="flex items-center justify-between rounded-md border bg-background/60 px-3 py-2 text-xs">
+      <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
+        <RotateCcw className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span className="truncate font-medium">Usage resets</span>
+      </span>
+      <span className="flex shrink-0 items-center gap-2">
+        <span className="tabular-nums font-semibold">{valueLabel}</span>
+        {onReset ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-6 gap-1 px-1.5 text-[11px]"
+            aria-label="Reset usage"
+            onClick={() => onReset(accountId)}
+            disabled={resetDisabled || availableCount <= 0}
+          >
+            <RotateCcw className="h-3 w-3" aria-hidden="true" />
+            Reset
+          </Button>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+export function AccountUsagePanel({
+  account,
+  trends,
+  resetCredits,
+  resetCreditsLoading,
+  resetCreditsUnavailable,
+  resetDisabled = false,
+  onReset,
+}: AccountUsagePanelProps) {
   const primary = account.usage?.primaryRemainingPercent ?? null;
   const secondary = account.usage?.secondaryRemainingPercent ?? null;
+  const monthly = account.usage?.monthlyRemainingPercent ?? null;
   const requestUsage = account.requestUsage ?? null;
   const hasRequestUsage = (requestUsage?.requestCount ?? 0) > 0;
   const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
+  const primaryTrendPoints = trends?.primary ?? [];
+  const secondaryTrendPoints = trends?.secondary ?? [];
+  const secondaryScheduledTrendPoints = trends?.secondaryScheduled ?? [];
+  const monthlyOnly =
+    account.windowMinutesMonthly != null &&
+    account.windowMinutesPrimary == null &&
+    account.windowMinutesSecondary == null;
   const hasTrends =
-    trends &&
-    (trends.primary.length > 0 || trends.secondary.length > 0 || trends.secondaryScheduled.length > 0);
+    primaryTrendPoints.length > 0 || secondaryTrendPoints.length > 0 || secondaryScheduledTrendPoints.length > 0;
 
   return (
-    <div className="space-y-4 rounded-lg border bg-muted/30 p-4">
+    <div className="min-w-0 space-y-4 rounded-lg border bg-muted/30 p-4">
       <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Usage</h3>
-      <div className={cn("grid gap-4", weeklyOnly ? "grid-cols-1" : "grid-cols-2")}>
-        {!weeklyOnly && <QuotaRow label="5h" percent={primary} resetAt={account.resetAtPrimary} />}
-        <QuotaRow label="Weekly" percent={secondary} resetAt={account.resetAtSecondary} />
+      <div className={cn("grid gap-4", weeklyOnly || monthlyOnly ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2")}>
+        {monthlyOnly ? (
+          <QuotaRow label="Monthly" percent={monthly} resetAt={account.resetAtMonthly} />
+        ) : (
+          <>
+            {!weeklyOnly && <QuotaRow label="5h" percent={primary} resetAt={account.resetAtPrimary} />}
+            <QuotaRow label="Weekly" percent={secondary} resetAt={account.resetAtSecondary} />
+          </>
+        )}
       </div>
+      <ResetCreditsRow
+        accountId={account.accountId}
+        resetCredits={resetCredits}
+        loading={resetCreditsLoading}
+        unavailable={resetCreditsUnavailable}
+        resetDisabled={resetDisabled}
+        onReset={onReset}
+      />
       <div className="rounded-md border bg-background/60 px-3 py-2">
         <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Request logs total</p>
         {hasRequestUsage ? (
-          <p className="mt-1 text-xs tabular-nums text-muted-foreground">
+          <p className="mt-1 break-words text-xs tabular-nums text-muted-foreground">
             {formatCompactNumber(requestUsage?.totalTokens)} tok | {formatCompactNumber(requestUsage?.cachedInputTokens)} cached |{" "}
             {formatCompactNumber(requestUsage?.requestCount)} req | {formatCurrency(requestUsage?.totalCostUsd)}
           </p>
@@ -158,7 +264,13 @@ export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
           {account.additionalQuotas.map((quota) => (
             <div key={quota.quotaKey ?? quota.limitName} className="rounded-md border bg-background/60 px-3 py-2 space-y-2">
               <p className="text-xs font-medium">
-                {quota.displayLabel ?? formatAdditionalLimitName(quota.limitName, quota.quotaKey)}
+                <span>{quota.displayLabel ?? formatAdditionalLimitName(quota.limitName, quota.quotaKey)}</span>
+                {quota.routingPolicy != null && quota.routingPolicy !== "inherit" ? (
+                  <span className="ml-2 inline-flex items-center gap-1 rounded-full border border-orange-200 bg-orange-50 px-1.5 py-0.5 text-[10px] font-medium text-orange-700 dark:border-orange-900/60 dark:bg-orange-950/40 dark:text-orange-300">
+                    <Flame className="h-3 w-3" aria-hidden="true" />
+                    {ADDITIONAL_ROUTING_POLICY_LABELS[quota.routingPolicy] ?? quota.routingPolicy}
+                  </span>
+                ) : null}
               </p>
               {quota.primaryWindow != null ? (
                 <AdditionalQuotaRow
@@ -180,30 +292,32 @@ export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
       ) : null}
       {hasTrends && (
         <div className="pt-3">
-          <div className="mb-2 flex items-center justify-between">
+          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">7-day trend</h4>
-            <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-2 w-2 rounded-full bg-chart-1" />
                 5h
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-2 w-2 rounded-full bg-chart-2" />
-                Weekly
+                {monthlyOnly ? "Monthly" : "Weekly"}
               </span>
-              {trends.secondaryScheduled.length > 0 ? (
+              {secondaryScheduledTrendPoints.length > 0 ? (
                 <span className="flex items-center gap-1.5">
                   <span className="inline-block h-0 w-4 border-t border-dashed border-chart-2" />
-                  Weekly plan
+                  {monthlyOnly ? "Monthly plan" : "Weekly plan"}
                 </span>
               ) : null}
             </div>
           </div>
-          <AccountTrendChart
-            primary={trends.primary}
-            secondary={trends.secondary}
-            secondaryScheduled={trends.secondaryScheduled}
-          />
+          <Suspense fallback={<div className="h-[220px]" />}>
+            <AccountTrendChart
+              primary={primaryTrendPoints}
+              secondary={secondaryTrendPoints}
+              secondaryScheduled={secondaryScheduledTrendPoints}
+            />
+          </Suspense>
         </div>
       )}
     </div>

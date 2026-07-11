@@ -143,7 +143,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name == "sqlite":
-        op.execute(sa.text("UPDATE accounts SET status = 'deactivated' WHERE CAST(status AS TEXT) = 'reauth_required'"))
+        op.execute(sa.text("UPDATE accounts SET status = 'deactivated' WHERE status = 'reauth_required'"))
         with op.batch_alter_table("accounts") as batch_op:
             batch_op.alter_column(
                 "status",
@@ -154,6 +154,6 @@ def downgrade() -> None:
         return
     if bind.dialect.name != "postgresql":
         return
-    op.execute(sa.text("UPDATE accounts SET status = 'deactivated' WHERE status::text = 'reauth_required'"))
+    op.execute(sa.text("UPDATE accounts SET status = 'deactivated' WHERE status = 'reauth_required'"))
     if _enum_value_exists("account_status", "reauth_required"):
         _replace_postgresql_account_status_enum(_LEGACY_ACCOUNT_STATUS_VALUES)

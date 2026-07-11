@@ -12,7 +12,17 @@ from sqlalchemy.sql import Insert
 
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, StickySession, StickySessionKind
+from app.db.session import sqlite_writer_section
 from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessionSortDir
+
+# Each (key, kind) pair in delete_entries contributes 2 bind parameters to
+# the underlying DELETE...OR (key=:k AND kind=:t)... statement. SQLite's
+# default SQLITE_LIMIT_VARIABLE_NUMBER is 999 on builds older than 3.32
+# and 32766 on newer builds, so chunking conservatively at 250 pairs
+# (500 bind parameters) keeps delete-filtered safe on any libsqlite that
+# ships with current Python interpreters. Postgres allows up to 65535
+# bind parameters, which this chunk size also respects.
+_DELETE_ENTRIES_CHUNK_SIZE = 250
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +66,9 @@ class StickySessionsRepository:
 
     async def upsert(self, key: str, account_id: str, *, kind: StickySessionKind) -> StickySession:
         statement = self._build_upsert_statement(key, account_id, kind)
-        await self._session.execute(statement)
-        await self._session.commit()
+        async with sqlite_writer_section():
+            await self._session.execute(statement)
+            await self._session.commit()
         row = await self.get_entry(key, kind=kind)
         if row is None:
             raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
@@ -71,8 +82,9 @@ class StickySessionsRepository:
             StickySession.key == key,
             StickySession.kind == kind,
         )
-        result = await self._session.execute(statement.returning(StickySession.key))
-        await self._session.commit()
+        async with sqlite_writer_section():
+            result = await self._session.execute(statement.returning(StickySession.key))
+            await self._session.commit()
         return result.scalar_one_or_none() is not None
 
     async def delete_entries(
@@ -82,12 +94,19 @@ class StickySessionsRepository:
         targets = {(key, kind) for key, kind in entries if key}
         if not targets:
             return []
-        statement = delete(StickySession).where(
-            or_(*(and_(StickySession.key == key, StickySession.kind == kind) for key, kind in targets))
-        )
-        result = await self._session.execute(statement.returning(StickySession.key, StickySession.kind))
-        await self._session.commit()
-        return [(key, kind) for key, kind in result.all()]
+
+        deleted: list[tuple[str, StickySessionKind]] = []
+        targets_list = list(targets)
+        for offset in range(0, len(targets_list), _DELETE_ENTRIES_CHUNK_SIZE):
+            chunk = targets_list[offset : offset + _DELETE_ENTRIES_CHUNK_SIZE]
+            statement = delete(StickySession).where(
+                or_(*(and_(StickySession.key == key, StickySession.kind == kind) for key, kind in chunk))
+            )
+            async with sqlite_writer_section():
+                result = await self._session.execute(statement.returning(StickySession.key, StickySession.kind))
+                await self._session.commit()
+            deleted.extend((key, kind) for key, kind in result.all())
+        return deleted
 
     async def list_entry_identifiers(
         self,
@@ -174,9 +193,10 @@ class StickySessionsRepository:
         stmt = delete(StickySession).where(StickySession.updated_at < to_utc_naive(cutoff))
         if kind is not None:
             stmt = stmt.where(StickySession.kind == kind)
-        result = await self._session.execute(stmt.returning(StickySession.key))
-        deleted = len(result.scalars().all())
-        await self._session.commit()
+        async with sqlite_writer_section():
+            result = await self._session.execute(stmt.returning(StickySession.key))
+            deleted = len(result.scalars().all())
+            await self._session.commit()
         return deleted
 
     def _build_upsert_statement(self, key: str, account_id: str, kind: StickySessionKind) -> Insert:

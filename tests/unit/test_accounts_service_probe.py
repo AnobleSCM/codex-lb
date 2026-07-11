@@ -6,9 +6,11 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import (
     DEFAULT_PROBE_MODEL,
     AccountNotProbableError,
@@ -40,8 +42,6 @@ def _make_account(status: AccountStatus = AccountStatus.ACTIVE) -> Account:
 
 
 def _make_usage_row(used_percent: float, account_id: str = _ACCOUNT_ID) -> Any:
-    # Service only reads ``used_percent`` off the row; a SimpleNamespace
-    # stand-in is enough for the unit test.
     return SimpleNamespace(used_percent=used_percent, account_id=account_id)
 
 
@@ -50,6 +50,7 @@ def _build_service(
     *,
     primary_pct: float | None = None,
     secondary_pct: float | None = None,
+    auth_manager: Any | None = None,
 ) -> AccountsService:
     repo = AsyncMock()
     repo.get_by_id.return_value = account
@@ -65,11 +66,12 @@ def _build_service(
 
     usage_repo.latest_entry_for_account.side_effect = _latest_entry_for_account
 
-    service = AccountsService(repo=repo, usage_repo=usage_repo)
+    service = AccountsService(repo=repo, usage_repo=usage_repo, auth_manager=auth_manager)
     # Stop the real UsageUpdater from running — the unit test asserts the
     # service-level orchestration, not the refresh internals.
-    service._usage_updater = AsyncMock()
-    service._usage_updater.refresh_accounts = AsyncMock(return_value=None)
+    usage_updater = AsyncMock()
+    usage_updater.force_refresh = AsyncMock(return_value=True)
+    service._usage_updater = usage_updater
     return service
 
 
@@ -91,6 +93,14 @@ async def test_probe_account_rejects_paused_account():
 @pytest.mark.asyncio
 async def test_probe_account_rejects_deactivated_account():
     account = _make_account(status=AccountStatus.DEACTIVATED)
+    service = _build_service(account=account)
+    with pytest.raises(AccountNotProbableError):
+        await service.probe_account(_ACCOUNT_ID)
+
+
+@pytest.mark.asyncio
+async def test_probe_account_rejects_reauth_required_account():
+    account = _make_account(status=AccountStatus.REAUTH_REQUIRED)
     service = _build_service(account=account)
     with pytest.raises(AccountNotProbableError):
         await service.probe_account(_ACCOUNT_ID)
@@ -126,7 +136,38 @@ async def test_probe_account_captures_before_after_snapshot(monkeypatch):
     assert captured_kwargs["chatgpt_account_id"] == _CHATGPT_ACCOUNT_ID
     assert captured_kwargs["model"] == "gpt-5.5-test"
 
-    cast(AsyncMock, service._usage_updater).refresh_accounts.assert_awaited_once()
+    assert service._usage_updater is not None
+    force_refresh_mock = service._usage_updater.force_refresh
+    assert isinstance(force_refresh_mock, AsyncMock)
+    force_refresh_mock.assert_awaited_once_with(account, ignore_refresh_disabled=True)
+
+
+@pytest.mark.asyncio
+async def test_probe_account_refreshes_token_before_sending_probe(monkeypatch):
+    stale_account = _make_account(status=AccountStatus.ACTIVE)
+    fresh_account = _make_account(status=AccountStatus.ACTIVE)
+    encryptor = TokenEncryptor()
+    fresh_account.access_token_encrypted = encryptor.encrypt("fresh-access-token")
+    auth_manager = SimpleNamespace(ensure_fresh=AsyncMock(return_value=fresh_account))
+    service = _build_service(
+        account=stale_account,
+        primary_pct=95.0,
+        secondary_pct=80.0,
+        auth_manager=auth_manager,
+    )
+
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _fake_probe(**kwargs):
+        captured_kwargs.update(kwargs)
+        return 200
+
+    monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
+
+    await service.probe_account(_ACCOUNT_ID)
+
+    auth_manager.ensure_fresh.assert_awaited_once_with(stale_account, force=False)
+    assert captured_kwargs["access_token"] == "fresh-access-token"
 
 
 @pytest.mark.asyncio
@@ -177,3 +218,75 @@ async def test_probe_account_surfaces_network_failure_status(monkeypatch):
     result = await service.probe_account(_ACCOUNT_ID)
     assert result is not None
     assert result.probe_status_code == 0
+
+
+@pytest.mark.asyncio
+async def test_import_usage_refresh_allowed_tolerates_missing_upstream_proxy_settings_schema(monkeypatch):
+    account = _make_account()
+
+    async def _resolve_upstream_route(*_args: Any, **_kwargs: Any):
+        return None
+
+    class _Session:
+        async def get(self, *_args: Any, **_kwargs: Any) -> None:
+            raise OperationalError(
+                "select dashboard_settings",
+                {},
+                Exception("column dashboard_settings.upstream_proxy_routing_enabled does not exist"),
+            )
+
+    monkeypatch.setattr("app.modules.accounts.service.resolve_upstream_route", _resolve_upstream_route)
+    repo = cast(AccountsRepository, SimpleNamespace(session=_Session()))
+    service = AccountsService(repo=repo)
+
+    assert await service._import_usage_refresh_allowed(account) is True
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_uses_shared_http_client(monkeypatch):
+    account = _make_account()
+    service = _build_service(account=account)
+    captured: dict[str, Any] = {}
+
+    class _Response:
+        status = 204
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Session:
+        def post(self, url: str, **kwargs: Any):
+            captured["url"] = url
+            captured.update(kwargs)
+            return _Response()
+
+    class _Lease:
+        async def __aenter__(self):
+            captured["leased"] = True
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            captured["released"] = True
+            return False
+
+    monkeypatch.setattr("app.modules.accounts.service.lease_http_session", lambda: _Lease())
+
+    status = await service._send_probe_request(
+        access_token=_PROBE_TOKEN_PLAINTEXT,
+        chatgpt_account_id=_CHATGPT_ACCOUNT_ID,
+        model="gpt-5.5-test",
+    )
+
+    assert status == 204
+    assert captured["leased"] is True
+    assert captured["released"] is True
+    assert captured["url"].endswith("/backend-api/codex/responses")
+    assert captured["headers"]["Authorization"] == f"Bearer {_PROBE_TOKEN_PLAINTEXT}"
+    assert captured["headers"]["chatgpt-account-id"] == _CHATGPT_ACCOUNT_ID
+    assert captured["json"]["model"] == "gpt-5.5-test"
+    assert captured["timeout"].total == 30.0
+    assert captured["timeout"].connect is None
+    assert captured["timeout"].sock_connect == 10.0
