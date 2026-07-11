@@ -123,6 +123,17 @@ printf 'ok\\n'
 """,
     )
 
+    default_sequence = tmp_path / "default-status-sequence.txt"
+    default_sequence.write_text(
+        "\n".join(
+            [
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+                '{"status":"ok","checks":{"draining":true,"bridge_drain_active":true,"in_flight":0}}',
+            ]
+        )
+        + "\n"
+    )
+
     env = os.environ.copy()
     env.update(
         {
@@ -132,11 +143,15 @@ printf 'ok\\n'
             "FAKE_DOCKER_LOG": str(docker_log),
             "FAKE_CURL_LOG": str(curl_log),
             "FAKE_EVENT_LOG": str(event_log),
+            # Real endpoint shape: JSON booleans and integer counts. The earlier
+            # string-typed fixture ('"draining":"false"') masked a bug where
+            # Python bools printed as True/False and broke the shell parser.
             "FAKE_DRAIN_STATUS": (
-                '{"status":"ok","checks":{"draining":"false","bridge_drain_active":"false","in_flight":"0"}}'
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}'
             ),
             "FAKE_DRAIN_STATUS_COUNT_FILE": str(tmp_path / "status-count.txt"),
-            "FAKE_DRAIN_STATUS_SEQUENCE": "",
+            "FAKE_DRAIN_STATUS_SEQUENCE": str(default_sequence),
+            "CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS": "0",
             "FAKE_HOST_DRAIN_FORBIDDEN": "0",
             "FAKE_LIVE_REVISIONS": "20260630_020000_merge_heads\n20260701_000000_pace_smoothing",
             "FAKE_NEW_IMAGE_REVISIONS": ("20260630_020000_merge_heads\n20260701_000000_pace_smoothing"),
@@ -147,9 +162,8 @@ printf 'ok\\n'
 
 def test_deploy_refuses_to_build_or_recreate_when_live_proxy_has_in_flight_work(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
-    env["FAKE_DRAIN_STATUS"] = (
-        '{"status":"ok","checks":{"draining":"false","bridge_drain_active":"false","in_flight":"2"}}'
-    )
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = ""
+    env["FAKE_DRAIN_STATUS"] = '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":2}}'
 
     result = subprocess.run(
         ["bash", str(DEPLOY_SCRIPT)],
@@ -170,12 +184,13 @@ def test_deploy_refuses_to_build_or_recreate_when_live_proxy_has_in_flight_work(
 @pytest.mark.parametrize("active_key", ["draining", "bridge_drain_active"])
 def test_deploy_refuses_to_build_when_live_proxy_is_already_draining(tmp_path: Path, active_key: str) -> None:
     env = _base_env(tmp_path)
-    checks: dict[str, str] = {
-        "draining": "false",
-        "bridge_drain_active": "false",
-        "in_flight": "0",
+    checks: dict[str, object] = {
+        "draining": False,
+        "bridge_drain_active": False,
+        "in_flight": 0,
     }
-    checks[active_key] = "true"
+    checks[active_key] = True
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = ""
     env["FAKE_DRAIN_STATUS"] = json.dumps({"status": "ok", "checks": checks})
 
     result = subprocess.run(
@@ -218,6 +233,7 @@ def test_deploy_fails_closed_when_live_drain_status_is_unreadable(tmp_path: Path
 
 def test_deploy_fails_closed_when_live_drain_status_is_malformed(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = ""
     env["FAKE_DRAIN_STATUS"] = "not-json"
 
     result = subprocess.run(
@@ -238,6 +254,7 @@ def test_deploy_fails_closed_when_live_drain_status_is_malformed(tmp_path: Path)
 
 def test_deploy_fails_closed_when_live_drain_status_omits_state_flags(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = ""
     env["FAKE_DRAIN_STATUS"] = '{"status":"ok","checks":{"in_flight":"0"}}'
 
     result = subprocess.run(
@@ -258,6 +275,18 @@ def test_deploy_fails_closed_when_live_drain_status_omits_state_flags(tmp_path: 
 
 def test_deploy_starts_drain_and_waits_before_recreating_idle_container(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
+    status_sequence = tmp_path / "status-sequence.txt"
+    status_sequence.write_text(
+        "\n".join(
+            [
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+                '{"status":"ok","checks":{"draining":true,"bridge_drain_active":true,"in_flight":0}}',
+            ]
+        )
+        + "\n"
+    )
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = str(status_sequence)
+    env["CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS"] = "0"
 
     result = subprocess.run(
         ["bash", str(DEPLOY_SCRIPT)],
@@ -276,14 +305,56 @@ def test_deploy_starts_drain_and_waits_before_recreating_idle_container(tmp_path
     assert drain_status_index < drain_start_index < compose_index
 
 
+def test_deploy_drain_wait_requires_latched_flags_before_completing(tmp_path: Path) -> None:
+    # in_flight=0 alone must NOT complete the drain wait: until the drain
+    # flags latch, the proxy is still admitting work and a request accepted
+    # between the poll and the recreate would be killed. The wait may only
+    # finish on a status read showing draining AND bridge_drain_active AND
+    # zero in-flight together.
+    env = _base_env(tmp_path)
+    status_sequence = tmp_path / "status-sequence.txt"
+    status_sequence.write_text(
+        "\n".join(
+            [
+                # pre-drain idle gate
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+                # post-start: zero in-flight but the drain has NOT latched yet
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+                # latched: only now may the wait complete
+                '{"status":"ok","checks":{"draining":true,"bridge_drain_active":true,"in_flight":0}}',
+            ]
+        )
+        + "\n"
+    )
+    env["FAKE_DRAIN_STATUS_SEQUENCE"] = str(status_sequence)
+    env["CODEX_LB_DEPLOY_DRAIN_POLL_SECONDS"] = "0"
+
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    event_log = (tmp_path / "events.log").read_text()
+    status_reads = event_log.count("/internal/drain/status")
+    assert result.returncode == 0, result.stderr
+    # All three sequence lines were consumed: the unlatched zero-in-flight
+    # read did not complete the wait.
+    assert status_reads >= 3
+    assert event_log.index("/internal/drain/start") < event_log.index(" compose ")
+
+
 def test_deploy_stops_drain_after_post_drain_timeout(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
     status_sequence = tmp_path / "status-sequence.txt"
     status_sequence.write_text(
         "\n".join(
             [
-                '{"status":"ok","checks":{"draining":"false","bridge_drain_active":"false","in_flight":"0"}}',
-                '{"status":"ok","checks":{"draining":"true","bridge_drain_active":"true","in_flight":"1"}}',
+                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+                '{"status":"ok","checks":{"draining":true,"bridge_drain_active":true,"in_flight":1}}',
             ]
         )
         + "\n"
