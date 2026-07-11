@@ -387,9 +387,14 @@ class LoadBalancer:
                 "upstream circuit breaker is open",
                 available_accounts=_service_available_accounts(selection_inputs),
             )
-        elif selection_inputs.accounts:
-            set_normal(available_accounts=_service_available_accounts(selection_inputs))
-        elif selection_inputs.error_code is not None:
+        # Recovery to normal is declared on a successful selection (below), or
+        # here for a TYPED selection error (a config/scope-shaped failure such
+        # as no-plan-supports-model — not pool degradation). Upstream also
+        # flipped to normal whenever accounts were merely PRESENT, so a pool of
+        # present-but-unroutable accounts (e.g. all rate-limited) flapped
+        # normal -> degraded on every request, re-firing the transition warning
+        # and briefly publishing a healthy /health while unroutable.
+        elif not selection_inputs.accounts and selection_inputs.error_code is not None:
             set_normal(available_accounts=_service_available_accounts(selection_inputs))
 
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
@@ -772,6 +777,7 @@ class LoadBalancer:
                 )
                 error_message = _format_degraded_error_message(error_message)
             return AccountSelection(account=None, error_message=error_message, error_code=selection_error_code)
+        set_normal(available_accounts=_service_available_accounts(selection_inputs))
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",
             selected_snapshot.id,

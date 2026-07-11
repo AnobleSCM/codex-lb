@@ -254,6 +254,93 @@ async def test_load_balancer_returns_degraded_message_when_no_accounts_available
 
 
 @pytest.mark.asyncio
+async def test_load_balancer_stays_degraded_when_all_present_accounts_are_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reviewer regression (sync PR #24 round 2A): accounts that are merely
+    # PRESENT must not flip the service to normal. With every present account
+    # rate-limited (future reset, no fresh usage evidence), a request must
+    # neither call set_normal nor clear an existing degraded state — recovery
+    # is declared only on a successful selection or a typed selection error.
+    import time as _time
+    from datetime import datetime as _datetime
+
+    from app.db.models import Account, AccountStatus
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=False)
+    )
+    now = int(_time.time())
+    benched = Account(
+        id="rl-1",
+        chatgpt_account_id="chatgpt-rl-1",
+        email="rl-1@test.com",
+        plan_type="plus",
+        access_token_encrypted=b"a",
+        refresh_token_encrypted=b"r",
+        id_token_encrypted=b"i",
+        last_refresh=_datetime(2025, 1, 1),
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=now + 3600,
+        blocked_at=now - 60,
+    )
+
+    normal_calls: list[int] = []
+    original_set_normal = load_balancer_module.set_normal
+    monkeypatch.setattr(
+        load_balancer_module,
+        "set_normal",
+        lambda *args, **kwargs: normal_calls.append(1) or original_set_normal(*args, **kwargs),
+    )
+
+    set_degraded("all upstream accounts are unavailable")
+    balancer = LoadBalancer(lambda: _repo_factory([benched]))
+    selection = await balancer.select_account()
+
+    assert selection.account is None
+    assert normal_calls == []
+    assert is_degraded() is True
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_recovers_to_normal_on_successful_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Companion to the stays-degraded regression above: recovery to normal is
+    # declared when a selection actually succeeds.
+    import time as _time
+    from datetime import datetime as _datetime
+
+    from app.db.models import Account, AccountStatus
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=False)
+    )
+    active = Account(
+        id="ok-1",
+        chatgpt_account_id="chatgpt-ok-1",
+        email="ok-1@test.com",
+        plan_type="plus",
+        access_token_encrypted=b"a",
+        refresh_token_encrypted=b"r",
+        id_token_encrypted=b"i",
+        last_refresh=_datetime(2025, 1, 1),
+        status=AccountStatus.ACTIVE,
+        reset_at=None,
+        blocked_at=None,
+    )
+    _ = _time  # imported for symmetry with the sibling regression
+
+    set_degraded("all upstream accounts are unavailable")
+    balancer = LoadBalancer(lambda: _repo_factory([active]))
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert is_degraded() is False
+    assert get_available_accounts() == 1
+
+
+@pytest.mark.asyncio
 async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
