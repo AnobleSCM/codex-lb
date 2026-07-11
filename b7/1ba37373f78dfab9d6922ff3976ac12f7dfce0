@@ -1,0 +1,23 @@
+scripts/codex-lb-deploy.sh
+  bae4441013363813 83-89,167,170-177,181,183
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b71ba37373f78dfab9d6922ff3976ac12f7dfce0",
+  "prompts": {
+    "bae4441013363813": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce0f470b-3412-4c74-8e9a-a3f79529eb63",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM",
+      "messages": [],
+      "total_additions": 83,
+      "total_deletions": 15,
+      "accepted_lines": 77,
+      "overriden_lines": 0
+    }
+  }
+}
