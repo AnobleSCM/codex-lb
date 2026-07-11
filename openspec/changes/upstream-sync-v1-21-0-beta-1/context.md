@@ -32,28 +32,43 @@ with broader coverage. These are dropped (not carried):
 - **#20** — parity scaffolding that existed only to track fork-vs-upstream
   divergence; the reset makes it obsolete.
 
-### RETIRED — upstream-covered (Lane 1, fork #1 `80904ebb` + #2 `55ab5d0c`)
+### SPLIT — Lane 1 retired, Lane 1b carried (fork #1 `80904ebb` + #2 `55ab5d0c`)
 
-The fork's RATE_LIMITED early-recovery patches are **not** carried. Current
-upstream `65dc4b75` already covers both semantics they added:
+**Lane 1 (restart recovery) — RETIRED, upstream-covered.** A persisted
+`blocked_at` account recovers after a process restart via
+`background_recovery_state_from_account`
+(`app/modules/proxy/load_balancer.py`), seeded from the persisted block marker
+and driven by the usage refresh scheduler's
+`reconcile_recoverable_account_statuses`
+(`app/core/usage/refresh_scheduler.py`). Upstream provenance: #754
+(stored-reset recovery), #928 and #1121 (the background reconciler +
+restart-without-runtime-state path). Coverage is pinned by upstream's own
+tests plus
+`test_usage_refresh_scheduler_recovery.py::test_reconcile_recoverable_account_statuses_restores_rate_limited_after_reset_elapses`
+and
+`test_load_balancer.py::test_background_recovery_state_recovers_rate_limited_after_reset_elapses`.
 
-- **Restart recovery without live runtime state** — a persisted `blocked_at`
-  account recovers after a process restart via
-  `background_recovery_state_from_account`
-  (`app/modules/proxy/load_balancer.py`), seeded from the persisted block marker
-  and driven by the usage refresh scheduler's
-  `reconcile_recoverable_account_statuses`
-  (`app/core/usage/refresh_scheduler.py`).
-- **Fresh-usage clearing of stale reset guards** — the same path clears a stale
-  runtime reset guard when fresh post-block usage proves the window rolled over.
+**Lane 1b (stale-future-reset early recovery) — CARRIED.** A live probe
+against `65dc4b75` (2026-07-10) showed the reviewed claim "fresh usage clears
+stale reset guards" holds only for QUOTA_EXCEEDED: `_state_from_account`'s
+fresh-newer-window guard clear was QUOTA_EXCEEDED-only, and
+`apply_usage_quota` held RATE_LIMITED whenever the stored reset lay in the
+future — so an account benched by a pessimistic/stale reset hint stayed
+benched for the full stored horizon (~2.5h in the original 2026-05 incident)
+even when fresh usage proved the window had already rolled. Lane 1b adds the
+RATE_LIMITED analogue of upstream's own QUOTA_EXCEEDED clear: recovery only on
+positive fresh evidence (recent entry, capacity available, reset strictly
+newer than the stored guard, and — when a block marker exists — recorded
+after the block). Absence of evidence keeps the stored horizon (fail-closed);
+re-blocking refreshes `blocked_at`, which invalidates older evidence, so a
+genuinely limited account cannot flap through the clear. Pinned by the
+`background_recovery_state` stale-guard tests (2 recovery + 2 fail-closed) and
+`test_reconcile_recoverable_account_statuses_restores_rate_limited_on_stale_future_reset`.
 
-Upstream provenance: #754 (stored-reset recovery), #928 and #1121 (the
-background reconciler + restart-without-runtime-state path). A line-level check
-against `65dc4b75` (orchestrator + independent inventory) confirmed the fork's
-`RATE_LIMITED_COOLDOWN_SECONDS` early-recovery branch and its no-blocked-at
-fresh-window branch are both redundant with this upstream machinery, so carrying
-them would re-introduce divergence for no behavior gain (and the fork's
-regression tests no longer match upstream's evolved `apply_usage_quota`).
+The fork's original `RATE_LIMITED_COOLDOWN_SECONDS` cooldown branch remains
+retired — its 120s marker-based early-recovery is superseded by the
+evidence-gated clear above, and the fork's regression tests no longer match
+upstream's evolved `apply_usage_quota`.
 
 ### Carried (re-implemented against upstream — Lanes 2-5)
 
@@ -124,10 +139,11 @@ Deferred to live cutover (cannot be proven from the source tree alone):
    the exact routed model id must be re-validated against the live `/v1/models`
    / catalog surface.
 2. **RATE_LIMITED reconciler soak** — capture at least one live observation of a
-   RATE_LIMITED account recovering to ACTIVE via the upstream reconciler
+   RATE_LIMITED account recovering to ACTIVE via the reconciler
    (`reconcile_recoverable_account_statuses` /
-   `background_recovery_state_from_account`), confirming Lane 1's retirement is
-   safe in the running system.
+   `background_recovery_state_from_account`), confirming Lane 1's retirement
+   (restart recovery) and the Lane 1b evidence-gated stale-guard clear are
+   both safe in the running system.
 
 ## Example
 

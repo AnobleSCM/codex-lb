@@ -2361,20 +2361,19 @@ def test_background_recovery_state_preserves_rate_limit_cooldown_when_reset_is_i
     assert state.cooldown_until == pytest.approx(future_reset)
 
 
-def test_background_recovery_state_keeps_rate_limited_on_future_reset_despite_fresh_newer_window(monkeypatch):
+def test_background_recovery_state_clears_stale_future_reset_on_fresh_newer_window(monkeypatch):
     # Fork-#2 evidence shape (observed 2026-05-17): status=rate_limited with a
     # stored reset still in the future and no persisted blocked_at, while fresh
-    # primary usage shows capacity on a strictly LATER reset window. Upstream
-    # treats the persisted reset guard as authoritative until it elapses: the
-    # fresh-newer-window guard clear in _state_from_account applies only to
-    # QUOTA_EXCEEDED, and apply_usage_quota holds RATE_LIMITED while
-    # runtime_reset lies in the future. Recovery for this shape lands once the
-    # stored reset passes (see the companion test below) — not early.
+    # primary usage shows capacity on a strictly LATER reset window. The stored
+    # guard is provably stale — the provider window already rolled — so the
+    # RATE_LIMITED stale-guard clear recovers the account instead of benching
+    # it for the remaining stored horizon.
     now = 1_700_000_000.0
     future_reset = int(now + 3600)
     newer_reset = int(now + 7200)
     monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
     monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
 
     account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
     fresh_primary = _make_test_usage(
@@ -2387,6 +2386,103 @@ def test_background_recovery_state_keeps_rate_limited_on_future_reset_despite_fr
     state = background_recovery_state_from_account(
         account=account,
         primary_entry=fresh_primary,
+        secondary_entry=None,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+    assert state.blocked_at is None
+
+
+def test_background_recovery_state_clears_stale_future_reset_with_post_block_evidence(monkeypatch):
+    # Same stale-guard shape but with a persisted blocked_at marker: recovery
+    # requires the newer-window evidence to have been recorded AFTER the block.
+    now = 1_700_000_000.0
+    blocked = now - 1800.0
+    future_reset = int(now + 3600)
+    newer_reset = int(now + 7200)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=future_reset,
+        blocked_at=int(blocked),
+    )
+    fresh_primary = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=newer_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+    )
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=fresh_primary,
+        secondary_entry=None,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+    assert state.blocked_at is None
+
+
+def test_background_recovery_state_keeps_rate_limited_when_evidence_predates_block(monkeypatch):
+    # Fail-closed: evidence recorded BEFORE the block cannot clear the guard,
+    # even when it advertises a newer window with capacity. A re-block updates
+    # blocked_at, so a genuinely limited account cannot flap through the clear.
+    now = 1_700_000_000.0
+    blocked = now - 20.0
+    future_reset = int(now + 3600)
+    newer_reset = int(now + 7200)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=future_reset,
+        blocked_at=int(blocked),
+    )
+    stale_evidence = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=newer_reset,
+        recorded_at=_epoch_to_naive_utc(now - 60),
+    )
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=stale_evidence,
+        secondary_entry=None,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == pytest.approx(future_reset)
+
+
+def test_background_recovery_state_keeps_rate_limited_on_same_window_evidence(monkeypatch):
+    # Fail-closed: fresh evidence for the SAME window (reset_at not strictly
+    # later than the stored guard) is a live hold, not a stale one — the
+    # account stays benched until the stored reset elapses.
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=future_reset)
+    same_window = _make_test_usage(
+        window="primary",
+        used_percent=0.0,
+        reset_at=future_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+    )
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=same_window,
         secondary_entry=None,
     )
 

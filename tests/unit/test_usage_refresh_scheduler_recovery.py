@@ -242,6 +242,63 @@ async def test_reconcile_recoverable_account_statuses_restores_rate_limited_afte
 
 
 @pytest.mark.asyncio
+async def test_reconcile_recoverable_account_statuses_restores_rate_limited_on_stale_future_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stale-guard recovery (carry lane 1b): the stored reset is still in the
+    # future, but fresh post-block primary usage proves a strictly newer window
+    # with capacity — the reconciler recovers the account instead of waiting
+    # out the stale horizon.
+    now = 1_700_000_000.0
+    future_reset = int(now + 3600)
+    newer_reset = int(now + 7200)
+    blocked_at = int(now - 1800)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_account(
+        "acc_rate_limited_stale_guard",
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=future_reset,
+        blocked_at=blocked_at,
+    )
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(
+        primary={
+            account.id: _make_usage(
+                account.id,
+                window="primary",
+                used_percent=0.0,
+                reset_at=newer_reset,
+                recorded_at=_epoch_to_naive_utc(now - 30),
+                window_minutes=300,
+            )
+        }
+    )
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=accounts_repo,
+        usage_repo=usage_repo,
+        accounts=[account],
+    )
+
+    assert recovered == 1
+    assert account.status == AccountStatus.ACTIVE
+    assert account.reset_at is None
+    assert account.blocked_at is None
+    assert accounts_repo.status_updates == [
+        {
+            "account_id": account.id,
+            "status": AccountStatus.ACTIVE,
+            "deactivation_reason": None,
+            "reset_at": None,
+            "blocked_at": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_recoverable_account_statuses_keeps_legacy_rate_limited_when_primary_is_not_recent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

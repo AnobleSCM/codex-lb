@@ -1937,6 +1937,42 @@ def _state_from_account(
     ):
         effective_runtime_reset = None
 
+    # RATE_LIMITED analogue of the stale-guard clear above. A stored future
+    # reset can go stale when the provider window rolls early (reset hints are
+    # pessimistic), benching an otherwise-healthy account for the full stored
+    # horizon. Unlike QUOTA_EXCEEDED, RATE_LIMITED persists blocked_at, so
+    # instead of requiring the marker to be absent the evidence must have been
+    # recorded AFTER the block. Recovery requires positive fresh evidence of a
+    # strictly newer window with available capacity; absence of evidence keeps
+    # the stored horizon. A re-block refreshes blocked_at, which invalidates
+    # older evidence, so a genuinely limited account cannot flap through this
+    # path.
+    if (
+        account.status == AccountStatus.RATE_LIMITED
+        and effective_runtime_reset is not None
+        and effective_runtime_reset > time.time()
+    ):
+        rate_limited_evidence = _rate_limited_freshness_entry(
+            account=account,
+            primary_entry=primary_entry,
+            long_window_entry=effective_secondary_entry,
+        )
+        evidence_after_block = effective_blocked_at is None or (
+            rate_limited_evidence is not None
+            and rate_limited_evidence.recorded_at is not None
+            and rate_limited_evidence.recorded_at.replace(tzinfo=timezone.utc).timestamp() > effective_blocked_at
+        )
+        if (
+            rate_limited_evidence is not None
+            and _usage_entry_is_recent_enough(rate_limited_evidence.recorded_at)
+            and rate_limited_evidence.used_percent is not None
+            and float(rate_limited_evidence.used_percent) < 100.0
+            and rate_limited_evidence.reset_at is not None
+            and float(rate_limited_evidence.reset_at) > effective_runtime_reset
+            and evidence_after_block
+        ):
+            effective_runtime_reset = None
+
     # Clear the runtime reset guard only when a post-block refresh has been
     # observed and the debounce period is over.
     #
