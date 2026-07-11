@@ -84,7 +84,6 @@ async def test_health_ready_db_ok():
         patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
-
         mock_get_session.return_value = _SessionCM(mock_session)
 
         response = await health_ready()
@@ -104,7 +103,6 @@ async def test_health_ready_db_error():
         patch("app.core.startup._bridge_registration_complete", True),
         patch("app.modules.health.api.SessionLocal") as mock_get_session,
     ):
-
         mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
@@ -149,7 +147,6 @@ async def test_health_ready_ignores_upstream_state():
         patch("app.modules.health.api.SessionLocal") as mock_get_session,
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
-
         mock_get_session.return_value = _SessionCM(mock_session)
 
         response = await health_ready()
@@ -175,7 +172,6 @@ async def test_health_ready_circuit_breaker_disabled_returns_200():
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
         with patch("app.modules.health.api.get_settings", return_value=SimpleNamespace(circuit_breaker_enabled=False)):
-
             mock_get_session.return_value = _SessionCM(mock_session)
 
             response = await health_ready()
@@ -299,7 +295,6 @@ async def test_health_ready_fails_when_bridge_registration_is_not_complete():
         ),
         patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock(return_value=_bridge_ring_ok())),
     ):
-
         mock_get_session.return_value = _SessionCM(mock_session)
 
         with pytest.raises(HTTPException) as exc_info:
