@@ -305,12 +305,23 @@ def test_deploy_starts_drain_and_waits_before_recreating_idle_container(tmp_path
     assert drain_status_index < drain_start_index < compose_index
 
 
-def test_deploy_drain_wait_requires_latched_flags_before_completing(tmp_path: Path) -> None:
-    # in_flight=0 alone must NOT complete the drain wait: until the drain
+@pytest.mark.parametrize(
+    "unlatched_checks",
+    [
+        # in_flight=0 alone, neither flag latched
+        '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
+        # draining latched but the bridge drain is not: must NOT complete
+        '{"status":"ok","checks":{"draining":true,"bridge_drain_active":false,"in_flight":0}}',
+        # bridge drain latched but draining is not: must NOT complete
+        '{"status":"ok","checks":{"draining":false,"bridge_drain_active":true,"in_flight":0}}',
+    ],
+)
+def test_deploy_drain_wait_requires_latched_flags_before_completing(tmp_path: Path, unlatched_checks: str) -> None:
+    # in_flight=0 alone must NOT complete the drain wait: until BOTH drain
     # flags latch, the proxy is still admitting work and a request accepted
-    # between the poll and the recreate would be killed. The wait may only
-    # finish on a status read showing draining AND bridge_drain_active AND
-    # zero in-flight together.
+    # between the poll and the recreate would be killed. Each parametrized
+    # case leaves exactly one conjunct unsatisfied so removing any individual
+    # flag check from wait_for_drain_zero fails a case (mutation-resistant).
     env = _base_env(tmp_path)
     status_sequence = tmp_path / "status-sequence.txt"
     status_sequence.write_text(
@@ -318,9 +329,9 @@ def test_deploy_drain_wait_requires_latched_flags_before_completing(tmp_path: Pa
             [
                 # pre-drain idle gate
                 '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
-                # post-start: zero in-flight but the drain has NOT latched yet
-                '{"status":"ok","checks":{"draining":false,"bridge_drain_active":false,"in_flight":0}}',
-                # latched: only now may the wait complete
+                # post-start: zero in-flight but the drain has NOT fully latched
+                unlatched_checks,
+                # fully latched: only now may the wait complete
                 '{"status":"ok","checks":{"draining":true,"bridge_drain_active":true,"in_flight":0}}',
             ]
         )
@@ -344,6 +355,9 @@ def test_deploy_drain_wait_requires_latched_flags_before_completing(tmp_path: Pa
     # All three sequence lines were consumed: the unlatched zero-in-flight
     # read did not complete the wait.
     assert status_reads >= 3
+    # The qualifying (latched) status read happened BEFORE the recreate:
+    # the drain gate completed on live evidence, not after the fact.
+    assert event_log.rindex("/internal/drain/status") < event_log.index(" compose ")
     assert event_log.index("/internal/drain/start") < event_log.index(" compose ")
 
 
