@@ -15,3 +15,10 @@ NOT turn the already-committed upsert into a missing-row or refresh exception.
 - **THEN** it returns the mapping snapshot written by its own database statement
 - **AND** it does not raise `StickySession upsert failed`
 - **AND** it does not raise a database refresh exception
+
+#### Scenario: Rebind updates a row already loaded by the same session
+
+- **GIVEN** a worker has loaded a sticky-session mapping to account A
+- **WHEN** that worker upserts the same `(key, kind)` mapping to account B
+- **THEN** the returned mapping snapshot identifies account B
+- **AND** it does not retain stale attributes from the session identity map

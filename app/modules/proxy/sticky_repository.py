@@ -67,7 +67,10 @@ class StickySessionsRepository:
     async def upsert(self, key: str, account_id: str, *, kind: StickySessionKind) -> StickySession:
         statement = self._build_upsert_statement(key, account_id, kind).returning(StickySession)
         async with sqlite_writer_section():
-            result = await self._session.execute(statement)
+            result = await self._session.execute(
+                statement,
+                execution_options={"populate_existing": True},
+            )
             row = result.scalar_one()
             await self._session.commit()
         return row
