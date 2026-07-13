@@ -65,14 +65,11 @@ class StickySessionsRepository:
         return result.scalar_one_or_none()
 
     async def upsert(self, key: str, account_id: str, *, kind: StickySessionKind) -> StickySession:
-        statement = self._build_upsert_statement(key, account_id, kind)
+        statement = self._build_upsert_statement(key, account_id, kind).returning(StickySession)
         async with sqlite_writer_section():
-            await self._session.execute(statement)
+            result = await self._session.execute(statement)
+            row = result.scalar_one()
             await self._session.commit()
-        row = await self.get_entry(key, kind=kind)
-        if row is None:
-            raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
-        await self._session.refresh(row)
         return row
 
     async def delete(self, key: str, *, kind: StickySessionKind) -> bool:
