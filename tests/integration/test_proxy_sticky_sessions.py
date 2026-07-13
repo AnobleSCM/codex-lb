@@ -180,9 +180,13 @@ async def test_backend_responses_survives_concurrent_sticky_delete_after_upsert_
 
         delete_task = asyncio.create_task(_delete_after_commit())
         try:
-            return await original_upsert(repository, sticky_key, account_id, kind=kind)
-        finally:
-            await delete_task
+            row = await original_upsert(repository, sticky_key, account_id, kind=kind)
+        except BaseException:
+            delete_task.cancel()
+            await asyncio.gather(delete_task, return_exceptions=True)
+            raise
+        await delete_task
+        return row
 
     monkeypatch.setattr(StickySessionsRepository, "upsert", _upsert_with_concurrent_delete)
 
