@@ -1,0 +1,29 @@
+tests/unit/test_openai_requests.py
+  f859591a30fcf1b0 593-594,610-611
+openspec/specs/responses-api-compat/spec.md
+  f859591a30fcf1b0 459,463-464
+tests/integration/test_proxy_compact.py
+  f859591a30fcf1b0 139-140
+app/core/openai/requests.py
+  f859591a30fcf1b0 618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "800a9b6ebc02ca4614a12f441cac67aa70abe0dc",
+  "prompts": {
+    "f859591a30fcf1b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2cab7725-bfe0-43fc-9775-d035c313daee",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM",
+      "messages": [],
+      "total_additions": 10,
+      "total_deletions": 6,
+      "accepted_lines": 10,
+      "overriden_lines": 0
+    }
+  }
+}
