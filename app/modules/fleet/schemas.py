@@ -15,6 +15,13 @@ class FleetWindowSummary(DashboardModel):
     window_minutes: int | None = None
 
 
+class FleetRateLimitResetCreditsSummary(DashboardModel):
+    """Minimal, non-sensitive reset-credit state for a fleet account."""
+
+    available_count: int
+    nearest_expires_at: datetime | None = None
+
+
 class FleetAccountSummary(DashboardModel):
     """Non-sensitive capacity projection for fleet consumers."""
 
@@ -26,6 +33,7 @@ class FleetAccountSummary(DashboardModel):
     primary: FleetWindowSummary
     secondary: FleetWindowSummary
     last_refresh_at: datetime | None = None
+    rate_limit_reset_credits: FleetRateLimitResetCreditsSummary | None = None
 
 
 class FleetSummaryResponse(DashboardModel):

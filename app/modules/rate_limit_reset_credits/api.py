@@ -44,6 +44,7 @@ from app.dependencies import AccountsContext, get_accounts_context
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.schemas import AccountUsageResetConsumeRequest
 from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.rate_limit_reset_credits.eligibility import reset_credits_account_is_eligible
 from app.modules.rate_limit_reset_credits.store import (
     RateLimitResetCreditsStore,
     get_rate_limit_reset_credits_store,
@@ -114,7 +115,10 @@ async def get_rate_limit_reset_credits(
     if account is None:
         await store.invalidate(account_id)
         return None
-    if account.status in _NON_REDEEMABLE_STATUSES or not account.chatgpt_account_id:
+    if not reset_credits_account_is_eligible(
+        status=account.status,
+        chatgpt_account_id=account.chatgpt_account_id,
+    ):
         await store.invalidate(account_id)
         return None
 

@@ -22,6 +22,7 @@ from app.modules.accounts.schemas import (
     AccountUsageTrend,
     UsageTrendPoint,
 )
+from app.modules.rate_limit_reset_credits.eligibility import eligible_reset_credits_snapshot
 from app.modules.rate_limit_reset_credits.store import (
     RateLimitResetCreditsSnapshot,
     RateLimitResetCreditsStore,
@@ -30,9 +31,6 @@ from app.modules.rate_limit_reset_credits.store import (
 from app.modules.usage.mappers import usage_history_to_window_row
 
 _ACCOUNT_ROUTING_POLICIES = frozenset({"burn_first", "normal", "preserve"})
-_RESET_CREDITS_INELIGIBLE_STATUSES = frozenset(
-    {AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED}
-)
 _DEFAULT_USAGE_REFRESH_INTERVAL_SECONDS = 60
 
 
@@ -288,9 +286,12 @@ def _reset_credits_snapshot_for_account(
     account: Account,
     store: RateLimitResetCreditsStore,
 ) -> RateLimitResetCreditsSnapshot | None:
-    if account.status in _RESET_CREDITS_INELIGIBLE_STATUSES or not account.chatgpt_account_id:
-        return None
-    return store.get(account.id)
+    return eligible_reset_credits_snapshot(
+        store,
+        account_id=account.id,
+        status=account.status,
+        chatgpt_account_id=account.chatgpt_account_id,
+    )
 
 
 def _limit_warmup_to_status(entry: AccountLimitWarmup | None) -> AccountLimitWarmupStatus | None:
