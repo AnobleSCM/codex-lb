@@ -1,5 +1,5 @@
 - [x] 1. Add a failing fleet-summary API regression for a confirmed zero reset-credit snapshot.
 - [x] 2. Add the nullable, minimal reset-credit response schema and mapper projection.
 - [x] 3. Cover unavailable-cache, policy suppression, and sensitive-field behavior.
-- [x] 4. Run focused tests, lint/type checks, full relevant verification, OpenSpec validation attempt, and diff checks.
+- [x] 4. Run focused tests, lint/type checks, full relevant verification, strict OpenSpec validation, and diff checks.
 - [ ] 5. Obtain the required independent review and merge/deploy through the protected runtime gate.
