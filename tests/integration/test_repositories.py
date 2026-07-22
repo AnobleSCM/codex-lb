@@ -29,6 +29,7 @@ from app.modules.accounts.repository import (
     _slot_lock_key,
     _slot_lock_keys,
 )
+from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import UsageRepository
 
@@ -71,6 +72,29 @@ async def test_accounts_upsert_updates_existing_by_email(db_setup):
 
         all_accounts = await session.execute(select(Account))
         assert len(list(all_accounts.scalars().all())) == 1
+
+
+@pytest.mark.asyncio
+async def test_sticky_session_upsert_returns_rebound_identity_map_snapshot(db_setup):
+    async with SessionLocal() as session:
+        accounts = AccountsRepository(session)
+        await accounts.upsert(_make_account("acc_sticky_old", "sticky-old@example.com"))
+        await accounts.upsert(_make_account("acc_sticky_new", "sticky-new@example.com"))
+
+        sticky_sessions = StickySessionsRepository(session)
+        first = await sticky_sessions.upsert(
+            "sticky-rebind",
+            "acc_sticky_old",
+            kind=StickySessionKind.CODEX_SESSION,
+        )
+        rebound = await sticky_sessions.upsert(
+            "sticky-rebind",
+            "acc_sticky_new",
+            kind=StickySessionKind.CODEX_SESSION,
+        )
+
+        assert rebound is first
+        assert rebound.account_id == "acc_sticky_new"
 
 
 @pytest.mark.asyncio

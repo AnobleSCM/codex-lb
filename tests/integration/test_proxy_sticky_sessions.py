@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import delete, text
 
 import app.modules.proxy.service as proxy_module
 from app.core.crypto import TokenEncryptor
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
@@ -116,6 +118,92 @@ def _install_proxy_settings_cache(
     )
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_module, "get_settings", lambda: settings)
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_survives_concurrent_sticky_delete_after_upsert_commit(
+    async_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _set_routing_settings(async_client, sticky_threads_enabled=False)
+    await _import_account(async_client, "acc-sticky-route-race", "sticky-route-race@example.com")
+
+    stream_seen: list[str] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        del payload, headers, access_token, base_url, raise_for_status, _kwargs
+        stream_seen.append(account_id)
+        yield 'data: {"type":"response.completed","response":{"id":"resp_sticky_route_race"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    key = "codex-sticky-route-race"
+    original_upsert = StickySessionsRepository.upsert
+    race_injected = False
+
+    async def _upsert_with_concurrent_delete(
+        repository: StickySessionsRepository,
+        sticky_key: str,
+        account_id: str,
+        *,
+        kind: StickySessionKind,
+    ) -> StickySession:
+        nonlocal race_injected
+        if race_injected or sticky_key != key or kind != StickySessionKind.CODEX_SESSION:
+            return await original_upsert(repository, sticky_key, account_id, kind=kind)
+
+        race_injected = True
+        upsert_committed = asyncio.Event()
+        delete_finished = asyncio.Event()
+        original_commit = repository._session.commit
+
+        async def _commit_then_allow_concurrent_delete() -> None:
+            await original_commit()
+            upsert_committed.set()
+            await delete_finished.wait()
+
+        monkeypatch.setattr(repository._session, "commit", _commit_then_allow_concurrent_delete)
+
+        async def _delete_after_commit() -> None:
+            await upsert_committed.wait()
+            try:
+                async with SessionLocal() as delete_session:
+                    await delete_session.execute(
+                        delete(StickySession).where(
+                            StickySession.key == sticky_key,
+                            StickySession.kind == kind,
+                        )
+                    )
+                    await delete_session.commit()
+            finally:
+                delete_finished.set()
+
+        delete_task = asyncio.create_task(_delete_after_commit())
+        try:
+            row = await original_upsert(repository, sticky_key, account_id, kind=kind)
+        except BaseException:
+            delete_task.cancel()
+            await asyncio.gather(delete_task, return_exceptions=True)
+            raise
+        await delete_task
+        return row
+
+    monkeypatch.setattr(StickySessionsRepository, "upsert", _upsert_with_concurrent_delete)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        headers={"session-id": key},
+        json={
+            "model": "gpt-5.1",
+            "instructions": "continue",
+            "input": [],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert race_injected is True
+    assert stream_seen == ["acc-sticky-route-race"]
 
 
 @pytest.mark.asyncio
