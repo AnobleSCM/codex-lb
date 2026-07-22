@@ -1,0 +1,25 @@
+openspec/changes/expose-reset-credits-in-fleet-summary/.openspec.yaml
+  s_eeb1da640afd53::t_712eeb470c2c4e 1-2
+openspec/changes/expose-reset-credits-in-fleet-summary/design.md
+  s_eeb1da640afd53::t_8f2105ded5a214 1-55
+openspec/changes/expose-reset-credits-in-fleet-summary/proposal.md
+  s_eeb1da640afd53::t_dcb93cab2e587b 1-32
+openspec/changes/expose-reset-credits-in-fleet-summary/tasks.md
+  s_eeb1da640afd53::t_c4aa91508e6af9 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "61a1a27e91b4ebf6b00d66990cea4a30aa66e0e3",
+  "prompts": {},
+  "sessions": {
+    "s_eeb1da640afd53": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "55128607-75e8-4751-8aed-0a1765e882b5",
+        "model": "claude-fable-5"
+      },
+      "human_author": "AnobleSCM <andrewnoble1992@gmail.com>"
+    }
+  }
+}
