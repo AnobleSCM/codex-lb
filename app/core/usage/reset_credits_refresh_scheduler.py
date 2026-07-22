@@ -15,9 +15,10 @@ from app.core.clients.rate_limit_reset_credits import (
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
-from app.db.models import Account, AccountStatus
+from app.db.models import Account
 from app.db.session import detach_session_objects, get_background_session
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.rate_limit_reset_credits.eligibility import reset_credits_account_is_eligible
 from app.modules.rate_limit_reset_credits.store import (
     RateLimitResetCreditsStore,
     get_rate_limit_reset_credits_store,
@@ -25,10 +26,6 @@ from app.modules.rate_limit_reset_credits.store import (
 from app.modules.usage.updater import _resolve_upstream_route_for_account
 
 logger = logging.getLogger(__name__)
-
-_RESET_CREDITS_SKIP_STATUSES = frozenset(
-    {AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED}
-)
 
 ResetCreditsFetchFn = Callable[..., Awaitable[ResetCreditsResponse]]
 ResolveRouteFn = Callable[[Account], Awaitable[ResolvedUpstreamRoute | None]]
@@ -98,9 +95,10 @@ async def refresh_reset_credits_for_accounts(
     stays owned by usage refresh. One account failing must not abort the loop.
     """
     for account in accounts:
-        if account.status in _RESET_CREDITS_SKIP_STATUSES:
-            continue
-        if not account.chatgpt_account_id:
+        if not reset_credits_account_is_eligible(
+            status=account.status,
+            chatgpt_account_id=account.chatgpt_account_id,
+        ):
             continue
         await _refresh_account_reset_credits(
             account,

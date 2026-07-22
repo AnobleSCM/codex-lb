@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import pytest
 
+from app.core.clients.rate_limit_reset_credits import RateLimitResetCreditsSnapshot, ResetCreditItem
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
@@ -16,6 +17,7 @@ from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeyData, ApiKeysService
 from app.modules.fleet import api as fleet_api
+from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
@@ -72,11 +74,12 @@ def _make_account(
     *,
     status: AccountStatus = AccountStatus.ACTIVE,
     plan_type: str = "plus",
+    has_chatgpt_identity: bool = True,
 ) -> Account:
     encryptor = TokenEncryptor()
     return Account(
         id=account_id,
-        chatgpt_account_id=None,
+        chatgpt_account_id=f"chatgpt-{account_id}" if has_chatgpt_identity else None,
         email=email,
         plan_type=plan_type,
         access_token_encrypted=encryptor.encrypt("access"),
@@ -117,11 +120,19 @@ async def _seed_account_with_windows(
     primary_reset_at: int,
     secondary_reset_at: int,
     status: AccountStatus = AccountStatus.ACTIVE,
+    has_chatgpt_identity: bool = True,
 ) -> None:
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
-        await accounts_repo.upsert(_make_account(account_id, email, status=status))
+        await accounts_repo.upsert(
+            _make_account(
+                account_id,
+                email,
+                status=status,
+                has_chatgpt_identity=has_chatgpt_identity,
+            )
+        )
         await usage_repo.add_entry(
             account_id,
             primary_used_percent,
@@ -136,6 +147,19 @@ async def _seed_account_with_windows(
             reset_at=secondary_reset_at,
             window_minutes=_SECONDARY_WINDOW_MINUTES,
         )
+
+
+@asynccontextmanager
+async def _cached_reset_credits(account_id: str, available_count: int = 2):
+    store = get_rate_limit_reset_credits_store()
+    await store.set(
+        account_id,
+        RateLimitResetCreditsSnapshot(available_count=available_count, credits=[]),
+    )
+    try:
+        yield
+    finally:
+        await store.invalidate()
 
 
 async def _seed_request_log(
@@ -298,6 +322,59 @@ async def test_fleet_summary_returns_minimal_projection_with_valid_key(async_cli
 
 
 @pytest.mark.asyncio
+async def test_fleet_summary_distinguishes_confirmed_zero_reset_credits(async_client, db_setup):
+    plain_key = await _create_api_key("fleet-summary-reset-credits-key")
+    account_id = "acc_fleet_zero_resets"
+    await _seed_account_with_windows(
+        account_id,
+        "zero-resets@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+    )
+    store = get_rate_limit_reset_credits_store()
+    await store.set(account_id, RateLimitResetCreditsSnapshot(available_count=0, credits=[]))
+
+    try:
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
+    finally:
+        await store.invalidate()
+
+    assert response.status_code == 200
+    account = response.json()["accounts"][0]
+    assert account["rateLimitResetCredits"] == {
+        "availableCount": 0,
+        "nearestExpiresAt": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fleet_summary_marks_missing_reset_credit_snapshot_unavailable(async_client, db_setup):
+    plain_key = await _create_api_key("fleet-summary-missing-reset-credits-key")
+    await _seed_account_with_windows(
+        "acc_fleet_missing_resets",
+        "missing-resets@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+    )
+    await get_rate_limit_reset_credits_store().invalidate()
+
+    response = await async_client.get(
+        "/api/fleet/summary",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accounts"][0]["rateLimitResetCredits"] is None
+
+
+@pytest.mark.asyncio
 async def test_fleet_summary_omits_sensitive_fields(async_client, db_setup):
     plain_key = await _create_api_key("fleet-summary-sensitive-key")
     await _seed_account_with_windows(
@@ -309,10 +386,31 @@ async def test_fleet_summary_omits_sensitive_fields(async_client, db_setup):
         secondary_reset_at=1736467200,
     )
 
-    response = await async_client.get(
-        "/api/fleet/summary",
-        headers={"Authorization": f"Bearer {plain_key}"},
+    expires_at = utcnow() + timedelta(days=1)
+    store = get_rate_limit_reset_credits_store()
+    await store.set(
+        "acc_sensitive",
+        RateLimitResetCreditsSnapshot(
+            available_count=1,
+            nearest_expires_at=expires_at,
+            credits=[
+                ResetCreditItem(
+                    id="credit-secret-id",
+                    status="available",
+                    title="secret credit title",
+                    description="secret credit description",
+                    expires_at=expires_at,
+                )
+            ],
+        ),
     )
+    try:
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
+    finally:
+        await store.invalidate()
 
     assert response.status_code == 200
     payload = response.json()
@@ -330,7 +428,13 @@ async def test_fleet_summary_omits_sensitive_fields(async_client, db_setup):
         "primary",
         "secondary",
         "lastRefreshAt",
+        "rateLimitResetCredits",
     }
+    assert set(account["rateLimitResetCredits"].keys()) == {"availableCount", "nearestExpiresAt"}
+    assert account["rateLimitResetCredits"]["availableCount"] == 1
+    assert "credit-secret-id" not in raw
+    assert "secret credit title" not in raw
+    assert "secret credit description" not in raw
 
 
 @pytest.mark.asyncio
@@ -394,6 +498,90 @@ async def test_fleet_summary_hides_usage_when_key_disables_account_pool_usage(as
 
 
 @pytest.mark.asyncio
+async def test_fleet_summary_hides_reset_credits_when_usage_policy_disallows(async_client, db_setup):
+    account_id = "acc_reset_credits_hidden"
+    plain_key = await _create_api_key("fleet-summary-reset-credits-hidden-key", usage_sections="")
+    await _seed_account_with_windows(
+        account_id,
+        "reset-credits-hidden@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+    )
+    store = get_rate_limit_reset_credits_store()
+    await store.set(account_id, RateLimitResetCreditsSnapshot(available_count=2, credits=[]))
+
+    try:
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
+    finally:
+        await store.invalidate()
+
+    assert response.status_code == 200
+    assert response.json()["accounts"][0]["rateLimitResetCredits"] is None
+
+
+@pytest.mark.parametrize("status", [AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED])
+@pytest.mark.asyncio
+async def test_fleet_summary_hides_stale_reset_credits_for_ineligible_status(async_client, db_setup, status):
+    account_id = f"acc_reset_credits_{status.value}"
+    plain_key = await _create_api_key(f"fleet-summary-reset-credits-{status.value}-key")
+    await _seed_account_with_windows(
+        account_id,
+        f"reset-credits-{status.value}@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+        status=status,
+    )
+    store = get_rate_limit_reset_credits_store()
+    await store.set(account_id, RateLimitResetCreditsSnapshot(available_count=2, credits=[]))
+
+    try:
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
+    finally:
+        await store.invalidate()
+
+    assert response.status_code == 200
+    assert response.json()["accounts"][0]["rateLimitResetCredits"] is None
+
+
+@pytest.mark.asyncio
+async def test_fleet_summary_hides_stale_reset_credits_without_chatgpt_identity(async_client, db_setup):
+    account_id = "acc_reset_credits_missing_identity"
+    plain_key = await _create_api_key("fleet-summary-reset-credits-missing-identity-key")
+    await _seed_account_with_windows(
+        account_id,
+        "reset-credits-missing-identity@example.com",
+        primary_used_percent=10.0,
+        secondary_used_percent=20.0,
+        primary_reset_at=1735862400,
+        secondary_reset_at=1736467200,
+        has_chatgpt_identity=False,
+    )
+    store = get_rate_limit_reset_credits_store()
+    await store.set(account_id, RateLimitResetCreditsSnapshot(available_count=2, credits=[]))
+
+    try:
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
+    finally:
+        await store.invalidate()
+
+    assert response.status_code == 200
+    assert response.json()["accounts"][0]["rateLimitResetCredits"] is None
+
+
+@pytest.mark.asyncio
 async def test_fleet_summary_hides_usage_when_key_only_allows_upstream_limits(async_client, db_setup):
     await _seed_account_with_windows(
         "acc_upstream_only",
@@ -405,10 +593,11 @@ async def test_fleet_summary_hides_usage_when_key_only_allows_upstream_limits(as
     )
     plain_key = await _create_api_key("fleet-summary-upstream-only-key", usage_sections="upstream_limits")
 
-    response = await async_client.get(
-        "/api/fleet/summary",
-        headers={"Authorization": f"Bearer {plain_key}"},
-    )
+    async with _cached_reset_credits("acc_upstream_only"):
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
 
     assert response.status_code == 200
     account = response.json()["accounts"][0]
@@ -416,6 +605,7 @@ async def test_fleet_summary_hides_usage_when_key_only_allows_upstream_limits(as
     assert account["email"] == "upstream-only@example.com"
     assert account["status"] == "active"
     assert account["lastRefreshAt"] is None
+    assert account["rateLimitResetCredits"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -432,15 +622,17 @@ async def test_fleet_summary_hides_usage_when_key_omits_upstream_limits(async_cl
     )
     plain_key = await _create_api_key("fleet-summary-account-pool-only-key", usage_sections="account_pool_usage")
 
-    response = await async_client.get(
-        "/api/fleet/summary",
-        headers={"Authorization": f"Bearer {plain_key}"},
-    )
+    async with _cached_reset_credits("acc_usage_hidden"):
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
 
     assert response.status_code == 200
     account = response.json()["accounts"][0]
     assert account["accountId"] == "acc_usage_hidden"
     assert account["lastRefreshAt"] is None
+    assert account["rateLimitResetCredits"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
@@ -463,15 +655,17 @@ async def test_fleet_summary_hides_usage_when_global_api_key_quota_privacy_enabl
     )
     assert settings.status_code == 200
 
-    response = await async_client.get(
-        "/api/fleet/summary",
-        headers={"Authorization": f"Bearer {plain_key}"},
-    )
+    async with _cached_reset_credits("acc_global_usage_hidden"):
+        response = await async_client.get(
+            "/api/fleet/summary",
+            headers={"Authorization": f"Bearer {plain_key}"},
+        )
 
     assert response.status_code == 200
     account = response.json()["accounts"][0]
     assert account["accountId"] == "acc_global_usage_hidden"
     assert account["lastRefreshAt"] is None
+    assert account["rateLimitResetCredits"] is None
     assert account["primary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
     assert account["secondary"] == {"remainingPercent": None, "resetAt": None, "windowMinutes": None}
 
